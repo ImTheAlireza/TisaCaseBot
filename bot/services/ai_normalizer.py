@@ -4,6 +4,8 @@ import json
 import logging
 import re
 import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
@@ -45,6 +47,16 @@ def _endpoint() -> str:
     if base.endswith("/chat/completions"):
         return base
     return base + "/chat/completions"
+
+
+@asynccontextmanager
+async def ai_client_session(
+    *, timeout: float | httpx.Timeout | None = None
+) -> AsyncIterator[httpx.AsyncClient]:
+    """A short-lived pooled client shared by the AI stages of one extraction."""
+    selected_timeout = timeout or httpx.Timeout(settings.ai_timeout_seconds, connect=15.0)
+    async with httpx.AsyncClient(timeout=selected_timeout) as client:
+        yield client
 
 
 def _extract_json(content: str) -> dict[str, Any]:
@@ -104,7 +116,11 @@ def _deterministic_is_safe(candidate: str) -> bool:
 
 
 async def ai_normalize(
-    raw_text: str, deterministic: str, job_log: Any | None = None
+    raw_text: str,
+    deterministic: str,
+    job_log: Any | None = None,
+    *,
+    client: httpx.AsyncClient | None = None,
 ) -> str:
     """Canonicalize messy model lists with an OpenAI-compatible model.
 
@@ -164,10 +180,13 @@ async def ai_normalize(
     started = time.perf_counter()
 
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(settings.ai_timeout_seconds, connect=15.0)) as client:
+        if client is None:
+            async with ai_client_session() as owned_client:
+                response = await owned_client.post(endpoint, headers=headers, json=payload)
+        else:
             response = await client.post(endpoint, headers=headers, json=payload)
-            response.raise_for_status()
-            body = response.json()
+        response.raise_for_status()
+        body = response.json()
         metrics.observe("ai_latency_ms", metrics.elapsed(started))
         content = body["choices"][0]["message"]["content"]
         data = _extract_json(content)

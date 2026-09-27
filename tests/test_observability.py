@@ -64,6 +64,22 @@ class TestMetrics(unittest.TestCase):
             m.incr("products_created", by=2)
             self.assertEqual(m.snapshot()["products_created"][0], 3)
 
+    def test_schema_and_wal_are_initialized_once_per_database_file(self):
+        from unittest import mock
+
+        with h.temp_metrics() as m, mock.patch.object(m, "_initialize", wraps=m._initialize) as initialize:
+            m.incr("products_created")
+            m.incr("products_created")
+            m.snapshot()
+            self.assertEqual(1, initialize.call_count)
+
+    def test_schema_is_recreated_if_the_database_file_is_removed(self):
+        with h.temp_metrics() as m:
+            m.incr("products_created")
+            m.DB_PATH.unlink()
+            m.incr("products_created")
+            self.assertEqual(1, m.snapshot()["products_created"][0])
+
     def test_a_key_nobody_declared_is_dropped_not_written(self):
         with h.temp_metrics() as m:
             m.incr("typo_in_a_caller")

@@ -379,6 +379,44 @@ class TestExtractionFastPaths(FlowStateTestCase):
 
         asyncio.run(run())
 
+    def test_model_and_detail_ai_calls_share_one_http_client(self):
+        from unittest.mock import AsyncMock, patch
+
+        from _flow_harness import patched_settings, settings_with
+        from bot.services.product_extractor import ProductData
+
+        class Client:
+            closed = False
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                self.closed = True
+
+        async def run():
+            client = Client()
+            session = PF.ProductSession(
+                mode="new", model_text="iPhone 15", info_text="قیمت 698000"
+            )
+            with (
+                patched_settings(settings_with(
+                    ai_base_url="https://ai.example/v1", ai_token="test-token", ai_model="test-model"
+                )),
+                patch("httpx.AsyncClient", return_value=client) as make_client,
+                patch.object(PF, "ai_normalize", new=AsyncMock(return_value="iPhone 15")) as normalize,
+                patch.object(PF, "extract_product", new=AsyncMock(return_value=ProductData())) as extract,
+            ):
+                await PF._extract(session, learn=False)
+            make_client.assert_called_once()
+            normalize.assert_awaited_once()
+            extract.assert_awaited_once()
+            self.assertIs(normalize.await_args.kwargs["client"], client)
+            self.assertIs(extract.await_args.kwargs["client"], client)
+            self.assertTrue(client.closed)
+
+        asyncio.run(run())
+
 
 @needs_flow
 class TestNoPhantomSession(FlowStateTestCase):

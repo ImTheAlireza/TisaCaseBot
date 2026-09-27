@@ -428,6 +428,42 @@ class TestWorkspaceKeepsTheName(unittest.TestCase):
 
 
 @needs_flow
+class TestCategoryLookupReuse(unittest.TestCase):
+    def test_shared_parent_category_is_looked_up_once_per_publish(self) -> None:
+        import asyncio
+        import httpx
+
+        from bot.services.woocommerce_direct import _resolve_categories
+        from bot.services.woo_client import Audit
+
+        parent = "قاب و کاور گوشی و تبلت"
+        catalog = {
+            parent: [{"id": 1, "name": parent, "parent": 0}],
+            "آیفون iphone": [{"id": 2, "name": "آیفون iphone", "parent": 1}],
+            "سامسونگ samsung": [{"id": 3, "name": "سامسونگ samsung", "parent": 1}],
+        }
+
+        class Client:
+            def __init__(self) -> None:
+                self.searched: list[str] = []
+
+            async def get(self, _url, *, params):
+                name = str(params["search"])
+                self.searched.append(name)
+                return httpx.Response(200, json=catalog.get(name, []))
+
+        client = Client()
+        result = asyncio.run(_resolve_categories(
+            client,
+            "https://shop.example/wp-json/wc/v3/products",
+            [f"{parent} > آیفون iphone", f"{parent} > سامسونگ samsung"],
+            Audit(),
+        ))
+        self.assertEqual([parent, "آیفون iphone", "سامسونگ samsung"], client.searched)
+        self.assertEqual([{"id": 1}, {"id": 2}, {"id": 3}], result)
+
+
+@needs_flow
 class TestProductPreview(unittest.TestCase):
     """پیش‌نمایش فقط فیلدهای اصلی را با مدل کامل و دسته‌بندی درختی نشان می‌دهد."""
 

@@ -329,13 +329,12 @@ class TestNoSecondImplementation(unittest.TestCase):
                                        "ساخته‌ای یا client را دور زده‌ای")
 
     def test_the_client_is_the_only_socket(self) -> None:
-        """فهرستِ صریح، نه «هیچ‌کس»: AI یک سرویس دیگر است و client خودش حقش است."""
+        """Only the Woo policy and shared AI session factory construct clients."""
         from pathlib import Path
 
         allowed = {
             "bot/services/woo_client.py",          # فروشگاه
-            "bot/services/ai_normalizer.py",        # ارائه‌دهندهٔ AI
-            "bot/services/product_extractor.py",    # ارائه‌دهندهٔ AI
+            "bot/services/ai_normalizer.py",        # AI session factory shared by both stages
         }
         root = Path(__file__).resolve().parents[1]
         users = {path.relative_to(root).as_posix() for path in (root / "bot").rglob("*.py")

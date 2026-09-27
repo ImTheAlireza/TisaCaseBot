@@ -13,6 +13,7 @@ import httpx
 
 from bot.config import settings
 from bot.services import learning, metrics, model_catalog, money, phone_parser
+from bot.services.ai_normalizer import ai_client_session
 from bot.services.postmodel import (
     Block,
     classify_line,
@@ -694,6 +695,8 @@ async def extract_product(
     caption: str = "",
     info_text: str = "",
     color_suppressed: set[str] | None = None,
+    *,
+    client: httpx.AsyncClient | None = None,
 ) -> ProductData:
     # Keep one AI request, but preserve provenance. The deterministic parser
     # receives PRODUCT INFO first so its title/SKU/price precedence is stable.
@@ -754,11 +757,22 @@ async def extract_product(
     metrics.incr("ai_calls")
     started = time.perf_counter()
     try:
-        async with httpx.AsyncClient(timeout=settings.ai_timeout_seconds) as client:
-            response = await client.post(_endpoint(), headers={"Authorization": f"Bearer {settings.ai_token}"}, json=payload)
-            response.raise_for_status()
-            metrics.observe("ai_latency_ms", metrics.elapsed(started))
-            content = response.json()["choices"][0]["message"]["content"]
+        if client is None:
+            async with ai_client_session(timeout=settings.ai_timeout_seconds) as owned_client:
+                response = await owned_client.post(
+                    _endpoint(),
+                    headers={"Authorization": f"Bearer {settings.ai_token}"},
+                    json=payload,
+                )
+        else:
+            response = await client.post(
+                _endpoint(),
+                headers={"Authorization": f"Bearer {settings.ai_token}"},
+                json=payload,
+            )
+        response.raise_for_status()
+        metrics.observe("ai_latency_ms", metrics.elapsed(started))
+        content = response.json()["choices"][0]["message"]["content"]
         obj = _json_object(content)
         attrs = _dict_field(obj, "attributes")
         clean_attrs = {

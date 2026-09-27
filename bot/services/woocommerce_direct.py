@@ -615,14 +615,27 @@ async def _rollback(
 async def _resolve_categories(client: WooClient, base: str, categories: list[str], audit: Sink) -> list[dict[str, int]]:
     endpoint = f"{base}/categories"
     category_ids: list[dict[str, int]] = []
+    seen_ids: set[int] = set()
+    # Multiple selected branches usually share their root (e.g. phone-brand
+    # children). Cache by parent + case-folded name within this publish so each
+    # common ancestor costs one WooCommerce round trip, without stale cross-run IDs.
+    resolved: dict[tuple[int, str], int | None] = {}
     for raw_path in categories:
         parts = [part.strip() for part in str(raw_path).replace("&gt;", ">").split(">") if part.strip()]
         parent_id = 0
         for part in parts:
-            response = await client.get(
-                endpoint,
-                params={"search": part, "per_page": 100}
-            )
+            cache_key = (parent_id, part.casefold())
+            if cache_key in resolved:
+                category_id = resolved[cache_key]
+                if category_id is None:
+                    continue
+                if category_id not in seen_ids:
+                    category_ids.append({"id": category_id})
+                    seen_ids.add(category_id)
+                parent_id = category_id
+                continue
+
+            response = await client.get(endpoint, params={"search": part, "per_page": 100})
             if not response.is_success:
                 audit.log(f"[cat] جستجوی دستهٔ «{part}» ناموفق: HTTP {response.status_code}")
                 continue
@@ -631,10 +644,13 @@ async def _resolve_categories(client: WooClient, base: str, categories: list[str
             exact = exact or (matches[0] if matches else None)
             if exact:
                 category_id = int(exact["id"])
-                if not any(item["id"] == category_id for item in category_ids):
+                resolved[cache_key] = category_id
+                if category_id not in seen_ids:
                     category_ids.append({"id": category_id})
+                    seen_ids.add(category_id)
                 parent_id = category_id
             else:
+                resolved[cache_key] = None
                 audit.log(f"[cat] دستهٔ «{part}» در فروشگاه پیدا نشد؛ نادیده گرفته شد.")
     audit.log(f"[cat] دسته‌های نهایی: {[c['id'] for c in category_ids] if category_ids else '(هیچ)'}")
     return category_ids

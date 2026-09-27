@@ -27,6 +27,7 @@ import json
 import logging
 import shutil
 import sqlite3
+import threading
 import time
 
 import httpx
@@ -81,6 +82,8 @@ DRAIN_LIMIT = 5
 DATA_DIR = data_dir()
 DB_PATH = DATA_DIR / "outbox.sqlite3"
 FILES_DIR = DATA_DIR / "outbox_files"
+_schema_lock = threading.Lock()
+_initialized: dict[Path, tuple[int, int]] = {}
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS outbox (
@@ -132,16 +135,34 @@ def backoff_seconds(attempts: int) -> int:
     return min(BACKOFF_BASE_SECONDS * (2 ** max(0, attempts - 1)), MAX_DELAY_SECONDS)
 
 
-def _connect() -> sqlite3.Connection:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, timeout=10.0)
-    conn.row_factory = sqlite3.Row
+def _initialize(conn: sqlite3.Connection) -> None:
+    """Set file-level journal mode and create the queue schema."""
     try:                                    # WAL needs a real fs; a plain journal is fine too
         conn.execute("PRAGMA journal_mode=WAL")
     except sqlite3.Error:                   # pragma: no cover - host dependent
         logger.warning("outbox: WAL is not available here; using the default journal")
-    conn.execute("PRAGMA busy_timeout=10000")
     conn.executescript(_SCHEMA)
+
+
+def _connect() -> sqlite3.Connection:
+    path = Path(DB_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path, timeout=10.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA busy_timeout=10000")
+        stat = path.stat()
+        identity = (stat.st_dev, stat.st_ino)
+        # WAL mode and DDL belong to the database file, not each enqueue/due call.
+        # Re-running them on the hot path needlessly acquires SQLite's schema locks.
+        with _schema_lock:
+            if _initialized.get(path) != identity or stat.st_size == 0:
+                _initialize(conn)
+                stat = path.stat()
+                _initialized[path] = (stat.st_dev, stat.st_ino)
+    except Exception:
+        conn.close()
+        raise
     return conn
 
 

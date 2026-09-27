@@ -16,6 +16,7 @@ import shutil
 import time
 import traceback
 import zipfile
+from contextlib import AsyncExitStack
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -45,7 +46,7 @@ from bot.services import (
     workspace,
 )
 from bot.services import postmodel as ev, product_journal
-from bot.services.ai_normalizer import ai_normalize
+from bot.services.ai_normalizer import ai_client_session, ai_normalize
 from bot.services.category_taxonomy import FORBIDDEN, TAXONOMY, apply_sku_category_policy
 from bot.services.color_matrix import (
     is_color_attribute,
@@ -876,36 +877,58 @@ async def _extract(session: ProductSession, *, learn: bool = True) -> ProductDat
     # Accessory families such as AirPods are handled separately because the
     # phone normalizer deliberately rejects them. An empty caption/info block
     # has nothing for AI to normalize, so do not spend a network round trip.
-    ai_models = await ai_normalize(model_source, deterministic) if model_source else deterministic
-    models = [x.strip() for x in (ai_models or deterministic).split(" | ") if x.strip()]
-    for accessory in extract_accessory_models(model_source):
-        if accessory.casefold() not in {item.casefold() for item in models}:
-            models.append(accessory)
-    session.models = models
-    # Do not make an unnecessary second AI request while only the photos are
-    # being processed. It runs as soon as the information message arrives.
     # Product details may be split between the media caption and later
     # Telegram messages. The extractor must receive both texts in one request
     # so title, SKU, price, colors and models can complement each other.
     combined_text = "\n".join(part for part in (caption_text, info_text) if part.strip())
-    # Locks survive a re-extraction on purpose: the owner typed them by hand,
-    # and the parser does not get to "re-decide" a deliberate edit.
-    carried_edits = dict(session.data.user_edits) if session.data else {}
-    if not combined_text.strip() or (session.defer_details and not info_text.strip()):
-        # In the collection screen captions identify phone models; users are
-        # explicitly asked to send price/title/features afterwards. Calling the
-        # full extractor here used to make a second network AI round trip whose
-        # result was never shown, then repeat it when PRODUCT INFO arrived.
-        session.data = ProductData(models=models)
-    else:
-        session.data = await extract_product(
-            combined_text,
-            models,
-            TAXONOMY,
-            caption=caption_text,
-            info_text=info_text,
-            color_suppressed=set(session.suppressed_colors),
+    defer_details = session.defer_details and not info_text.strip()
+    # Reuse one HTTPX pool for the model-normalization and details requests. They
+    # are sequential and normally hit the same AI host, so separate clients paid
+    # a second DNS/TCP/TLS setup for one product. Keep standalone service calls
+    # self-contained; the shared client exists only for this extraction.
+    share_client = bool(
+        model_source
+        and combined_text.strip()
+        and not defer_details
+        and settings.ai_base_url
+        and settings.ai_token
+        and settings.ai_model
+    )
+    async with AsyncExitStack() as stack:
+        ai_client = None
+        if share_client:
+            ai_client = await stack.enter_async_context(ai_client_session())
+        normalize_kwargs = {"client": ai_client} if ai_client is not None else {}
+        ai_models = (
+            await ai_normalize(model_source, deterministic, **normalize_kwargs)
+            if model_source
+            else deterministic
         )
+        models = [x.strip() for x in (ai_models or deterministic).split(" | ") if x.strip()]
+        for accessory in extract_accessory_models(model_source):
+            if accessory.casefold() not in {item.casefold() for item in models}:
+                models.append(accessory)
+        session.models = models
+        # Locks survive a re-extraction on purpose: the owner typed them by hand,
+        # and the parser does not get to "re-decide" a deliberate edit.
+        carried_edits = dict(session.data.user_edits) if session.data else {}
+        if not combined_text.strip() or defer_details:
+            # In the collection screen captions identify phone models; users are
+            # explicitly asked to send price/title/features afterwards. Calling the
+            # full extractor here used to make a second network AI round trip whose
+            # result was never shown, then repeat it when PRODUCT INFO arrived.
+            session.data = ProductData(models=models)
+        else:
+            extract_kwargs = {"client": ai_client} if ai_client is not None else {}
+            session.data = await extract_product(
+                combined_text,
+                models,
+                TAXONOMY,
+                caption=caption_text,
+                info_text=info_text,
+                color_suppressed=set(session.suppressed_colors),
+                **extract_kwargs,
+            )
     session.data.user_edits = carried_edits
     draft_edits.apply_locks(session.data)
     # A value the owner already confirmed stays confirmed after a re-extraction:
