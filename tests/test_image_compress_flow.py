@@ -70,6 +70,119 @@ class TestImageCompressAnalysis(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("رنگ: مشکی، سفید", session.info_text)
         self.assertFalse(extract.await_args.kwargs["learn"])
 
+    @unittest.skipUnless(
+        importlib.util.find_spec("telegram") and importlib.util.find_spec("httpx"),
+        "Telegram/httpx runtime dependencies are not installed",
+    )
+    async def test_download_retries_transient_network_error_without_partial_file(self) -> None:
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+
+        from telegram.error import TimedOut
+
+        from bot.modules import image_compress
+
+        calls = 0
+
+        async def download_to_drive(*, custom_path):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                Path(custom_path).write_bytes(b"partial")
+                raise TimedOut("read timed out")
+            Path(custom_path).write_bytes(b"complete-image")
+
+        tg_file = SimpleNamespace(file_size=14, download_to_drive=download_to_drive)
+        context = SimpleNamespace(bot=SimpleNamespace(get_file=AsyncMock(return_value=tg_file)))
+        with TemporaryDirectory() as directory, patch.object(image_compress.asyncio, "sleep", new=AsyncMock()):
+            target = Path(directory) / "photo.jpg"
+            size = await image_compress._download(context, "file-id", target)
+            self.assertEqual(14, size)
+            self.assertEqual(2, calls)
+            self.assertEqual(b"complete-image", target.read_bytes())
+        self.assertEqual(2, context.bot.get_file.await_count)
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("telegram") and importlib.util.find_spec("httpx"),
+        "Telegram/httpx runtime dependencies are not installed",
+    )
+    async def test_application_uses_longer_telegram_timeouts_and_separate_polling_pool(self) -> None:
+        from bot.app import build_application
+
+        app = build_application()
+        try:
+            polling_request, api_request = app.bot._request
+            api_timeout = api_request._client_kwargs["timeout"]
+            poll_timeout = polling_request._client_kwargs["timeout"]
+            self.assertEqual(45.0, api_timeout.read)
+            self.assertEqual(90.0, api_request._media_write_timeout)
+            self.assertEqual(40.0, poll_timeout.read)
+            self.assertEqual(2, polling_request._client_kwargs["limits"].max_connections)
+        finally:
+            for request in app.bot._request:
+                await request.shutdown()
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("telegram") and importlib.util.find_spec("httpx"),
+        "Telegram/httpx runtime dependencies are not installed",
+    )
+    async def test_polling_read_errors_are_not_reported_as_unhandled_bot_failures(self) -> None:
+        from telegram.error import NetworkError
+
+        from bot.modules import fallback
+
+        sender = AsyncMock(return_value=True)
+        context = SimpleNamespace(error=NetworkError("httpx.ReadError"), job=None, bot=SimpleNamespace())
+        with patch.object(fallback.product_journal, "send_log_message", new=sender):
+            await fallback.on_error(None, context)
+        sender.assert_not_awaited()
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("telegram") and importlib.util.find_spec("httpx"),
+        "Telegram/httpx runtime dependencies are not installed",
+    )
+    async def test_a_progress_message_timeout_does_not_abort_compression(self) -> None:
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+
+        from telegram.error import TimedOut
+
+        from bot.modules import image_compress
+
+        message = SimpleNamespace(
+            message_id=44,
+            caption=None,
+            photo=[SimpleNamespace(file_id="photo-id")],
+            document=None,
+            reply_text=AsyncMock(side_effect=TimedOut("temporary Telegram timeout")),
+        )
+        bot = SimpleNamespace(send_document=AsyncMock())
+        context = SimpleNamespace(bot=bot, user_data={})
+        update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=7))
+
+        async def downloaded(_context, _file_id, target):
+            target.write_bytes(b"original")
+            return 8
+
+        def compressed(_source, directory):
+            directory.mkdir(parents=True, exist_ok=True)
+            output = directory / "ready.jpg"
+            output.write_bytes(b"compressed")
+            return output
+
+        with (
+            TemporaryDirectory() as directory,
+            patch.object(image_compress, "TEMP_DIR", Path(directory)),
+            patch.object(image_compress, "_download", new=downloaded),
+            patch.object(image_compress, "compress_image", new=compressed),
+            patch.object(image_compress, "_log_to_group", new=AsyncMock()),
+            patch.object(image_compress, "_try_send_analysis", new=AsyncMock()),
+        ):
+            result = await image_compress.on_media(update, context)
+
+        self.assertEqual(image_compress.WAITING, result)
+        bot.send_document.assert_awaited_once()
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

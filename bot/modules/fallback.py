@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 
 from telegram import Update
+from telegram.error import NetworkError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -48,6 +49,12 @@ async def doc_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Log an unhandled error locally and to the configured audit chat."""
     error = context.error
+    if update is None and context.job is None and isinstance(error, NetworkError):
+        # PTB reports transient getUpdates socket failures with no Update object.
+        # Polling reconnects automatically; sending each ReadError to the admin
+        # group turns an ordinary network blip into a stream of false alarms.
+        logger.warning("Transient Telegram polling network error; PTB will reconnect: %s", error)
+        return
     exc_info = (type(error), error, error.__traceback__) if error is not None else None
     logger.error("Unhandled exception while processing update", exc_info=exc_info)
 

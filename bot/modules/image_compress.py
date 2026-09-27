@@ -182,12 +182,33 @@ def _media(message) -> tuple[str, str] | None:
     return None
 
 
-async def _download(context: ContextTypes.DEFAULT_TYPE, file_id: str, target: Path) -> int:
-    tg_file = await context.bot.get_file(file_id)
-    if tg_file.file_size and tg_file.file_size > settings.max_download_mb * 1024 * 1024:
-        raise ValueError(f"فایل بزرگ‌تر از سقف مجاز ({settings.max_download_mb:g} MB) است.")
-    await tg_file.download_to_drive(custom_path=target)
-    return tg_file.file_size or 0
+async def _download(
+    context: ContextTypes.DEFAULT_TYPE, file_id: str, target: Path, attempts: int = 3
+) -> int:
+    """Download safely, retrying only idempotent Telegram read operations."""
+    for attempt in range(1, attempts + 1):
+        try:
+            tg_file = await context.bot.get_file(file_id)
+            if tg_file.file_size and tg_file.file_size > settings.max_download_mb * 1024 * 1024:
+                raise ValueError(f"فایل بزرگ‌تر از سقف مجاز ({settings.max_download_mb:g} MB) است.")
+            await tg_file.download_to_drive(custom_path=target)
+            return tg_file.file_size or 0
+        except (NetworkError, TimeoutError) as exc:
+            # A failed download may have left a partial file behind. Never let a
+            # retry treat that partial response as a complete image.
+            target.unlink(missing_ok=True)
+            if attempt >= attempts:
+                raise
+            delay = 0.5 * (2 ** (attempt - 1))
+            logger.warning(
+                "Telegram image download failed (%s/%s); retrying in %.1fs: %s",
+                attempt,
+                attempts,
+                delay,
+                exc,
+            )
+            await asyncio.sleep(delay)
+    raise RuntimeError("Telegram image download failed without an exception")
 
 
 async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -216,6 +237,16 @@ async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return WAITING
 
 
+async def _update_status(status, text: str, user_id: int) -> None:
+    """Progress messages are helpful, but a failed edit must not cancel image work."""
+    if status is None:
+        return
+    try:
+        await asyncio.wait_for(status.edit_text(text), timeout=5.0)
+    except Exception:
+        logger.info("Could not update compression status for user %s", user_id, exc_info=True)
+
+
 async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Download, compress and send back every image in the incoming message."""
     message = update.effective_message
@@ -233,15 +264,33 @@ async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     root = TEMP_DIR / f"{user.id}_{int(time.time() * 1000)}"
     root.mkdir(parents=True, exist_ok=True)
     src = root / _safe_name(name, "image.jpg")
-    status = await message.reply_text("⬇️ در حال دانلود عکس...")
+    status = None
+    stage = "نمایش وضعیت"
     send_started = False
     delivered = False
     try:
+        try:
+            status = await asyncio.wait_for(
+                message.reply_text("⏳ در حال دریافت، فشرده‌سازی و ارسال عکس..."), timeout=5.0
+            )
+        except (NetworkError, TimeoutError):
+            # Losing a cosmetic progress message should not prevent the actual
+            # download/upload from being attempted.
+            logger.warning("Could not send compression progress for user %s", user.id, exc_info=True)
+
+        stage = "دریافت عکس از تلگرام"
+        started = time.perf_counter()
         original_size = await _download(context, file_id, src)
-        await status.edit_text("🗜️ در حال فشرده‌سازی...")
+        download_seconds = time.perf_counter() - started
+
+        stage = "فشرده‌سازی محلی"
+        started = time.perf_counter()
         compressed = await asyncio.to_thread(compress_image, src, root / "out")
-        await status.edit_text("📤 در حال ارسال...")
+        compression_seconds = time.perf_counter() - started
+
+        stage = "ارسال عکس فشرده به تلگرام"
         send_started = True
+        started = time.perf_counter()
         with compressed.open("rb") as handle:
             await context.bot.send_document(
                 user.id,
@@ -249,44 +298,39 @@ async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 filename=compressed.name,
                 caption=f"🗜️ فشرده شد: {name}",
             )
+        upload_seconds = time.perf_counter() - started
         delivered = True
-        try:
-            await status.delete()
-        except Exception:
-            # The photo was already sent. A timed-out cleanup must not turn success
-            # into a red «compression failed» message.
-            logger.info("Could not delete compression status for user %s", user.id, exc_info=True)
+        await _update_status(status, "✅ عکس فشرده و ارسال شد.", user.id)
         compressed_size = compressed.stat().st_size if compressed.exists() else 0
         await _log_to_group(
             context,
             f"🗜️ [compress:{user.id}] عکس ارسال شد: {name}؛ "
-            f"{original_size} → {compressed_size} بایت.",
+            f"{original_size} → {compressed_size} بایت؛ "
+            f"دریافت {download_seconds:.1f}s، فشرده‌سازی {compression_seconds:.1f}s، "
+            f"ارسال {upload_seconds:.1f}s.",
         )
+        stage = "تشخیص مدل‌ها و ویژگی‌ها"
         await _try_send_analysis(context, user.id)
     except Exception as exc:
-        logger.exception("Compress flow failed for user %s", user.id)
+        logger.exception("Compress flow failed for user %s during %s", user.id, stage)
         await _log_to_group(
             context,
-            f"🗜️ [compress:{user.id}] خطای فشرده‌سازی/ارسال: {type(exc).__name__}: {str(exc)[:240]}",
+            f"🗜️ [compress:{user.id}] خطا در مرحلهٔ {stage}: "
+            f"{type(exc).__name__}: {str(exc)[:240]}",
         )
         if delivered:
             # Any post-send failure is ancillary; the file is already in the admin chat.
-            try:
-                await status.edit_text("✅ عکس فشرده و ارسال شد.")
-            except Exception:
-                pass
+            await _update_status(status, "✅ عکس فشرده و ارسال شد.", user.id)
         elif send_started and isinstance(exc, NetworkError):
             # Telegram may have accepted the document even though its response timed out.
-            # Do not suggest an automatic retry that could send a duplicate file.
-            try:
-                await status.edit_text("⚠️ پاسخ تلگرام نرسید؛ ممکن است عکس ارسال شده باشد. قبل از تکرار، پیام‌ها را بررسی کن.")
-            except Exception:
-                pass
+            # Do not retry automatically: that could send a duplicate file.
+            await _update_status(
+                status,
+                "⚠️ پاسخ تلگرام نرسید؛ ممکن است عکس ارسال شده باشد. قبل از تکرار، پیام‌ها را بررسی کن.",
+                user.id,
+            )
         else:
-            try:
-                await status.edit_text(f"❌ خطا: {type(exc).__name__}: {exc}")
-            except Exception:
-                pass
+            await _update_status(status, f"❌ {stage}: {type(exc).__name__}: {exc}", user.id)
     finally:
         shutil.rmtree(root, ignore_errors=True)
     return WAITING

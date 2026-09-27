@@ -6,6 +6,7 @@ import logging
 
 from telegram import BotCommand, Chat, Update
 from telegram.ext import Application, ApplicationBuilder
+from telegram.request import HTTPXRequest
 
 from bot.config import settings
 from bot.modules import register_all
@@ -82,9 +83,30 @@ async def _post_init(app: Application) -> None:
 
 
 def build_application() -> Application:
+    # Telegram's defaults are only five seconds for reads/writes and one second
+    # for connection-pool acquisition. That is brittle on shared hosting and
+    # especially for multipart media uploads. Keep polling on its own small pool
+    # so a slow upload cannot starve getUpdates.
+    api_request = HTTPXRequest(
+        connection_pool_size=16,
+        connect_timeout=10.0,
+        read_timeout=45.0,
+        write_timeout=45.0,
+        pool_timeout=20.0,
+        media_write_timeout=90.0,
+    )
+    polling_request = HTTPXRequest(
+        connection_pool_size=2,
+        connect_timeout=10.0,
+        read_timeout=40.0,
+        write_timeout=15.0,
+        pool_timeout=10.0,
+    )
     app = (
         ApplicationBuilder()
         .token(settings.bot_token)
+        .request(api_request)
+        .get_updates_request(polling_request)
         .application_class(PrivateOnlyApplication)
         .post_init(_post_init)
         .build()
