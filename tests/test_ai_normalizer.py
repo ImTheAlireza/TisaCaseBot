@@ -186,6 +186,28 @@ A55"""
         self.assertTrue({"A16", "A26", "Redmi Note 9 Pro", "Redmi Note 9S"}.issubset(set(models)))
         self.assertFalse(any("/" in model for model in models))
 
+    def test_ai_must_keep_every_model_in_a_redmi_note_slash_chain(self) -> None:
+        raw = "Xiaomi / POCO\nNOTE11/11S/12S"
+        deterministic = "Redmi Note 11 | Redmi Note 11S | Redmi Note 12S"
+        fake = _FailingPost(_completion('{"models": ["Redmi Note 12S"]}'))
+        with (
+            patch.object(ai_normalizer, "AI_BASE_URL", "https://ai.example/v1"),
+            patch.object(ai_normalizer, "AI_TOKEN", "sk-test"),
+            patch.object(ai_normalizer, "AI_MODEL", "gpt-x"),
+            patch("httpx.AsyncClient.post", new=fake),
+            self.assertLogs("bot.services.ai_normalizer", level="WARNING"),
+        ):
+            out = asyncio.run(ai_normalizer.ai_normalize(raw, deterministic))
+        models = out.split(" | ")
+        self.assertEqual(
+            {"Redmi Note 11", "Redmi Note 11S", "Redmi Note 12S"},
+            set(models),
+            "the AI's single Note 12S answer must not erase either earlier slash token",
+        )
+        system = fake.calls[0]["json"]["messages"][0]["content"]
+        self.assertIn("NOTE11/11S/12S", system)
+        self.assertIn("never just Note 12S", system)
+
     def test_the_learned_owner_rules_travel_in_the_system_prompt(self) -> None:
         """AI باید همان قواعدی را بداند که مسیر deterministic اعمال می‌کند."""
         fake = _FailingPost(_completion('{"models": ["iPhone 15"]}'))

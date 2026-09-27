@@ -46,7 +46,7 @@ from bot.services import (
 )
 from bot.services import postmodel as ev, product_journal
 from bot.services.ai_normalizer import ai_normalize
-from bot.services.category_taxonomy import FORBIDDEN, TAXONOMY
+from bot.services.category_taxonomy import FORBIDDEN, TAXONOMY, apply_sku_category_policy
 from bot.services.color_matrix import (
     is_color_attribute,
     is_model_attribute,
@@ -955,6 +955,9 @@ async def _extract(session: ProductSession, *, learn: bool = True) -> ProductDat
                     path = airpods_root + " > " + leaf
                     if path not in normalized_categories:
                         normalized_categories.append(path)
+    normalized_categories = apply_sku_category_policy(
+        normalized_categories, session.data.sku_prefix
+    )
     session.data.categories = _canonical_category_paths(normalized_categories)
     session.data.attributes = {k: v for k, v in session.data.attributes.items() if not is_model_attribute(k)}
     _apply_color_matrix(session, model_source)
@@ -1362,6 +1365,9 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await query.answer("اول عکس و اطلاعات محصول را بفرست.", show_alert=True)
         return REVIEW
     data = session.data
+    data.categories = _canonical_category_paths(
+        apply_sku_category_policy(data.categories, data.sku_prefix)
+    )
     # ONE shared gate for both output paths. It used to be two different checks,
     # so the REST path happily published a product with no models while the ZIP
     # importer rejected exactly that.

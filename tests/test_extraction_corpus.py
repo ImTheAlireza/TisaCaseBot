@@ -16,14 +16,17 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import unittest
+from dataclasses import replace
+from unittest.mock import patch
 
 os.environ.setdefault("BOT_TOKEN", "123456:TEST")
 os.environ.setdefault("SUDO_IDS", "1234567")
 
 try:
-    from bot.services import plan, phone_parser
+    from bot.services import plan, phone_parser, product_extractor
     from bot.services.product_extractor import extract_accessory_models, extract_product
 
     HAS_EXTRACTOR = True
@@ -76,6 +79,59 @@ class TestExtractionCorpus(unittest.TestCase):
         self.assertFalse(missing, f"corpus باید همهٔ خانه‌ها را بگوید: {sorted(missing)}")
         for key, value in wanted.items():
             self.assertEqual(value, got[key], f"«{key}» در این پست فرق کرد: {got!r}")
+
+    def test_print_category_is_controlled_by_sku_not_marketing_copy(self) -> None:
+        """«چاپ IMD» توصیف طرح است؛ فقط شناسه‌های CH/SB مجاز به دستهٔ چاپی‌اند."""
+        self.assertIn("controlled ONLY by the product SKU prefix", product_extractor.SYSTEM_PROMPT)
+        self.assertIn("Never include «چاپی» for other SKU prefixes", product_extractor.SYSTEM_PROMPT)
+        cases = (
+            ("AS", "چاپ IMD باکیفیت", []),
+            ("CH", "قاب ساده بدون اشاره به چاپ", ["چاپی"]),
+            ("SB", "قاب ساده بدون اشاره به چاپ", ["چاپی"]),
+        )
+        offline_settings = replace(
+            product_extractor.settings, ai_base_url="", ai_token="", ai_model=""
+        )
+        with patch.object(product_extractor, "settings", offline_settings):
+            for sku, description, categories in cases:
+                with self.subTest(sku=sku):
+                    info = f"{sku}\nقاب IMD طرح پاپیونی\n{description}\nقیمت 498000"
+                    data = asyncio.run(
+                        extract_product(info, [], "", caption="", info_text=info)
+                    )
+                    self.assertEqual(sku, data.sku_prefix)
+                    self.assertEqual(categories, data.categories)
+
+    def test_ai_cannot_turn_print_copy_into_a_print_category_or_change_the_sku(self) -> None:
+        content = json.dumps({
+            "title": "قاب IMD طرح پاپیونی",
+            "price": 498000,
+            "sku_prefix": "CH",  # deliberately disagrees with the actual AS code
+            "attributes": {},
+            "model_colors": {},
+            "categories": ["قاب و کاور گوشی و تبلت > چاپی"],
+        }, ensure_ascii=False)
+
+        async def fake_post(_client, url, **_kwargs):
+            request = product_extractor.httpx.Request("POST", url)
+            return product_extractor.httpx.Response(
+                200, json={"choices": [{"message": {"content": content}}]}, request=request
+            )
+
+        online_settings = replace(
+            product_extractor.settings,
+            ai_base_url="https://ai.example/v1",
+            ai_token="test-token",
+            ai_model="test-model",
+        )
+        info = "AS\nقاب IMD طرح پاپیونی\nچاپ IMD باکیفیت\nقیمت 498000"
+        with (
+            patch.object(product_extractor, "settings", online_settings),
+            patch("httpx.AsyncClient.post", new=fake_post),
+        ):
+            data = asyncio.run(extract_product(info, [], "", caption="", info_text=info))
+        self.assertEqual("AS", data.sku_prefix, "the explicit deterministic SKU beats the AI guess")
+        self.assertFalse(any("چاپی" in category for category in data.categories))
 
     def test_group_prices_survive_the_noise_lines(self) -> None:
         """P0-2/P0-3/P0-4: وزن، تاریخ و کد ملی قیمت نیستند؛ دو گروه در یک خط، دو قیمت."""

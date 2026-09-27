@@ -25,7 +25,13 @@ from typing import Any
 from bot.config import settings
 from bot.services import brand_suggest, money, vocabulary
 from bot.services import postmodel as ev
-from bot.services.category_taxonomy import FORBIDDEN, TAXONOMY
+from bot.services.category_taxonomy import (
+    FORBIDDEN,
+    TAXONOMY,
+    apply_sku_category_policy,
+    is_printed_category,
+    sku_uses_printed_category,
+)
 from bot.services.color_matrix import color_key
 from bot.services.phone_parser import extract_phone_models, fold_variant_words
 
@@ -476,10 +482,23 @@ def apply_edit(data: Any, key: str, raw: str) -> str | None:
                 data.model_colors = _prune_matrix(getattr(data, "model_colors", None) or {}, stored)
                 evidence_key = "colors"
             elif key == "categories":
-                data.categories = stored or []
+                categories = stored or []
+                if (
+                    any(is_printed_category(category) for category in categories)
+                    and not sku_uses_printed_category(getattr(data, "sku_prefix", ""))
+                ):
+                    return "دستهٔ «چاپی» فقط برای شناسه‌های CH و SB مجاز است."
+                data.categories = apply_sku_category_policy(
+                    categories, getattr(data, "sku_prefix", "")
+                )
+                stored = data.categories
                 evidence_key = "category"
             else:
                 setattr(data, key, stored)
+                if key == "sku_prefix":
+                    data.categories = apply_sku_category_policy(
+                        getattr(data, "categories", None) or [], str(stored or "")
+                    )
                 evidence_key = key
     except ValueError as exc:
         return str(exc)
@@ -547,6 +566,13 @@ def apply_locks(data: Any) -> dict[str, Any]:
         restored[key] = value
         ev.merge(data.evidence, key if not key.startswith("attr:") else key.split(":", 1)[1],
                  ev.USER, quote="ویرایش دستی شما", overwrite=True)
+    if hasattr(data, "categories"):
+        before_categories = list(getattr(data, "categories", None) or [])
+        data.categories = apply_sku_category_policy(
+            before_categories, getattr(data, "sku_prefix", "")
+        )
+        if data.categories != before_categories:
+            restored["categories"] = data.categories
     return restored
 
 

@@ -25,11 +25,11 @@ Your task is to canonicalize phone model names found in messy Persian/English re
 
 Rules:
 1. Output ONLY JSON: {"models":["..."]}.
-2. Preserve explicit iPhone compatibility groups written with slash as ONE item, e.g. "iphone 7/8" -> "iPhone 7/8". For Samsung, Xiaomi, Redmi, and POCO catalog lists, a slash separates distinct phone models: expand shorthand using the current section/context (e.g. "A16/A26" -> "A16", "A26"; "Note9PRO/9S" -> "Redmi Note 9 Pro", "Redmi Note 9S"; "A5/C71" -> "Redmi A5", "POCO C71"). Never return those non-iPhone models as one slash-joined item.
+2. Preserve explicit iPhone compatibility groups written with slash as ONE item, e.g. "iphone 7/8" -> "iPhone 7/8". For Samsung, Xiaomi, Redmi, and POCO catalog lists, a slash separates distinct phone models: expand EVERY token using the section/family context and retain each token's own number and suffix. Example: "NOTE11/11S/12S" MUST become three items: "Redmi Note 11", "Redmi Note 11S", "Redmi Note 12S"—never just Note 12S. Also: "A16/A26" -> "A16", "A26"; "Note9PRO/9S" -> "Redmi Note 9 Pro", "Redmi Note 9S"; "A5/C71" -> "Redmi A5", "POCO C71". Never collapse non-iPhone models into one slash-joined item.
 3. Never turn an accessory list (AirPods, cases, watches, etc.) into phone models.
 4. iPhone: canonical prefix is exactly "iPhone". Normalize spacing/case: 17promax -> iPhone 17 Pro Max; 14Pro -> iPhone 14 Pro; Xsmax -> iPhone XS Max.
 5. Samsung: REMOVE the word "Samsung" from output. Keep model identity exactly, including the lowercase s in A21s. A21 s -> A21s, NOT A21. Keep FE, Ultra, Plus, and network suffixes such as 4G/5G when present.
-6. Xiaomi: REMOVE only the generic brand word "Xiaomi" from output, but DO NOT remove "Redmi" when it is part of the product name. In a Xiaomi/Redmi Note section, canonical Note names use "Redmi Note ...". Example: Note12 4G -> Redmi Note 12 4G; Note 12S -> Redmi Note 12 S; Note 13 pro plus -> Redmi Note 13 Pro Plus.
+6. Xiaomi: REMOVE only the generic brand word "Xiaomi" from output, but DO NOT remove "Redmi" when it is part of the product name. In a Xiaomi/Redmi Note section, canonical Note names use "Redmi Note ...". Keep the S suffix attached to its model number. Examples: Note12 4G -> Redmi Note 12 4G; Note 12S -> Redmi Note 12S; Note 13 pro plus -> Redmi Note 13 Pro Plus.
 7. Do not invent a 4G/5G suffix when the source does not contain enough evidence. Prefer exact evidence over guessing.
 8. Deduplicate identical canonical models.
 9. Sort naturally by brand order iPhone, Samsung-family, Xiaomi-family; within each family sort by model number ascending, then variants in a sensible order.

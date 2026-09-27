@@ -142,6 +142,18 @@ class TestFieldParsers(unittest.TestCase):
         with self.assertRaises(ValueError):
             de.parse_categories("فروش ویژه")
 
+    def test_printed_category_is_tied_to_ch_sb_sku_edits(self):
+        ordinary = _draft(sku_prefix="AS")
+        error = de.apply_edit(ordinary, "categories", "چاپی")
+        self.assertIn("CH و SB", error or "")
+        self.assertEqual([], ordinary.categories)
+
+        printed = _draft(sku_prefix="CH")
+        self.assertIsNone(de.apply_edit(printed, "categories", "قاب تبلت"))
+        self.assertIn("چاپی", " | ".join(printed.categories))
+        self.assertIsNone(de.apply_edit(printed, "sku_prefix", "AS"))
+        self.assertNotIn("چاپی", " | ".join(printed.categories))
+
     def test_group_prices_refuse_half_a_table(self):
         self.assertEqual(de.parse_group_prices("ایفون 698 اندروید 598"),
                          {"iphone": 698000, "android": 598000})

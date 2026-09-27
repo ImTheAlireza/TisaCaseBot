@@ -1,4 +1,8 @@
-"""Allowed WooCommerce category taxonomy for AI classification."""
+"""Allowed WooCommerce category taxonomy and SKU-driven category rules."""
+from __future__ import annotations
+
+import re
+
 TAXONOMY = """فروش ویژه
 💥 بلک فرایدی
 محصولات عمده
@@ -51,3 +55,40 @@ TAXONOMY = """فروش ویژه
 محصولات روود
 محصولات سیلیکونی"""
 FORBIDDEN = {"فروش ویژه", "💥 بلک فرایدی", "محصولات عمده"}
+
+_PRINT_CATEGORY_LABELS = {"چاپی", "چاپ", "پرینت"}
+_PRINT_SKU_RE = re.compile(r"(?:CH|SB)\d*", re.IGNORECASE)
+
+
+def sku_uses_printed_category(sku_prefix: str) -> bool:
+    """Whether the supplied SKU/prefix belongs to the CH or SB print family."""
+    sku = re.sub(r"[^A-Z0-9]", "", str(sku_prefix or "").upper())
+    return bool(_PRINT_SKU_RE.fullmatch(sku))
+
+
+def is_printed_category(category: str) -> bool:
+    """Whether a taxonomy path names «چاپی» (or one of its AI aliases)."""
+    normalized = str(category or "").replace("&gt;", ">").replace(" ← ", ">")
+    parts = [part.strip().casefold() for part in normalized.split(">") if part.strip()]
+    return any(part in _PRINT_CATEGORY_LABELS for part in parts)
+
+
+def apply_sku_category_policy(categories: list[str], sku_prefix: str) -> list[str]:
+    """Allow the «چاپی» category only for CH/SB product identifiers.
+
+    Printing mentioned in marketing copy (for example «چاپ IMD») describes a
+    design, not the store category. The shop's SKU prefix is the authority: CH
+    and SB products always get the category; every other SKU loses it, even if
+    the AI inferred it from text or returned the full nested taxonomy path.
+    """
+    allow_print = sku_uses_printed_category(sku_prefix)
+    result: list[str] = []
+    for raw in categories:
+        category = str(raw or "").replace("&gt;", ">").replace(" ← ", ">")
+        if is_printed_category(category):
+            continue
+        if category.strip() and category not in result:
+            result.append(category)
+    if allow_print:
+        result.append("چاپی")
+    return result
