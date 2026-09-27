@@ -262,6 +262,79 @@ class TestFinishMedia(FlowStateTestCase):
 
 
 @needs_flow
+class TestModelCaptionsFromBatches(FlowStateTestCase):
+    def test_models_from_later_photo_batches_do_not_replace_earlier_captions(self):
+        import tempfile
+        from unittest.mock import AsyncMock, patch
+
+        from bot.services.phone_parser import normalize_caption
+        from bot.services.product_extractor import ProductData
+
+        first_caption = """Samsung:
+A06
+A07"""
+        second_caption = """XIAOMI / POCO:
+NOTE11/11S/12S"""
+        root = Path(tempfile.mkdtemp()) / "session"
+        root.mkdir(parents=True)
+        self.addCleanup(__import__("shutil").rmtree, root.parent, True)
+        session = PF.ProductSession(mode="new", workspace=root, chat_id=9)
+        PF.sessions[7] = session
+
+        async def download(_context, _file_id, target):
+            target.write_bytes(b"original-image")
+            return len(b"original-image")
+
+        def compress(source, directory):
+            directory.mkdir(parents=True, exist_ok=True)
+            output = directory / f"{source.stem}_compressed.jpg"
+            output.write_bytes(b"compressed")
+            return output
+
+        async def parse(session):
+            session.models = normalize_caption(session.model_text).split(" | ")
+            session.data = ProductData(title="قاب", models=session.models)
+            session.color_summary = ""
+            return session.data
+
+        class Bot:
+            async def send_message(self, *args, **kwargs):
+                return SimpleNamespace(message_id=1)
+
+        def photo(message_id, caption):
+            return SimpleNamespace(
+                message_id=message_id,
+                caption=caption,
+                text=None,
+                photo=[SimpleNamespace(file_id=f"file-{message_id}")],
+                document=None,
+            )
+
+        context = SimpleNamespace(bot=Bot())
+
+        async def run_batches():
+            with (
+                patch.object(PF, "_download_with_retry", new=download),
+                patch.object(PF, "compress_image", new=compress),
+                patch.object(PF, "_telegram_log", new=AsyncMock()),
+                patch.object(PF, "_status", new=AsyncMock()),
+                patch.object(PF, "_extract", new=parse),
+                patch.object(PF.flow_state, "record"),
+            ):
+                await PF._prepare_files(7, [photo(1, first_caption)], context)
+                await PF._prepare_files(7, [photo(2, second_caption)], context)
+
+        asyncio.run(run_batches())
+        self.assertEqual(first_caption + "\n\n" + second_caption, session.model_text)
+        self.assertTrue(
+            {"A06", "A07", "Redmi Note 11", "Redmi Note 11S", "Redmi Note 12S"}.issubset(
+                set(session.models)
+            ),
+            session.models,
+        )
+
+
+@needs_flow
 class TestNoPhantomSession(FlowStateTestCase):
     def test_media_without_a_session_ends_the_flow_instead_of_inventing_one(self):
         update, sent = _update("", chat_id=7)

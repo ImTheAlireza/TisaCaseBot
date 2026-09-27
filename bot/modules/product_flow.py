@@ -538,6 +538,19 @@ def _caption(messages: list[Message]) -> str:
     return "\n".join((m.caption or m.text or "") for m in sorted(messages, key=lambda x: x.message_id) if (m.caption or m.text))
 
 
+def _append_model_caption(existing: str, incoming: str) -> str:
+    """Keep model text from earlier photo batches when another batch arrives."""
+    old = (existing or "").strip()
+    new = (incoming or "").strip()
+    if not new:
+        return old
+    if not old:
+        return new
+    if any(block.strip().casefold() == new.casefold() for block in old.split("\n\n")):
+        return old
+    return f"{old}\n\n{new}"
+
+
 def _category_tree_lines(categories: Sequence[str]) -> list[str]:
     """Render category paths once as a compact parent/child tree."""
     tree: dict[str, dict] = {}
@@ -1108,7 +1121,7 @@ async def _prepare_files(user_id: int, messages: list[Message], context: Context
     # replace the ones already collected for this product.
     session.files = previous_files + new_files
     await _status(context, user_id, session, "🤖 مرحله ۳ از ۴: تشخیص مدل‌ها و اطلاعات با AI...")
-    session.model_text = _caption(messages)
+    session.model_text = _append_model_caption(session.model_text, _caption(messages))
     await _extract(session)
     session.processing_media = False
     await _telegram_log(context, f"[product:{user_id}] مدل‌های نهایی تشخیص‌داده‌شده:\n{chr(10).join(session.models) or '<هیچ مدلی تشخیص داده نشد>'}")
