@@ -94,10 +94,13 @@ class TestPureHelpers(unittest.TestCase):
             "  iPhone 15 Pro , ",  # فاصله و ویرگول حاشیه‌ای
             "iPhone 15 Pro",  # تکراری (casefold) حذف می‌شود
             "AirPods Pro 2",  # لوازم جانبی به لیست مدل گوشی راه ندارد
+            "A16/A26",  # shorthandهای slashدار باید از parser و به‌صورت جداگانه بیایند
+            "Redmi Note 9 Pro/9S",
+            "iPhone 7/8",  # گروه سازگاری آیفون همچنان یک گزینه است
             42,  # ورودیِ غیررشته‌ای نادیده گرفته می‌شود
         ]
         self.assertEqual(
-            ["Galaxy S24", "Redmi Note 12 4G", "Xiaomi 13", "iPhone 15 Pro"],
+            ["Galaxy S24", "Redmi Note 12 4G", "Xiaomi 13", "iPhone 15 Pro", "iPhone 7/8"],
             ai_normalizer._clean_model_list(values),
         )
 
@@ -151,6 +154,37 @@ class TestAiNormalizePaths(unittest.TestCase):
         self.assertEqual("Bearer sk-test", sent["headers"]["Authorization"])
         self.assertEqual(0, sent["json"]["temperature"], "مدلِ خلاق برای canonicalize ممنوع")
         self.assertIn("DETERMINISTIC CANDIDATE", sent["json"]["messages"][1]["content"])
+
+    def test_ai_cannot_silently_drop_deterministic_candidates(self) -> None:
+        raw = """Samsung:
+S24 FE
+A55"""
+        deterministic = "S24 FE | A55"
+        fake = _FailingPost(_completion('{"models": ["S24 FE"]}'))
+        with patch.object(ai_normalizer, "AI_BASE_URL", "https://ai.example/v1"), \
+                patch.object(ai_normalizer, "AI_TOKEN", "sk-test"), \
+                patch.object(ai_normalizer, "AI_MODEL", "gpt-x"), \
+                patch("httpx.AsyncClient.post", new=fake), \
+                self.assertLogs("bot.services.ai_normalizer", level="WARNING") as logs:
+            out = asyncio.run(ai_normalizer.ai_normalize(raw, deterministic))
+        self.assertEqual("S24 FE | A55", out)
+        self.assertIn("omitted 1 deterministic model", "\n".join(logs.output))
+
+    def test_ai_slash_groups_cannot_collapse_non_iphone_variants(self) -> None:
+        raw = "Samsung A16/A26\nXiaomi / POCO NOTE9PRO/9S"
+        deterministic = "A16 | A26 | Redmi Note 9 Pro | Redmi Note 9S"
+        fake = _FailingPost(_completion('{"models": ["A16/A26", "Redmi Note 9 Pro/9S"]}'))
+        with (
+            patch.object(ai_normalizer, "AI_BASE_URL", "https://ai.example/v1"),
+            patch.object(ai_normalizer, "AI_TOKEN", "sk-test"),
+            patch.object(ai_normalizer, "AI_MODEL", "gpt-x"),
+            patch("httpx.AsyncClient.post", new=fake),
+            self.assertLogs("bot.services.ai_normalizer", level="WARNING"),
+        ):
+            out = asyncio.run(ai_normalizer.ai_normalize(raw, deterministic))
+        models = out.split(" | ")
+        self.assertTrue({"A16", "A26", "Redmi Note 9 Pro", "Redmi Note 9S"}.issubset(set(models)))
+        self.assertFalse(any("/" in model for model in models))
 
     def test_the_learned_owner_rules_travel_in_the_system_prompt(self) -> None:
         """AI باید همان قواعدی را بداند که مسیر deterministic اعمال می‌کند."""

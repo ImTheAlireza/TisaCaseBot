@@ -10,6 +10,7 @@ import httpx
 
 from bot.config import settings
 from bot.services import learning, metrics
+from bot.services.phone_parser import normalize_caption
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +25,7 @@ Your task is to canonicalize phone model names found in messy Persian/English re
 
 Rules:
 1. Output ONLY JSON: {"models":["..."]}.
-2. Preserve compatibility groups written with slash as ONE item. Example: "iphone 7/8" -> "iPhone 7/8"; "iphone 7+/8+" -> "iPhone 7 Plus/8 Plus".
+2. Preserve explicit iPhone compatibility groups written with slash as ONE item, e.g. "iphone 7/8" -> "iPhone 7/8". For Samsung, Xiaomi, Redmi, and POCO catalog lists, a slash separates distinct phone models: expand shorthand using the current section/context (e.g. "A16/A26" -> "A16", "A26"; "Note9PRO/9S" -> "Redmi Note 9 Pro", "Redmi Note 9S"; "A5/C71" -> "Redmi A5", "POCO C71"). Never return those non-iPhone models as one slash-joined item.
 3. Never turn an accessory list (AirPods, cases, watches, etc.) into phone models.
 4. iPhone: canonical prefix is exactly "iPhone". Normalize spacing/case: 17promax -> iPhone 17 Pro Max; 14Pro -> iPhone 14 Pro; Xsmax -> iPhone XS Max.
 5. Samsung: REMOVE the word "Samsung" from output. Keep model identity exactly, including the lowercase s in A21s. A21 s -> A21s, NOT A21. Keep FE, Ultra, Plus, and network suffixes such as 4G/5G when present.
@@ -78,6 +79,11 @@ def _clean_model_list(values: Any) -> list[str]:
         value = re.sub(r"(?i)^Samsung\s+", "", value).strip()
         value = re.sub(r"(?i)^Xiaomi\s+(?=Redmi\b)", "", value).strip()
         if re.fullmatch(r"(?i)(?:case|airpods?|apple watch|watch)\b.*", value):
+            continue
+        # Outside iPhone compatibility labels, slash groups in this catalog are
+        # shorthand for separate phone variants. Keep the deterministic parser's
+        # expanded entries instead of letting an AI group hide or duplicate them.
+        if "/" in value and not re.search(r"(?i)\biPhone\b", value):
             continue
         key = value.casefold()
         if key not in seen:
@@ -166,9 +172,35 @@ async def ai_normalize(
         content = body["choices"][0]["message"]["content"]
         data = _extract_json(content)
         models = _clean_model_list(data.get("models"))
-        result = " | ".join(models)
-        note(logging.INFO, "AI returned %d models.", len(models))
-        return result
+
+        # The normalizer may improve spelling, but it is not allowed to silently
+        # delete a deterministic candidate. That happened with long slash-heavy
+        # Xiaomi/POCO lists: the AI returned a plausible, shorter subset and the
+        # missing phones were never shown for review.
+        canonical_candidate = normalize_caption(deterministic)
+        candidate_models = _clean_model_list(canonical_candidate.split(" | ") if canonical_candidate else [])
+        ai_identities: set[str] = set()
+        for model in models:
+            normalized = normalize_caption(model)
+            ai_identities.update(
+                item.casefold() for item in normalized.split(" | ") if item.strip()
+            )
+            if not normalized:
+                ai_identities.add(model.casefold())
+        missing = [
+            model for model in candidate_models
+            if model.casefold() not in ai_identities
+        ]
+        if missing:
+            models.extend(missing)
+            note(
+                logging.WARNING,
+                "AI omitted %d deterministic model(s); preserving them: %s",
+                len(missing),
+                " | ".join(missing[:12]),
+            )
+        note(logging.INFO, "AI returned %d models (%d deterministic candidates retained).", len(models), len(candidate_models))
+        return " | ".join(models)
     except Exception as exc:
         metrics.incr("ai_failures")
         note(

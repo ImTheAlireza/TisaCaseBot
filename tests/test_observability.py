@@ -256,13 +256,16 @@ class TestProductJournal(unittest.TestCase):
         self.assertIn("❌ منتشر نشد", context.bot.messages[0]["text"])
         self.assertIn("جزئیات ۱", context.bot.messages[1]["text"])
 
-    def test_without_a_log_chat_the_flow_keeps_recording_without_complaining(self):
+    def test_without_a_log_chat_the_flow_keeps_recording_and_warns(self):
         context = h.context()
-        with h.patched_settings(h.settings_with(log_chat_id=None)):
+        with h.patched_settings(h.settings_with(log_chat_id=None)), self.assertLogs(
+            "bot.services.product_journal", level="WARNING"
+        ) as logs:
             journal = product_journal.journal_for(context)
             journal.line("چیزی که فقط در logs/bot.log می‌ماند")
             self.assertIsNotNone(run(product_journal.flush(context, status="dry")))
         self.assertEqual(context.bot.messages, [])
+        self.assertIn("LOG_CHAT_ID is empty", " ".join(logs.output))
 
     def test_a_context_without_chat_data_is_not_an_error(self):
         # جریان‌هایی که chat_data ندارند (هندلرِ تنها، تستِ جدا) نباید بترکند.

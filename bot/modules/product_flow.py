@@ -1410,6 +1410,67 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await query.answer("در حال ساخت پیش‌نویس مستقیم..." if session.mode == "new" else "در حال ساخت فایل ZIP...")
     await _telegram_log(context, f"[product:{user.id}] تأیید نهایی دریافت شد؛ داده نهایی:\n{json.dumps(data.to_dict(), ensure_ascii=False, indent=2)}")
     intent_key: str | None = None
+    publish_returned = False
+    product_id: int | str | None = None
+    edit_url = ""
+
+    async def keep_success_if_reply_failed(exc: BaseException) -> int:
+        """Never turn a completed WooCommerce write into a failed/retryable product.
+
+        The API call can succeed and the following Telegram card send can fail.
+        Treating that as a publish failure made a repeated tap capable of creating
+        a duplicate product, even though WooCommerce had already confirmed it.
+        """
+        status = "dry" if settings.woo_dry_run else "created"
+        ledger_saved = False
+        try:
+            _record_result(
+                user.id, session, data,
+                status=status,
+                product_id=None if settings.woo_dry_run else product_id,
+                edit_url=edit_url,
+                key=intent_key,
+                batch_id=batch,
+            )
+            ledger_saved = True
+        except Exception:
+            logger.exception("Could not preserve the successful product ledger entry")
+        reason = describe_exception(exc)
+        ledger_note = "دفتر محصولات به‌روز شد" if ledger_saved else "ثبت در دفتر محصولات هم شکست خورد"
+        if settings.woo_dry_run:
+            log_line = f"🧪 اجرای آزمایشی کامل شد؛ {ledger_note}؛ ارسال کارت نتیجه ناموفق بود: {reason}"
+            notice = "🧪 اجرای آزمایشی تمام شد؛ چیزی در سایت ساخته نشد. ارسال کارت نتیجه ناموفق بود."
+        else:
+            log_line = f"✅ پیش‌نویس محصول {product_id} ساخته شد؛ {ledger_note}؛ ارسال کارت نتیجه ناموفق بود: {reason}"
+            history_note = (
+                "از تاریخچهٔ محصولات می‌توانی جزئیات را ببینی."
+                if ledger_saved else "شناسهٔ محصول را برای پیگیری نگه دار."
+            )
+            notice = (
+                f"✅ پیش‌نویس ساخته شد (شناسهٔ محصول: {product_id}). "
+                f"ارسال کارت نتیجه ناموفق بود؛ {history_note}"
+            )
+        try:
+            await product_journal.send_log_message(context.bot, log_line)
+        except Exception:
+            logger.exception("Could not log post-publish notification failure")
+        try:
+            await query.edit_message_text(notice)
+        except Exception as notify_exc:
+            logger.warning(
+                "Product %s was created, but its result could not be shown to user %s (%s): %s",
+                product_id, user.id, type(notify_exc).__name__, str(notify_exc)[:240],
+            )
+            try:
+                await context.bot.send_message(text=notice, **_target(session, user.id))
+            except Exception:
+                logger.exception("Could not send post-publish recovery notice")
+        try:
+            _cleanup(user.id)
+        except Exception:
+            logger.exception("Product %s was created, but flow cleanup failed", product_id)
+        return ConversationHandler.END
+
     if session.mode == "new":
         try:
             await _status(context, user.id, session, "📤 در حال آپلود عکس‌ها و ساخت پیش‌نویس مستقیم در ووکامرس...")
@@ -1429,6 +1490,7 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                     bot_version=_BOT_VERSION,
                 ),
             )
+            publish_returned = True
             resumed = any(line.startswith("[resume] جمع‌بندی") for line in report)
             await _telegram_log(
                 context,
@@ -1479,6 +1541,8 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             _cleanup(user.id)
             return ConversationHandler.END
         except WooCommerceAPIError as exc:
+            if publish_returned:
+                return await keep_success_if_reply_failed(exc)
             audit_lines = exc.diagnostics or []
             await _telegram_log(
                 context,
@@ -1497,6 +1561,8 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             session.submitting = False
             return REVIEW
         except Exception as exc:
+            if publish_returned:
+                return await keep_success_if_reply_failed(exc)
             details = traceback.format_exc()
             audit_lines = list(getattr(exc, "diagnostics", []) or [])
             reason = describe_exception(exc)

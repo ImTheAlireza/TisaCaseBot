@@ -216,18 +216,25 @@ async def _send(context: Any, card: str, journal: Journal, *, chat_id: object) -
         logger.info("product trace:\n%s", journal.trace_text())
     target = settings.log_chat_id
     if not target:
+        logger.warning("product log card skipped: LOG_CHAT_ID is empty")
         return
     try:
         await context.bot.send_message(chat_id=target, text=card)
         if settings.verbose_log and journal.trace:
-            for start in range(0, len(journal.trace_text()), MESSAGE_LIMIT):
+            trace = journal.trace_text()
+            for start in range(0, len(trace), MESSAGE_LIMIT):
                 await context.bot.send_message(
-                    chat_id=target, text=journal.trace_text()[start : start + MESSAGE_LIMIT]
+                    chat_id=target, text=trace[start : start + MESSAGE_LIMIT]
                 )
     except Exception as exc:
-        # Once per card, and never fatal: a wrong LOG_CHAT_ID used to make the whole
-        # audit trail vanish without a trace anywhere else.
-        logger.debug("log chat unavailable (%s): %s", type(exc).__name__, exc)
+        # Never break publishing, but do not hide an invalid chat id, missing
+        # membership, or missing send permission at INFO log level.
+        logger.warning(
+            "product log delivery failed (LOG_CHAT_ID=%s, %s): %s",
+            target,
+            type(exc).__name__,
+            str(exc)[:240],
+        )
 
 
 __all__ = ["Journal", "flush", "journal_for", "reset", "send_log_message"]
