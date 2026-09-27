@@ -140,6 +140,32 @@ class Journal:
         return body
 
 
+async def send_log_message(bot: Any, text: str, *, parse_mode: str | None = None) -> bool:
+    """Send one diagnostic to ``LOG_CHAT_ID`` without breaking the user flow.
+
+    Returns whether Telegram accepted the message; configuration/permission failures
+    are reported to the local log so a missing group message is diagnosable.
+    """
+    target = settings.log_chat_id
+    if not target:
+        logger.warning("log chat message skipped: LOG_CHAT_ID is empty")
+        return False
+    kwargs: dict[str, Any] = {"chat_id": target, "text": text}
+    if parse_mode:
+        kwargs["parse_mode"] = parse_mode
+    try:
+        await bot.send_message(**kwargs)
+        return True
+    except Exception as exc:
+        logger.warning(
+            "log chat send failed (LOG_CHAT_ID=%s, %s): %s",
+            target,
+            type(exc).__name__,
+            str(exc)[:240],
+        )
+        return False
+
+
 def journal_for(context: Any) -> Journal | None:
     """This chat's journal (created on first use); ``None`` without a ``chat_data``."""
     data = getattr(context, "chat_data", None)
@@ -204,4 +230,4 @@ async def _send(context: Any, card: str, journal: Journal, *, chat_id: object) -
         logger.debug("log chat unavailable (%s): %s", type(exc).__name__, exc)
 
 
-__all__ = ["Journal", "flush", "journal_for", "reset"]
+__all__ = ["Journal", "flush", "journal_for", "reset", "send_log_message"]

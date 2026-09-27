@@ -19,6 +19,7 @@ import time
 from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import NetworkError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -30,11 +31,12 @@ from telegram.ext import (
 )
 
 from bot.buttons import feature_allowed
-from bot.services import metrics, flow_guard
+from bot.services import metrics, flow_guard, product_journal
 from bot.config import settings
 from bot.constants import CB
 from bot.keyboards import main_menu_keyboard, main_menu_text
 from bot.services.image_compressor import compress_image
+from bot.services.product_text_summary import format_product_summary
 
 logger = logging.getLogger(__name__)
 
@@ -60,10 +62,97 @@ def close_for(user_id: int) -> bool:
 
 INSTRUCTION = (
     "🗜️ <b>فشرده‌سازی عکس‌ها</b>\n\n"
-    "پیام‌هایی که عکس دارند را <b>فوروارد</b> کن (یا مستقیم بفرست).\n"
-    "هر عکس دانلود و فشرده می‌شود و به‌صورت فایل برایت ارسال می‌شود.\n\n"
+    "پیام‌های عکس‌دار را فوروارد کن؛ عکس فشرده می‌شود و مدل‌ها و ویژگی‌ها از کپشن/متن همراه استخراج می‌شوند.\n"
+    "مدل‌ها به شکل <code>model | model | ...</code> نمایش داده می‌شوند.\n\n"
     "برای پایان: /cancel"
 )
+
+ANALYSIS_CAPTIONS_KEY = "compress_analysis_captions"
+ANALYSIS_INFO_KEY = "compress_analysis_info"
+ANALYSIS_REPORT_KEY = "compress_analysis_report"
+ANALYSIS_SOURCE_KEY = "compress_analysis_source"
+ANALYSIS_PROMPT_KEY = "compress_analysis_prompt_sent"
+
+
+async def _log_to_group(context: ContextTypes.DEFAULT_TYPE, text: str, *, parse_mode: str | None = None) -> None:
+    logger.info("%s", text)
+    if settings.log_chat_id:
+        await product_journal.send_log_message(context.bot, text, parse_mode=parse_mode)
+
+
+def _append_analysis_text(context: ContextTypes.DEFAULT_TYPE, key: str, text: str) -> None:
+    text = (text or "").strip()
+    if not text:
+        return
+    values = context.user_data.setdefault(key, [])
+    if text not in values:
+        values.append(text)
+
+
+async def _send_analysis(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
+    """Analyze the text accompanying compressed photos and send a concise admin report."""
+    captions = context.user_data.get(ANALYSIS_CAPTIONS_KEY, [])
+    info_parts = context.user_data.get(ANALYSIS_INFO_KEY, [])
+    caption = "\n".join(captions)
+    info = "\n".join(info_parts)
+    source = "\n".join(part for part in (caption, info) if part.strip()).strip()
+    if not source:
+        if not context.user_data.get(ANALYSIS_PROMPT_KEY):
+            context.user_data[ANALYSIS_PROMPT_KEY] = True
+            await context.bot.send_message(
+                chat_id=user_id,
+                text="📝 برای تشخیص مدل و ویژگی‌ها، کپشن عکس یا متن محصول را هم بفرست؛ عکسِ بدون متن قابل‌تشخیص نیست.",
+            )
+            await _log_to_group(
+                context,
+                f"🗜️ [compress:{user_id}] تشخیص اجرا نشد: کپشن یا متن همراه عکس دریافت نشده است.",
+            )
+        return
+
+    report_source = "\n".join(part for part in (caption, info) if part.strip())
+    if report_source == context.user_data.get(ANALYSIS_SOURCE_KEY):
+        return
+    context.user_data[ANALYSIS_SOURCE_KEY] = report_source
+    # Reuse the product-creation flow verbatim: its parser/AI normalization,
+    # learned vocabulary, color matrix, and accessory handling all stay in sync.
+    from bot.modules.product_flow import extract_product_metadata
+
+    models, attributes = await extract_product_metadata(caption, info)
+    report = format_product_summary(models, attributes)
+    if report == context.user_data.get(ANALYSIS_REPORT_KEY):
+        return
+    await context.bot.send_message(chat_id=user_id, text=report, parse_mode="HTML")
+    await _log_to_group(
+        context,
+        f"🗜️ [compress:{user_id}] خروجی همان پارسرِ ساخت محصول:\n{report}",
+        parse_mode="HTML",
+    )
+    context.user_data[ANALYSIS_REPORT_KEY] = report
+
+
+async def _try_send_analysis(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
+    try:
+        await _send_analysis(context, user_id)
+    except Exception as exc:
+        # Compression should still succeed if extraction/AI is unavailable.
+        context.user_data.pop(ANALYSIS_SOURCE_KEY, None)
+        logger.exception("Image-compression metadata extraction failed for user %s", user_id)
+        await _log_to_group(
+            context,
+            f"🗜️ [compress:{user_id}] خطای تشخیص: {type(exc).__name__}: {str(exc)[:240]}",
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text="⚠️ عکس فشرده شد؛ تشخیص مدل و ویژگی از متن انجام نشد.",
+            )
+        except Exception:
+            logger.exception("Could not notify user %s about metadata extraction failure", user_id)
+
+
+def _clear_analysis(context: ContextTypes.DEFAULT_TYPE) -> None:
+    for key in (ANALYSIS_CAPTIONS_KEY, ANALYSIS_INFO_KEY, ANALYSIS_REPORT_KEY, ANALYSIS_SOURCE_KEY, ANALYSIS_PROMPT_KEY):
+        context.user_data.pop(key, None)
 
 
 def _can_compress(user_id: int | None) -> bool:
@@ -108,6 +197,7 @@ async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await query.answer("⛔ دسترسی ندارید.", show_alert=True)
         return ConversationHandler.END
     await query.answer()
+    _clear_analysis(context)
     # «one thing at a time»: any other open flow of this user is closed first.
     closed = flow_guard.close_others("compress", user.id)
     if closed:
@@ -137,15 +227,19 @@ async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return WAITING
 
     file_id, name = media
+    _append_analysis_text(context, ANALYSIS_CAPTIONS_KEY, message.caption or "")
     root = TEMP_DIR / f"{user.id}_{int(time.time() * 1000)}"
     root.mkdir(parents=True, exist_ok=True)
     src = root / _safe_name(name, "image.jpg")
     status = await message.reply_text("⬇️ در حال دانلود عکس...")
+    send_started = False
+    delivered = False
     try:
-        await _download(context, file_id, src)
+        original_size = await _download(context, file_id, src)
         await status.edit_text("🗜️ در حال فشرده‌سازی...")
         compressed = await asyncio.to_thread(compress_image, src, root / "out")
         await status.edit_text("📤 در حال ارسال...")
+        send_started = True
         with compressed.open("rb") as handle:
             await context.bot.send_document(
                 user.id,
@@ -153,23 +247,63 @@ async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 filename=compressed.name,
                 caption=f"🗜️ فشرده شد: {name}",
             )
-        await status.delete()
+        delivered = True
+        try:
+            await status.delete()
+        except Exception:
+            # The photo was already sent. A timed-out cleanup must not turn success
+            # into a red «compression failed» message.
+            logger.info("Could not delete compression status for user %s", user.id, exc_info=True)
+        compressed_size = compressed.stat().st_size if compressed.exists() else 0
+        await _log_to_group(
+            context,
+            f"🗜️ [compress:{user.id}] عکس ارسال شد: {name}؛ "
+            f"{original_size} → {compressed_size} بایت.",
+        )
+        await _try_send_analysis(context, user.id)
     except Exception as exc:
         logger.exception("Compress flow failed for user %s", user.id)
-        try:
-            await status.edit_text(f"❌ خطا: {type(exc).__name__}: {exc}")
-        except Exception:
-            pass
+        await _log_to_group(
+            context,
+            f"🗜️ [compress:{user.id}] خطای فشرده‌سازی/ارسال: {type(exc).__name__}: {str(exc)[:240]}",
+        )
+        if delivered:
+            # Any post-send failure is ancillary; the file is already in the admin chat.
+            try:
+                await status.edit_text("✅ عکس فشرده و ارسال شد.")
+            except Exception:
+                pass
+        elif send_started and isinstance(exc, NetworkError):
+            # Telegram may have accepted the document even though its response timed out.
+            # Do not suggest an automatic retry that could send a duplicate file.
+            try:
+                await status.edit_text("⚠️ پاسخ تلگرام نرسید؛ ممکن است عکس ارسال شده باشد. قبل از تکرار، پیام‌ها را بررسی کن.")
+            except Exception:
+                pass
+        else:
+            try:
+                await status.edit_text(f"❌ خطا: {type(exc).__name__}: {exc}")
+            except Exception:
+                pass
     finally:
         shutil.rmtree(root, ignore_errors=True)
     return WAITING
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """A stray text while waiting → remind the user what to send."""
-    await update.effective_message.reply_text(
-        "🗜️ پیامی با عکس فوروارد کن تا فشرده شود.\nبرای پایان: /cancel"
-    )
+    """Collect product info sent beside photos and show detected models/features."""
+    message = update.effective_message
+    user = update.effective_user
+    text = (message.text or "").strip() if message else ""
+    if not user or not text:
+        return WAITING
+    _append_analysis_text(context, ANALYSIS_INFO_KEY, text)
+    status = await message.reply_text("🔎 در حال تشخیص مدل‌ها و ویژگی‌ها...")
+    try:
+        await _try_send_analysis(context, user.id)
+        await status.delete()
+    except Exception:
+        logger.exception("Could not send image-compression analysis status for user %s", user.id)
     return WAITING
 
 
@@ -178,6 +312,7 @@ async def cb_back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     query = update.callback_query
     user = update.effective_user
     await query.answer()
+    _clear_analysis(context)
     await query.edit_message_text(
         main_menu_text(user.id if user else None, user),
         reply_markup=main_menu_keyboard(user.id if user else None),
@@ -189,6 +324,7 @@ async def cb_back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def cmd_exit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """/cancel, /start or /menu during the flow → back to the main menu."""
     user = update.effective_user
+    _clear_analysis(context)
     await update.effective_message.reply_html(
         main_menu_text(user.id if user else None, user),
         reply_markup=main_menu_keyboard(user.id if user else None),

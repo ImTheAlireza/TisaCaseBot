@@ -909,6 +909,13 @@ async def _extract(session: ProductSession, *, learn: bool = True) -> ProductDat
     return session.data
 
 
+async def extract_product_metadata(model_text: str, info_text: str) -> tuple[list[str], dict[str, list[str]]]:
+    """Use the actual product-flow parser/AI pipeline without recording a product."""
+    session = ProductSession(model_text=model_text or "", info_text=info_text or "")
+    data = await _extract(session, learn=False)
+    return session.models, data.attributes if data is not None else {}
+
+
 def _apply_color_matrix(session: ProductSession, source_text: str) -> None:
     """Split «which colors exist» from «which color goes with which phone».
 
