@@ -139,9 +139,12 @@ class TestCollectVersusReview(FlowStateTestCase):
         update, sent = _update("قیمت 698000")
         result = asyncio.run(PF.on_text(update, SimpleNamespace()))
         self.assertEqual(result, PF.COLLECT)
-        self.assertIn("تصاویر تمام شد", sent[0][1])
-        buttons = [b.callback_data for row in sent[0][2]["reply_markup"].inline_keyboard for b in row]
+        self.assertIn("عکس‌های دریافت‌شده پردازش شوند و به مرحلهٔ بعد بروی", sent[0][1])
+        rows = sent[0][2]["reply_markup"].inline_keyboard
+        buttons = [b.callback_data for row in rows for b in row]
+        labels = [b.text for row in rows for b in row]
         self.assertIn("product:mediaend", buttons)
+        self.assertIn("✅ عکس‌ها تمام شد؛ ادامه", labels)
 
     def test_typed_text_on_the_review_screen_is_only_a_proposal(self):
         session = PF.ProductSession(mode="new", info_text="قیمت 698000")
@@ -205,9 +208,12 @@ class TestCollectVersusReview(FlowStateTestCase):
         result = asyncio.run(PF.add_more(update, SimpleNamespace()))
         self.assertEqual(result, PF.COLLECT)
         # the toast comes first, then the message with the collect keyboard
-        self.assertTrue(any("تصاویر تمام شد" in str(item) for item in sent), sent)
-        buttons = [b.callback_data for row in sent[-1][2]["reply_markup"].inline_keyboard for b in row]
+        self.assertIn("عکس‌ها تمام شد؛ ادامه", sent[-1][1])
+        markup = sent[-1][2]["reply_markup"]
+        buttons = [b.callback_data for row in markup.inline_keyboard for b in row]
+        labels = [b.text for row in markup.inline_keyboard for b in row]
         self.assertIn("product:mediaend", buttons)
+        self.assertIn("✅ عکس‌ها تمام شد؛ ادامه", labels)
 
 
 @needs_flow

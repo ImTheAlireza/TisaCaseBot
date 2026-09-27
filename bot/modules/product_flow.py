@@ -1236,8 +1236,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     # in the session and let _prepare_files render the final preview later.
     if not session.files or session.processing_media:
         await message.reply_text(
-            "✅ متن دریافت شد؛ پردازش عکس‌ها و تشخیص مدل‌ها ادامه دارد. بعد از پایان، اطلاعات کامل به‌روزرسانی می‌شود."
-            + "\n\nاگر عکس‌هایت را تمام کردی، «✅ تصاویر تمام شد» را بزن تا معطل تایمر نشوی.",
+            "✅ متن دریافت شد؛ عکس‌ها هنوز در حال پردازش‌اند."
+            "\n\nاگر عکس دیگری نمی‌فرستی، «✅ عکس‌ها تمام شد؛ ادامه» را بزن تا عکس‌های دریافت‌شده پردازش شوند و به مرحلهٔ بعد بروی."
+            " اگر هنوز عکس می‌فرستی، دکمه را نزن و عکس را بفرست.",
             reply_markup=_collect_keyboard(),
         )
         return COLLECT
@@ -1955,7 +1956,7 @@ def _collect_keyboard() -> InlineKeyboardMarkup:
     anything. A person who knows they sent the last photo should not have to
     hope that timer was long enough — one tap flushes it.
     """
-    rows = [[InlineKeyboardButton("✅ تصاویر تمام شد", callback_data="product:mediaend")],
+    rows = [[InlineKeyboardButton("✅ عکس‌ها تمام شد؛ ادامه", callback_data="product:mediaend")],
             [InlineKeyboardButton("❌ لغو", callback_data="product:cancel")]]
     return InlineKeyboardMarkup(rows)
 
@@ -1998,7 +1999,7 @@ async def add_more(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return ConversationHandler.END
     session.pending_text = ""
     await query.message.reply_text(
-        "📦 عکس یا متن جدید را بفرست؛ بعد از هر پیام پیش‌نمایش تازه می‌شود. وقتی تمام کردی «✅ تصاویر تمام شد» را بزن.",
+        "📦 عکس یا متن جدید را بفرست؛ بعد از هر پیام پیش‌نمایش تازه می‌شود. وقتی عکس دیگری نداری، «✅ عکس‌ها تمام شد؛ ادامه» را بزن.",
         reply_markup=_collect_keyboard(),
     )
     return COLLECT
