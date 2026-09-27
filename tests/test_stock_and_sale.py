@@ -428,8 +428,8 @@ class TestWorkspaceKeepsTheName(unittest.TestCase):
 
 
 @needs_flow
-class TestPreviewSaysTheScope(unittest.TestCase):
-    """پیش‌نمایش باید بگوید این عدد روی چند واریژن نوشته می‌شود."""
+class TestProductPreview(unittest.TestCase):
+    """پیش‌نمایش فقط فیلدهای اصلی را با مدل کامل و دسته‌بندی درختی نشان می‌دهد."""
 
     def _preview(self, data: ProductData) -> str:
         from bot.modules import product_flow as PF
@@ -437,43 +437,58 @@ class TestPreviewSaysTheScope(unittest.TestCase):
         session = PF.ProductSession(data=data, chat_id=9)
         return PF._preview(session)
 
-    def test_variable_scope_is_stated(self) -> None:
+    def test_preview_uses_the_requested_essential_fields(self) -> None:
         text = self._preview(_draft())
-        self.assertIn("موجودی:</b> 20", text)
-        self.assertIn("هر 4 واریژن", text)
-        self.assertIn("قیمت ویژه:", text)
-
-    def test_simple_product_says_it_lands_on_the_product(self) -> None:
-        text = self._preview(_draft(models=[], attributes={}))
-        self.assertIn("محصول ساده", text)
-
-    def test_out_of_stock_without_a_number_is_still_shown(self) -> None:
-        text = self._preview(_draft(stock=None, stock_status="outofstock"))
-        self.assertIn("ناموجود", text)
-
-    def test_silence_shows_nothing(self) -> None:
-        text = self._preview(_draft(stock=None, sale_price=0))
-        self.assertNotIn("موجودی", text)
-        self.assertNotIn("قیمت ویژه", text)
-
-    def test_preview_does_not_repeat_models_in_attributes(self) -> None:
-        text = self._preview(_draft(models=["iPhone 13", "iPhone 14"], attributes={"رنگ": ["مشکی", "سفید"]}))
-        self.assertIn("<b>مدل‌ها (2):</b> iPhone 13 | iPhone 14", text)
+        self.assertIn("<b>عنوان:</b> قاب گوشی اپل", text)
+        self.assertIn("<b>قیمت:</b> 100,000 تومان", text)
+        self.assertIn("<b>شناسه:</b> IP15", text)
+        self.assertIn("<b>مدل:</b> iPhone 15 | S24 Ultra", text)
         self.assertIn("<b>رنگ:</b> مشکی | سفید", text)
-        self.assertNotIn("از کجا می‌دانم", text)
-        self.assertNotIn("اطلاعات را بررسی کن", text)
+        self.assertIn("<b>نوع محصول:</b> متغیر", text)
+        self.assertIn("<b>موجودی:</b> 20 عدد", text)
+        self.assertIn("<b>قیمت ویژه:</b> 49,000 تومان", text)
+        self.assertNotIn("واریژن", text)
 
-    def test_long_model_list_is_collapsed(self) -> None:
-        models = [f"iPhone {index}" for index in range(14)]
+    def test_empty_stock_and_sale_are_omitted(self) -> None:
+        text = self._preview(_draft(stock=None, sale_price=0, stock_status=""))
+        self.assertNotIn("موجودی:", text)
+        self.assertNotIn("قیمت ویژه:", text)
+
+    def test_out_of_stock_status_is_kept(self) -> None:
+        text = self._preview(_draft(stock=None, stock_status="outofstock", sale_price=0))
+        self.assertIn("<b>موجودی:</b> ناموجود", text)
+
+    def test_simple_product_says_simple(self) -> None:
+        text = self._preview(_draft(models=[], attributes={}))
+        self.assertIn("<b>نوع محصول:</b> ساده", text)
+
+    def test_model_list_is_not_truncated(self) -> None:
+        models = [f"iPhone {index}" for index in range(36)]
         text = self._preview(_draft(models=models, attributes={"رنگ": ["مشکی", "سفید"]}))
-        self.assertIn("… +9", text)
-        self.assertNotIn("iPhone 13", text)
+        self.assertIn("iPhone 35", text)
+        self.assertNotIn("… +", text)
 
-    def test_catalog_note_is_shortened(self) -> None:
-        data = _draft(models=["iPhone 13"], notes=["برند «Ring» در کاتالوگ ربات نیست؛ ممکن است مدلی از جا بماند"])
+    def test_categories_are_nested_and_parent_is_not_repeated(self) -> None:
+        parent = "قاب و کاور گوشی و تبلت"
+        text = self._preview(_draft(categories=[
+            f"{parent} > آیفون iphone",
+            f"{parent} > سامسونگ samsung",
+            "چاپی",
+        ]))
+        self.assertEqual(1, text.count(parent))
+        self.assertIn(f"- {parent}", text)
+        self.assertIn("  - آیفون iphone", text)
+        self.assertIn("  - سامسونگ samsung", text)
+        self.assertIn("  - چاپی", text)
+
+    def test_nonessential_parser_notes_do_not_clutter_preview(self) -> None:
+        data = _draft(
+            models=["iPhone 13"],
+            notes=["برند «PROMAX» در کاتالوگ ربات نیست؛ ممکن است مدلی از جا بماند"],
+        )
         text = self._preview(data)
-        self.assertIn("برند Ring در کاتالوگ نیست", text)
-        self.assertNotIn("ممکن است مدلی از جا بماند", text)
+        self.assertNotIn("PROMAX", text)
+        self.assertNotIn("حدسی", text)
 
 
 @needs_flow

@@ -2,8 +2,9 @@
 
 A single button starts a short conversation: the user forwards (or sends)
 messages containing photos / image documents, the bot downloads them, runs
-them through ``compress_image``, and sends the compressed files back. No
-WordPress / product involvement — just local image processing.
+them through ``compress_image``, and sends the compressed files back. When
+caption or product text is present, metadata is also extracted through the
+product-creation parser; this utility never publishes a product.
 
 Admins can use it only while the sudo owner has it enabled for them (see the
 «⚙️ تنظیمات» screen and bot/services/preferences.py).
@@ -76,8 +77,9 @@ ANALYSIS_PROMPT_KEY = "compress_analysis_prompt_sent"
 
 async def _log_to_group(context: ContextTypes.DEFAULT_TYPE, text: str, *, parse_mode: str | None = None) -> None:
     logger.info("%s", text)
-    if settings.log_chat_id:
-        await product_journal.send_log_message(context.bot, text, parse_mode=parse_mode)
+    # The shared sender also reports an unset destination, so misconfiguration is
+    # visible locally instead of silently skipping the requested audit trail.
+    await product_journal.send_log_message(context.bot, text, parse_mode=parse_mode)
 
 
 def _append_analysis_text(context: ContextTypes.DEFAULT_TYPE, key: str, text: str) -> None:

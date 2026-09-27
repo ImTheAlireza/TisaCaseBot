@@ -32,6 +32,21 @@ class TestImageCompressAnalysis(unittest.IsolatedAsyncioTestCase):
         importlib.util.find_spec("telegram") and importlib.util.find_spec("httpx"),
         "Telegram/httpx runtime dependencies are not installed",
     )
+    async def test_log_wrapper_always_uses_shared_sender(self) -> None:
+        from bot.modules import image_compress
+
+        bot = SimpleNamespace()
+        context = SimpleNamespace(bot=bot)
+        sender = AsyncMock(return_value=False)
+        with patch.object(image_compress.product_journal, "send_log_message", new=sender):
+            await image_compress._log_to_group(context, "trace")
+
+        sender.assert_awaited_once_with(bot, "trace", parse_mode=None)
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("telegram") and importlib.util.find_spec("httpx"),
+        "Telegram/httpx runtime dependencies are not installed",
+    )
     async def test_metadata_adapter_uses_product_creation_parser(self) -> None:
         product = SimpleNamespace(attributes={"رنگ": ["مشکی", "سفید"]})
 

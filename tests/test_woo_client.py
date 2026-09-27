@@ -134,7 +134,7 @@ class TestRetryPolicy(unittest.IsolatedAsyncioTestCase):
 
     async def test_transport_error_summary_fills_empty_timeout_message(self) -> None:
         self.assertEqual(
-            "ReadTimeout: پاسخ فروشگاه نرسید؛ ممکن است درخواست انجام شده باشد",
+            "ReadTimeout: پاسخ فروشگاه نرسید؛ ممکن است درخواست اعمال شده باشد",
             describe_exception(httpx.ReadTimeout("")),
         )
         self.assertEqual(

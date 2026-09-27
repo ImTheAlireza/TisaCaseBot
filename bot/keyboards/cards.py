@@ -43,7 +43,7 @@ def result_card(entry: dict[str, object]) -> str:
         if error:
             lines.append(f"⚠️ {html.escape(error.partition(':')[0], quote=False)}")
     elif status == "restocked":
-        lines.append("🔄 <b>موجودی به‌روز شد.</b>")
+        lines.append("🔄 <b>شارژ موجودی به‌روز شد.</b>")
     elif status == "zip":
         lines.append("📦 <b>فایل آمادهٔ آپلود است.</b>")
     else:

@@ -113,7 +113,7 @@ class TestLedger(LedgerTestCase):
     def test_queued_summary_shows_only_the_short_error_type(self):
         entry = products_ledger.record(
             user_id=7, status="queued", title="قاب",
-            error="ReadTimeout: پاسخ فروشگاه نرسید؛ ممکن است درخواست انجام شده باشد",
+            error="ReadTimeout: پاسخ فروشگاه نرسید؛ ممکن است درخواست اعمال شده باشد",
         )
         text = products_ledger.summary(entry)
         self.assertIn("ReadTimeout", text)
@@ -304,8 +304,8 @@ class TestProductTools(LedgerTestCase):
     def test_long_history_report_degrades_to_plain_text(self):
         products_ledger.record(user_id=7, title="قاب", product_id=1, report="<b>" + "ب" * 9000 + "</b>")
         entry = products_ledger.recent(1)[0]
-        update, sent = self._query(f"products:open:{entry['key']}")
-        asyncio.run(PT.cb_open(update, SimpleNamespace()))
+        update, sent = self._query(f"products:report:{entry['key']}")
+        asyncio.run(PT.cb_report(update, SimpleNamespace()))
         _kind, text, kwargs = sent[0]
         self.assertNotIn("parse_mode", kwargs)
         self.assertNotIn("<", text[-200:], "no dangling tag may reach Telegram")

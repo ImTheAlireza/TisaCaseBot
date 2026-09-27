@@ -538,8 +538,33 @@ def _caption(messages: list[Message]) -> str:
     return "\n".join((m.caption or m.text or "") for m in sorted(messages, key=lambda x: x.message_id) if (m.caption or m.text))
 
 
+def _category_tree_lines(categories: Sequence[str]) -> list[str]:
+    """Render category paths once as a compact parent/child tree."""
+    tree: dict[str, dict] = {}
+    visible = [str(category) for category in categories if str(category).strip() not in FORBIDDEN]
+    for raw_path in _canonical_category_paths(visible):
+        parts = [
+            html.unescape(part).strip()
+            for part in str(raw_path).replace("&gt;", ">").split(">")
+            if html.unescape(part).strip()
+        ]
+        branch = tree
+        for part in parts:
+            branch = branch.setdefault(part, {})
+
+    lines: list[str] = []
+
+    def append_branch(branch: dict[str, dict], depth: int = 0) -> None:
+        for name, children in branch.items():
+            lines.append(f"{'  ' * depth}- {html.escape(name)}")
+            append_branch(children, depth + 1)
+
+    append_branch(tree)
+    return lines
+
+
 def _preview(session: ProductSession) -> str:
-    """Short review of the fields that will be sent to the store."""
+    """Show only the product's essential publish fields in a clean hierarchy."""
     data = session.data
     if data is None:
         return "❌ هنوز اطلاعات محصولی ندارم."
@@ -549,45 +574,43 @@ def _preview(session: ProductSession) -> str:
     lines = ["📦 <b>پیش‌نمایش</b>"]
     if settings.woo_dry_run:
         lines.append("🧪 حالت آزمایشی")
-    lines.append(f"<b>عنوان:</b> {html.escape(data.title) if data.title else '⚠️ پیدا نشد'}")
+    title = html.escape(data.title) if data.title else "—"
+    lines.append(f"<b>عنوان:</b> {title}")
 
     if data.prices:
-        price_text = " | ".join(f"{group}: {value:,} تومان" for group, value in data.prices.items())
+        price_parts = [f"{html.escape(str(group))}: {value:,} تومان" for group, value in data.prices.items()]
         if data.price:
-            price_text += f" (پایه: {data.price:,} تومان)"
+            price_parts.append(f"پایه: {data.price:,} تومان")
+        price_text = " | ".join(price_parts)
     else:
         price_text = f"{data.price:,} تومان" if data.price else "—"
     lines.append(f"<b>قیمت:</b> {price_text}")
-
-    scope = f"هر {plan.count} واریژن" if plan.is_variable else "محصول"
     if data.sale_price:
-        lines.append(f"<b>قیمت ویژه:</b> {data.sale_price:,} تومان ({scope})")
+        lines.append(f"<b>قیمت ویژه:</b> {data.sale_price:,} تومان")
     if data.stock is not None:
-        status = {"outofstock": "، ناموجود", "onbackorder": "، پیش‌فروش"}.get(data.stock_status, "")
-        lines.append(f"<b>موجودی:</b> {data.stock:,} عدد ({scope}{status})")
+        lines.append(f"<b>موجودی:</b> {data.stock:,} عدد")
     elif data.stock_status == "outofstock":
         lines.append("<b>موجودی:</b> ناموجود")
     elif data.stock_status == "onbackorder":
-        lines.append("<b>وضعیت:</b> پیش‌فروش")
-    sku = html.escape(data.sku_prefix) if data.sku_prefix else "⚠️ پیدا نشد"
-    lines.append(f"<b>SKU:</b> {sku}")
+        lines.append("<b>موجودی:</b> پیش‌فروش")
+    sku = html.escape(data.sku_prefix) if data.sku_prefix else "—"
+    lines.append(f"<b>شناسه:</b> {sku}")
 
-    models = data.models or []
-    shown_models = " | ".join(html.escape(model) for model in models[:5])
-    if len(models) > 5:
-        shown_models += f" … +{len(models) - 5}"
-    lines.append(f"<b>مدل‌ها ({len(models)}):</b> {shown_models or '⚠️ پیدا نشد'}")
+    lines.append("")
+    lines.append("<b>ویژگی‌ها:</b>")
+    models = plan.models or list(data.models or [])
+    model_text = " | ".join(html.escape(model) for model in models) if models else "—"
+    lines.append(f"<b>مدل:</b> {model_text}")
+    for name, values in plan.axes:
+        if name == "مدل":
+            continue
+        lines.append(f"<b>{html.escape(name)}:</b> " + " | ".join(html.escape(value) for value in values))
+    lines.append(f"<b>نوع محصول:</b> {'متغیر' if plan.is_variable else 'ساده'}")
 
-    other_axes = [(name, values) for name, values in plan.axes if name != "مدل"]
-    if other_axes:
-        for name, values in other_axes:
-            lines.append(f"<b>{html.escape(name)}:</b> " + " | ".join(html.escape(value) for value in values))
-    lines.append(f"🎨 {plan.count} واریژن" if plan.is_variable else "📦 محصول ساده")
-    if plan.restricted:
-        lines.append(f"⚠️ رنگ‌ها برای {len(plan.restrictions)} مدل محدود شده")
-
-    categories = [html.escape(x.replace(" > ", " ← ")) for x in data.categories if x not in FORBIDDEN]
-    lines.append("<b>دسته:</b> " + (" · ".join(categories) if categories else "—"))
+    lines.append("")
+    lines.append("<b>دسته‌بندی:</b>")
+    category_lines = _category_tree_lines(data.categories)
+    lines.extend(category_lines or ["—"])
 
     issues = validate_draft(
         data.to_dict(),
@@ -602,14 +625,6 @@ def _preview(session: ProductSession) -> str:
     )
     if issues.blocking:
         lines.extend(f"⛔ {html.escape(issue.message)}" for issue in issues.errors[:3])
-    elif issues.warnings:
-        lines.append(f"⚠️ {html.escape(issues.warnings[0].message)}")
-    lines.extend(_open_questions(session))
-    for note in getattr(data, "notes", []) or []:
-        match = re.search(r"برند\s*[«\"]([^»\"]+)[»\"]\s*در کاتالوگ ربات نیست", str(note))
-        if match:
-            lines.append(f"⚠️ برند {html.escape(match.group(1))} در کاتالوگ نیست؛ مدل‌ها را بررسی کن.")
-            break
     return "\n".join(lines)
 
 
@@ -777,6 +792,47 @@ async def analyze(text: str, *, apply_rules: bool = True) -> ProductData:
         return await _extract(probe, learn=False)
 
 
+def _canonical_category_paths(categories: Sequence[str]) -> list[str]:
+    """Expand an unambiguous taxonomy leaf (e.g. «چاپی») to its full path."""
+    paths = draft_edits.taxonomy_paths()
+    by_leaf: dict[str, list[str]] = {}
+    for path in paths:
+        by_leaf.setdefault(path.split(" > ")[-1].casefold(), []).append(path)
+    roots = {
+        line.strip().casefold()
+        for line in TAXONOMY.splitlines()
+        if line.strip() and not line.startswith(" ")
+    }
+    result: list[str] = []
+    seen: set[str] = set()
+    for raw in categories:
+        category = html.unescape(str(raw)).replace(" ← ", " > ").strip()
+        category = re.sub(r"\s*>\s*", " > ", category)
+        key = category.casefold()
+        exact = next((path for path in paths if path.casefold() == key), None)
+        if not exact and "/" in category:
+            # A slash can be part of a category label («Airpods 1/2»); treat it
+            # as a hierarchy separator only if that produces a real taxonomy path.
+            candidate = re.sub(r"\s*/\s*", " > ", category).strip()
+            exact = next((path for path in paths if path.casefold() == candidate.casefold()), None)
+        if exact:
+            category = exact
+        elif key not in roots:
+            matches = by_leaf.get(category.split(">")[-1].strip().casefold(), [])
+            if len(matches) == 1:
+                category = matches[0]
+        folded = category.casefold()
+        if category and folded not in seen:
+            seen.add(folded)
+            result.append(category)
+    # Keep only the deepest selected paths; a child already carries its parent.
+    return [
+        category
+        for category in result
+        if not any(other.casefold().startswith(category.casefold() + " > ") for other in result)
+    ]
+
+
 async def _extract(session: ProductSession, *, learn: bool = True) -> ProductData:
     # ``learn=False`` is the parser-test sandbox: reading a sample must not add it
     # to the replay corpus of real products (see bot/services/learning_corpus.py).
@@ -872,9 +928,7 @@ async def _extract(session: ProductSession, *, learn: bool = True) -> ProductDat
     }
     normalized_categories = []
     for category in categories:
-        category = category.replace("&gt;", ">")
-        # AI sometimes uses slash instead of the hierarchy separator.
-        category = re.sub(r"\s*/\s*", " > ", category).strip()
+        category = html.unescape(category).replace(" ← ", " > ").strip()
         leaf = category.split(">")[-1].strip()
         if leaf in explicit_category_words and not re.search(explicit_category_words[leaf], source):
             continue
@@ -901,7 +955,7 @@ async def _extract(session: ProductSession, *, learn: bool = True) -> ProductDat
                     path = airpods_root + " > " + leaf
                     if path not in normalized_categories:
                         normalized_categories.append(path)
-    session.data.categories = normalized_categories
+    session.data.categories = _canonical_category_paths(normalized_categories)
     session.data.attributes = {k: v for k, v in session.data.attributes.items() if not is_model_attribute(k)}
     _apply_color_matrix(session, model_source)
     if learn:

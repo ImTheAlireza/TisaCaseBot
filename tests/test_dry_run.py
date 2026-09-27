@@ -412,12 +412,12 @@ class TestFlowDryRun(unittest.IsolatedAsyncioTestCase):
         trace = [text for text in cards if "درخواست‌هایی که ساخته شدند" in text]
         self.assertEqual(0, len(trace), "ردپای فنی نباید برای ادمین عادی ارسال شود")
 
-    async def test_preview_warns_before_approval(self) -> None:
+    async def test_preview_marks_dry_mode_concisely(self) -> None:
         with patched_settings(_dry_settings()):
             text = PF._preview(PF.sessions[7])
-        self.assertIn("TISA_DRY_RUN", text)
-        self.assertIn("روشن است", text)
-        self.assertNotIn("TISA_DRY_RUN", PF._preview(PF.sessions[7]), "با حالت خاموش نباید اخطاری بماند")
+        self.assertIn("🧪 حالت آزمایشی", text)
+        self.assertNotIn("TISA_DRY_RUN", text, "متن پیش‌نمایش باید برای کاربر باشد، نه نام تنظیم")
+        self.assertNotIn("حالت آزمایشی", PF._preview(PF.sessions[7]), "با حالت خاموش نباید نشان داده شود")
 
 
 @needs_flow

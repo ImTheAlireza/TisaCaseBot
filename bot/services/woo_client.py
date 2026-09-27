@@ -183,7 +183,7 @@ def describe_exception(exc: BaseException) -> str:
     separately by :class:`WooClient` without query parameters.
     """
     if isinstance(exc, httpx.ReadTimeout):
-        detail = "پاسخ فروشگاه نرسید؛ ممکن است درخواست انجام شده باشد"
+        detail = "پاسخ فروشگاه نرسید؛ ممکن است درخواست اعمال شده باشد"
     elif isinstance(exc, httpx.ConnectTimeout):
         detail = "مهلت اتصال به فروشگاه تمام شد"
     elif isinstance(exc, httpx.WriteTimeout):

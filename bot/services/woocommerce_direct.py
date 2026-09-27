@@ -861,7 +861,7 @@ async def create_draft(
         # Preserve the successful steps and the final HTTP path on transport failures too.
         # Otherwise the user sees an empty ``ReadTimeout:`` despite a useful audit trail.
         try:
-            setattr(exc, "diagnostics", audit.lines)
+            exc.diagnostics = audit.lines  # type: ignore[attr-defined]
         except Exception:
             pass
         logger.exception("create_draft failed unexpectedly")
