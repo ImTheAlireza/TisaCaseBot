@@ -8,7 +8,7 @@ from dataclasses import dataclass
 
 import httpx
 
-from bot.services.woo_client import WooClient, body_snippet, products_base
+from bot.services.woo_client import Audit, WooClient, body_snippet, describe_exception, products_base
 
 logger = logging.getLogger(__name__)
 
@@ -41,11 +41,15 @@ async def ping_woocommerce(
     # Read one product: it exercises the same authenticated REST route that
     # the site owner verified in the browser, without downloading the catalog.
     started = time.perf_counter()
+    audit = Audit()
     try:
-        async with WooClient(timeout=timeout, attempts=1, key=consumer_key, secret=consumer_secret) as client:
+        async with WooClient(
+            audit=audit, timeout=timeout, attempts=1, key=consumer_key, secret=consumer_secret
+        ) as client:
             response = await client.get(products_base(url, version), params={"per_page": 1})
         elapsed = (time.perf_counter() - started) * 1000
         if response.is_success:
+            logger.info("WooCommerce ping trace: %s", audit.text())
             return WooCommerceResult(True, response.status_code, "Connected", elapsed)
         # The response body is useful for distinguishing WooCommerce permissions
         # from a hosting/WAF block. It is sent only to the private log chat and
@@ -54,6 +58,7 @@ async def ping_woocommerce(
         # It goes to the log only (never to the chat) and is redacted + single-lined by the
         # client helper rather than sliced by hand.
         logger.warning("WooCommerce response body: %s", body_snippet(response, 800))
+        logger.warning("WooCommerce ping trace: %s", audit.text())
         if response.status_code == 401:
             message = "Authentication failed (check the consumer key and secret)."
         elif response.status_code == 403:
@@ -63,12 +68,14 @@ async def ping_woocommerce(
         else:
             message = f"WooCommerce returned HTTP {response.status_code}."
         return WooCommerceResult(False, response.status_code, message, elapsed)
-    except httpx.TimeoutException:
+    except httpx.TimeoutException as exc:
         elapsed = (time.perf_counter() - started) * 1000
-        return WooCommerceResult(False, None, "Connection timed out.", elapsed)
+        logger.warning("WooCommerce ping timeout after %.0f ms: %s | %s", elapsed, describe_exception(exc), audit.text())
+        return WooCommerceResult(False, None, describe_exception(exc), elapsed)
     except httpx.HTTPError as exc:
         elapsed = (time.perf_counter() - started) * 1000
-        return WooCommerceResult(False, None, f"Connection error: {exc.__class__.__name__}.", elapsed)
+        logger.warning("WooCommerce ping transport error after %.0f ms: %s | %s", elapsed, describe_exception(exc), audit.text())
+        return WooCommerceResult(False, None, describe_exception(exc), elapsed)
     except Exception:
         elapsed = (time.perf_counter() - started) * 1000
         return WooCommerceResult(False, None, "Could not connect to WooCommerce.", elapsed)

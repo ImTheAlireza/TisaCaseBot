@@ -19,7 +19,7 @@ from bot import __version__ as _BOT_VERSION
 from bot.config import settings
 from bot.keyboards import result_card, result_keyboard
 from bot.services import outbox, products_ledger, publish_batch
-from bot.services.woo_client import WooCommerceAPIError
+from bot.services.woo_client import WooCommerceAPIError, describe_exception
 from bot.services.woocommerce_direct import create_draft
 
 logger = logging.getLogger(__name__)
@@ -107,8 +107,8 @@ async def _attempt(app: Application, entry: outbox.QueuedPublish) -> None:
             ),
         )
     except Exception as exc:
-        reason = f"{type(exc).__name__}: {exc}" if not isinstance(exc, WooCommerceAPIError) \
-            else f"HTTP {exc.status_code}: {exc}"
+        reason = f"HTTP {exc.status_code}: {exc}" if isinstance(exc, WooCommerceAPIError) \
+            else describe_exception(exc)
         if outbox.is_transient(exc):
             updated = outbox.note_failure(entry, reason)
             if updated.status == outbox.STATUS_DROPPED:

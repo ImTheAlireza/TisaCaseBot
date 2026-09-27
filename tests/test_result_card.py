@@ -376,5 +376,25 @@ class TestLedgerRecordsPublishes(LedgerTestCase):
         self.assertIn("boom", products_ledger.summary(entry))
 
 
+@needs_flow
+class TestPublishAuditSummary(unittest.TestCase):
+    def test_failed_http_request_and_media_context_survive_condensing(self):
+        from bot.modules.product_flow import _audit_for_chat
+
+        lines = [
+            "[config] تعداد تصاویر: 7",
+            "[media:start] آپلود 03_آبی.jpg؛ حجم 123,456 بایت",
+            "[http:start] #4 POST /wp-json/wp/v2/media (تلاش 1/1؛ مهلت هر فاز=45s)",
+            "[media:error] آپلود 03_آبی.jpg (123,456 بایت): ReadTimeout: timeout",
+            "[http:error] #4 POST /wp-json/wp/v2/media پس از 45,000 ms: ReadTimeout: timeout",
+            "[attempt 1] POST محصول پاسخ داد HTTP 400",
+        ]
+        summary = _audit_for_chat(lines)
+        self.assertIn("03_آبی.jpg", summary)
+        self.assertIn("123,456 بایت", summary)
+        self.assertIn("#4 POST /wp-json/wp/v2/media", summary)
+        self.assertIn("45,000 ms", summary)
+
+
 if __name__ == "__main__":
     unittest.main()

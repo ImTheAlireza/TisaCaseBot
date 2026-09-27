@@ -64,6 +64,7 @@ from bot.services.product_extractor import (
     extract_accessory_models,
     extract_product,
 )
+from bot.services.woo_client import describe_exception
 from bot.services.woocommerce_direct import WooCommerceAPIError, create_draft, product_description
 
 # The flow is a small state machine (§4.2 of docs/CODE-REVIEW-AND-UPGRADE-PLAN.md):
@@ -217,6 +218,31 @@ def _audit_for_chat(lines: list[str]) -> str:
     parts.append(attempts[0])
     if len(attempts) > 2:
         parts.append(attempts[-1])
+
+    # Keep the HTTP timeline concise but never drop the exact failed request. This is
+    # especially useful when several image uploads or variations were in flight together.
+    stage_lines = [
+        line for line in lines
+        if line.startswith(("[media:start]", "[media:error]", "[variation:start]", "[variation:error]", "[variation:batch]"))
+    ]
+    if stage_lines:
+        parts.append("جزئیات رسانه/واریژن:")
+        recent_stages = stage_lines[-5:]
+        parts.extend(recent_stages)
+        parts.extend(
+            line for line in stage_lines
+            if line.startswith(("[media:error]", "[variation:error]")) and line not in recent_stages
+        )
+
+    http_lines = [line for line in lines if line.startswith(("[http:start]", "[http:done]", "[http:error]", "[retry]"))]
+    if http_lines:
+        parts.append("گزارش HTTP (آخرین درخواست‌ها):")
+        recent = http_lines[-6:]
+        parts.extend(recent)
+        parts.extend(
+            line for line in http_lines
+            if line.startswith("[http:error]") and line not in recent
+        )
 
     plugin = [line for line in sku_lines if "next-sku" in line]
     free = [line for line in sku_lines if "آزاد است" in line]
@@ -1470,8 +1496,14 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             return REVIEW
         except Exception as exc:
             details = traceback.format_exc()
-            await _telegram_log(context, f"[product:{user.id}] ساخت مستقیم ناموفق بود: {type(exc).__name__}: {exc}\n{details}")
-            reason = f"{type(exc).__name__}: {exc}"
+            audit_lines = list(getattr(exc, "diagnostics", []) or [])
+            reason = describe_exception(exc)
+            await _telegram_log(
+                context,
+                f"[product:{user.id}] ساخت مستقیم ناموفق بود: {reason}"
+                + ("\n\n--- لاگ گام‌به‌گام ---\n" + "\n".join(audit_lines) if audit_lines else "")
+                + f"\n\n{details}",
+            )
             queued = _queue_for_retry(exc, user_id=user.id, session=session, data=data,
                                       batch=batch, error=reason, ledger_key=intent_key)
             _record_result(user.id, session, data, status="queued" if queued else "failed",
@@ -1479,7 +1511,9 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             await _flush_journal(context, status="queued" if queued else "failed", data=data,
                                  session=session, batch=batch, errors=[reason])
             await query.edit_message_text(
-                f"❌ ساخت مستقیم محصول ناموفق بود:\n{type(exc).__name__}: {exc}" + _queued_note(queued)
+                _attach_audit(
+                    f"❌ ساخت مستقیم محصول ناموفق بود:\n{reason}" + _queued_note(queued), audit_lines
+                )
             )
             session.submitting = False
             return REVIEW
