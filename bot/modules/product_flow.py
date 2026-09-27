@@ -106,6 +106,9 @@ class ProductSession:
     submitting: bool = False
     # Text fingerprint of the last extraction, to avoid a pointless AI rerun.
     last_extract_hash: str = ""
+    # During media intake, the captions are for models; expensive product-detail
+    # extraction can wait until PRODUCT INFO arrives.
+    defer_details: bool = False
     # Where the flow was started (chat + forum thread). Every proactive message
     # has to go back there; ``user.id`` was a private-chat assumption that breaks
     # in a topic chat.
@@ -846,6 +849,13 @@ def _canonical_category_paths(categories: Sequence[str]) -> list[str]:
     ]
 
 
+def _extract_fingerprint(session: ProductSession) -> str:
+    """Stable cache key for parser inputs and learned rules."""
+    return hashlib.sha1(
+        f"{session.model_text}|{session.info_text}|{learning.revision()}".encode()
+    ).hexdigest()
+
+
 async def _extract(session: ProductSession, *, learn: bool = True) -> ProductData:
     # ``learn=False`` is the parser-test sandbox: reading a sample must not add it
     # to the replay corpus of real products (see bot/services/learning_corpus.py).
@@ -864,8 +874,9 @@ async def _extract(session: ProductSession, *, learn: bool = True) -> ProductDat
     deterministic = normalize_caption(model_source)
     # The old OPTION bot's AI normalizer is now the primary phone detector.
     # Accessory families such as AirPods are handled separately because the
-    # phone normalizer deliberately rejects them.
-    ai_models = await ai_normalize(model_source, deterministic)
+    # phone normalizer deliberately rejects them. An empty caption/info block
+    # has nothing for AI to normalize, so do not spend a network round trip.
+    ai_models = await ai_normalize(model_source, deterministic) if model_source else deterministic
     models = [x.strip() for x in (ai_models or deterministic).split(" | ") if x.strip()]
     for accessory in extract_accessory_models(model_source):
         if accessory.casefold() not in {item.casefold() for item in models}:
@@ -880,14 +891,21 @@ async def _extract(session: ProductSession, *, learn: bool = True) -> ProductDat
     # Locks survive a re-extraction on purpose: the owner typed them by hand,
     # and the parser does not get to "re-decide" a deliberate edit.
     carried_edits = dict(session.data.user_edits) if session.data else {}
-    session.data = (await extract_product(
-        combined_text,
-        models,
-        TAXONOMY,
-        caption=caption_text,
-        info_text=info_text,
-        color_suppressed=set(session.suppressed_colors),
-    ) if combined_text.strip() else ProductData(models=models))
+    if not combined_text.strip() or (session.defer_details and not info_text.strip()):
+        # In the collection screen captions identify phone models; users are
+        # explicitly asked to send price/title/features afterwards. Calling the
+        # full extractor here used to make a second network AI round trip whose
+        # result was never shown, then repeat it when PRODUCT INFO arrived.
+        session.data = ProductData(models=models)
+    else:
+        session.data = await extract_product(
+            combined_text,
+            models,
+            TAXONOMY,
+            caption=caption_text,
+            info_text=info_text,
+            color_suppressed=set(session.suppressed_colors),
+        )
     session.data.user_edits = carried_edits
     draft_edits.apply_locks(session.data)
     # A value the owner already confirmed stays confirmed after a re-extraction:
@@ -1120,9 +1138,18 @@ async def _prepare_files(user_id: int, messages: list[Message], context: Context
     # A second batch (or a late album photo) must ADD images, never silently
     # replace the ones already collected for this product.
     session.files = previous_files + new_files
-    await _status(context, user_id, session, "🤖 مرحله ۳ از ۴: تشخیص مدل‌ها و اطلاعات با AI...")
     session.model_text = _append_model_caption(session.model_text, _caption(messages))
-    await _extract(session)
+    fingerprint = _extract_fingerprint(session)
+    if fingerprint == session.last_extract_hash and session.data is not None:
+        await _telegram_log(context, f"[product:{user_id}] استخراج تکراری رد شد؛ متن کپشن/اطلاعات تغییری نکرده است.")
+    else:
+        await _status(context, user_id, session, "🤖 مرحله ۳ از ۴: تشخیص مدل‌ها و اطلاعات با AI...")
+        session.defer_details = not bool(session.info_text.strip())
+        try:
+            await _extract(session)
+        finally:
+            session.defer_details = False
+        session.last_extract_hash = fingerprint
     session.processing_media = False
     await _telegram_log(context, f"[product:{user_id}] مدل‌های نهایی تشخیص‌داده‌شده:\n{chr(10).join(session.models) or '<هیچ مدلی تشخیص داده نشد>'}")
     if session.color_summary:
@@ -1261,9 +1288,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     # Extraction costs up to two AI requests. If nothing changed since the last
     # extraction there is nothing to redo — and re-asking the model was also how
     # it could quietly "change its mind" about a value the owner had accepted.
-    fingerprint = hashlib.sha1(
-        f"{session.model_text}|{session.info_text}|{learning.revision()}".encode()
-    ).hexdigest()
+    fingerprint = _extract_fingerprint(session)
     if fingerprint == session.last_extract_hash and session.data is not None:
         await message.reply_text(
             "ℹ️ چیز تازه‌ای نسبت به آخرین استخراج ندیدم؛ همان مقادیر معتبرند. "

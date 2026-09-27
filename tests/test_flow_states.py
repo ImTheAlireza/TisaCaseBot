@@ -291,7 +291,11 @@ NOTE11/11S/12S"""
             output.write_bytes(b"compressed")
             return output
 
+        parse_calls = 0
+
         async def parse(session):
+            nonlocal parse_calls
+            parse_calls += 1
             session.models = normalize_caption(session.model_text).split(" | ")
             session.data = ProductData(title="قاب", models=session.models)
             session.color_summary = ""
@@ -323,8 +327,11 @@ NOTE11/11S/12S"""
             ):
                 await PF._prepare_files(7, [photo(1, first_caption)], context)
                 await PF._prepare_files(7, [photo(2, second_caption)], context)
+                await PF._prepare_files(7, [photo(3, second_caption)], context)
 
         asyncio.run(run_batches())
+        self.assertEqual(2, parse_calls, "an exact repeated caption must not trigger another AI parse")
+        self.assertEqual(3, len(session.files), "all media should still be kept")
         self.assertEqual(first_caption + "\n\n" + second_caption, session.model_text)
         self.assertTrue(
             {"A06", "A07", "Redmi Note 11", "Redmi Note 11S", "Redmi Note 12S"}.issubset(
@@ -332,6 +339,45 @@ NOTE11/11S/12S"""
             ),
             session.models,
         )
+
+
+@needs_flow
+class TestExtractionFastPaths(FlowStateTestCase):
+    def test_empty_media_intake_does_not_call_ai(self):
+        from unittest.mock import AsyncMock, patch
+
+        async def run():
+            session = PF.ProductSession(mode="new")
+            with (
+                patch.object(PF, "ai_normalize", new=AsyncMock()) as normalize,
+                patch.object(PF, "extract_product", new=AsyncMock()) as extract,
+            ):
+                await PF._extract(session, learn=False)
+            normalize.assert_not_awaited()
+            extract.assert_not_awaited()
+            self.assertEqual([], session.models)
+            self.assertIsNotNone(session.data)
+
+        asyncio.run(run())
+
+    def test_model_caption_intake_defers_the_product_details_ai_call(self):
+        from unittest.mock import AsyncMock, patch
+
+        from bot.services.product_extractor import ProductData
+
+        async def run():
+            session = PF.ProductSession(mode="new", model_text="Samsung A06", defer_details=True)
+            with (
+                patch.object(PF, "ai_normalize", new=AsyncMock(return_value="A06")) as normalize,
+                patch.object(PF, "extract_product", new=AsyncMock(return_value=ProductData())) as extract,
+            ):
+                await PF._extract(session, learn=False)
+            normalize.assert_awaited_once()
+            extract.assert_not_awaited()
+            self.assertEqual(["A06"], session.models)
+            self.assertEqual(["A06"], session.data.models)
+
+        asyncio.run(run())
 
 
 @needs_flow
