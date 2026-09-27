@@ -280,7 +280,7 @@ class TestDryRunCard(LedgerTestCase):
     def test_card_says_nothing_was_created(self) -> None:
         card = result_card(self._entry())
         self.assertIn("🧪", card)
-        self.assertIn("هیچ چیزی در سایت ساخته نشد", card)
+        self.assertIn("هیچ محصولی در سایت ساخته نشد", card)
         self.assertNotIn("ویرایش در سایت", card, "دکمهٔ ویرایش به محصولی می‌رود که نیست")
         self.assertNotIn("#None", card, "شناسهٔ ساختگی نباید روی کارت بیاید")
 

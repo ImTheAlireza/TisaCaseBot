@@ -160,6 +160,20 @@ def parse_stock(text: str) -> int | None:
     return value
 
 
+def parse_stock_status(text: str) -> str:
+    raw = _one_line(text).casefold()
+    if _is_clear(raw):
+        return ""
+    values = {
+        "موجود": "instock", "موجود است": "instock", "instock": "instock",
+        "ناموجود": "outofstock", "outofstock": "outofstock",
+        "پیش‌فروش": "onbackorder", "پیش فروش": "onbackorder", "onbackorder": "onbackorder",
+    }
+    if raw not in values:
+        raise ValueError("وضعیت را بنویس: موجود، ناموجود یا پیش‌فروش.")
+    return values[raw]
+
+
 def parse_colors(text: str) -> list[str]:
     items = _split_items(text)
     if _is_clear((text or "").strip()):
@@ -270,9 +284,11 @@ def parse_categories(text: str) -> list[str]:
 
 
 def parse_attribute(text: str) -> list[str]:
+    if _is_clear(text):
+        return []
     items = _split_items(text)
     if len(items) < 2:
-        raise ValueError("یک ویژگی با یک مقدار، ویژگی نیست؛ همان را در عنوان بنویس.")
+        raise ValueError("حداقل دو مقدار بنویس یا ویژگی را حذف کن.")
     return items
 
 
@@ -299,6 +315,11 @@ def _fields() -> dict[str, dict[str, Any]]:
             "hint": "یک عدد، مثلاً 20؛ برای حذف بنویس «حذف»",
             "parse": parse_stock,
         },
+        "stock_status": {
+            "label": "وضعیت موجودی",
+            "hint": "موجود، ناموجود یا پیش‌فروش",
+            "parse": parse_stock_status,
+        },
         "colors": {"label": "رنگ‌ها", "hint": "با | یا ، جدا کن (دو تا به بالا)", "parse": parse_colors},
         "models": {"label": "مدل‌ها", "hint": "هر مدل در یک خط", "parse": parse_models},
         "sku_prefix": {"label": "پیشوند SKU", "hint": "حروف لاتین، مثلاً BO", "parse": parse_sku_prefix},
@@ -315,7 +336,7 @@ def editable_fields(data: Any) -> list[tuple[str, str, str]]:
     """
     out: list[tuple[str, str, str]] = []
     specs = _fields()
-    for key in ("title", "price", "sale_price", "prices", "stock", "colors", "models", "sku_prefix", "categories"):
+    for key in ("title", "price", "sale_price", "prices", "stock", "stock_status", "colors", "models", "sku_prefix", "categories"):
         out.append((key, specs[key]["label"], display_value(data, key)))
     for name, values in (getattr(data, "attributes", None) or {}).items():
         if name == "رنگ":
@@ -367,7 +388,11 @@ def display_value(data: Any, key: str) -> str:
         return money.format_toman(value) if value else "—"
     if key == "stock":
         value = getattr(data, "stock", None)
-        return "— (ربات موجودی نمی‌فرستد)" if value is None else f"{value:,} عدد"
+        return "—" if value is None else f"{value:,} عدد"
+    if key == "stock_status":
+        return {
+            "instock": "موجود", "outofstock": "ناموجود", "onbackorder": "پیش‌فروش",
+        }.get(str(getattr(data, "stock_status", "") or ""), "—")
     if key == "prices":
         groups = getattr(data, "prices", None) or {}
         return " | ".join(f"{g}: {v:,}" for g, v in groups.items()) or "—"
@@ -390,18 +415,17 @@ def prompt_for(key: str, data: Any) -> str:
         name = key.split(":", 1)[1]
         return (
             f"✏️ <b>ویژگی {name}</b>\n"
-            f"الان: {display_value(data, key) or '—'}\n"
-            "مقدارهای جدید را با «|» یا «،» جدا کن (دو تا به بالا).\n"
-            "برای حذف این ویژگی: «حذف»"
+            f"فعلی: {display_value(data, key)}\n"
+            "مقدارها را با «|» جدا کن؛ برای حذف بنویس «حذف»."
         )
     spec = specs[key]
     scope = _scope_note(key, data)
     return (
         f"✏️ <b>{spec['label']}</b>\n"
-        f"الان: {display_value(data, key)}\n"
-        f"راهنما: {spec['hint']}\n"
+        f"فعلی: {display_value(data, key)}\n"
+        f"{spec['hint']}\n"
         + (f"{scope}\n" if scope else "")
-        + "همان مقدار را بفرست تا ذخیره شود؛ برای بی‌خیال شدن «انصراف»."
+        + "مقدار جدید را بفرست."
     )
 
 
@@ -430,7 +454,10 @@ def apply_edit(data: Any, key: str, raw: str) -> str | None:
             name = key.split(":", 1)[1]
             values = parse_attribute(raw)
             attributes = dict(getattr(data, "attributes", None) or {})
-            attributes[name] = values
+            if values:
+                attributes[name] = values
+            else:
+                attributes.pop(name, None)
             data.attributes = attributes
             stored: Any = values
             evidence_key = name
@@ -505,7 +532,10 @@ def apply_locks(data: Any) -> dict[str, Any]:
             elif key.startswith("attr:"):
                 name = key.split(":", 1)[1]
                 attributes = dict(getattr(data, "attributes", None) or {})
-                attributes[name] = value
+                if value:
+                    attributes[name] = value
+                else:
+                    attributes.pop(name, None)
                 data.attributes = attributes
             else:
                 setattr(data, key, value)

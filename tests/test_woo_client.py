@@ -134,11 +134,11 @@ class TestRetryPolicy(unittest.IsolatedAsyncioTestCase):
 
     async def test_transport_error_summary_fills_empty_timeout_message(self) -> None:
         self.assertEqual(
-            "ReadTimeout: سرور فروشگاه در مهلت مقرر پاسخ نداد؛ ممکن است درخواست اعمال شده باشد",
+            "ReadTimeout: پاسخ فروشگاه نرسید؛ ممکن است درخواست انجام شده باشد",
             describe_exception(httpx.ReadTimeout("")),
         )
         self.assertEqual(
-            "ConnectTimeout: اتصال به سرور فروشگاه در مهلت مقرر برقرار نشد",
+            "ConnectTimeout: مهلت اتصال به فروشگاه تمام شد",
             describe_exception(httpx.ConnectTimeout("")),
         )
 
@@ -240,7 +240,7 @@ class TestToolsUseTheSameClient(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.ok)
         self.assertIsNone(result.status_code)
         self.assertIn("ReadTimeout", result.message)
-        self.assertIn("در مهلت مقرر پاسخ نداد", result.message)
+        self.assertIn("پاسخ فروشگاه نرسید", result.message)
 
     async def test_media_tool_uploads_and_cleans_up(self) -> None:
         script = TransportScript(respond(201, {"id": 55}), respond(200, {}))

@@ -439,13 +439,13 @@ class TestPreviewSaysTheScope(unittest.TestCase):
 
     def test_variable_scope_is_stated(self) -> None:
         text = self._preview(_draft())
-        self.assertIn("موجودی:</b> 20 عدد", text)
-        self.assertIn("روی هر 4 واریژن", text)
+        self.assertIn("موجودی:</b> 20", text)
+        self.assertIn("هر 4 واریژن", text)
         self.assertIn("قیمت ویژه:", text)
 
     def test_simple_product_says_it_lands_on_the_product(self) -> None:
         text = self._preview(_draft(models=[], attributes={}))
-        self.assertIn("روی خود محصول", text)
+        self.assertIn("محصول ساده", text)
 
     def test_out_of_stock_without_a_number_is_still_shown(self) -> None:
         text = self._preview(_draft(stock=None, stock_status="outofstock"))
@@ -457,11 +457,23 @@ class TestPreviewSaysTheScope(unittest.TestCase):
         self.assertNotIn("قیمت ویژه", text)
 
     def test_preview_does_not_repeat_models_in_attributes(self) -> None:
-        """لیست مدل‌ها فقط یک‌بار می‌آید و زیر ویژگی‌ها تکرار نمی‌شود."""
         text = self._preview(_draft(models=["iPhone 13", "iPhone 14"], attributes={"رنگ": ["مشکی", "سفید"]}))
         self.assertIn("<b>مدل‌ها (2):</b> iPhone 13 | iPhone 14", text)
-        self.assertNotIn("<b>ویژگی‌ها:</b>\n<b>مدل:</b>", text)
-        self.assertIn("<b>ویژگی‌ها:</b>\n<b>رنگ:</b> مشکی | سفید", text)
+        self.assertIn("<b>رنگ:</b> مشکی | سفید", text)
+        self.assertNotIn("از کجا می‌دانم", text)
+        self.assertNotIn("اطلاعات را بررسی کن", text)
+
+    def test_long_model_list_is_collapsed(self) -> None:
+        models = [f"iPhone {index}" for index in range(14)]
+        text = self._preview(_draft(models=models, attributes={"رنگ": ["مشکی", "سفید"]}))
+        self.assertIn("… +9", text)
+        self.assertNotIn("iPhone 13", text)
+
+    def test_catalog_note_is_shortened(self) -> None:
+        data = _draft(models=["iPhone 13"], notes=["برند «Ring» در کاتالوگ ربات نیست؛ ممکن است مدلی از جا بماند"])
+        text = self._preview(data)
+        self.assertIn("برند Ring در کاتالوگ نیست", text)
+        self.assertNotIn("ممکن است مدلی از جا بماند", text)
 
 
 @needs_flow

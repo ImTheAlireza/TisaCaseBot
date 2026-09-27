@@ -215,7 +215,8 @@ def summary(entry: dict[str, Any]) -> str:
     if entry.get("mode") in ("update", "restock"):
         bits.append("شارژ")
     if entry.get("error"):
-        bits.append(str(entry["error"])[:40])
+        error = str(entry["error"])
+        bits.append(error.partition(":")[0] if status == "queued" else error[:40])
     if status == "queued":
         # A queued attempt is not a failure and not a success: it is a promise the bot has
         # made for later, and the list has to be readable as that.

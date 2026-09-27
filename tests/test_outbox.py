@@ -303,9 +303,8 @@ class TestQueueIsCreatedFromTheFlow(QueueTestCase):
         _result, seen, _context = await self._confirm()
         text = " ".join(str(item[1]) for item in seen)
         self.assertIn("🐇", text)
-        self.assertIn(f"{outbox.REMAINING_TRIES_AFTER_FIRST} بار دیگر", text,
-                      "قولِ تعداد تلاش باید از ثابتِ خودِ صف بیاید؛ و «بار دیگر»، چون "
-                      "تلاشی که همین حالا شکست خورد شمارده شده")
+        self.assertIn("تلاش مجدد", text)
+        self.assertNotIn(f"{outbox.REMAINING_TRIES_AFTER_FIRST} بار دیگر", text)
         self.assertNotIn("رها شد", text, "در لحظهٔ صف‌گذاری هنوز رها نشده")
 
 

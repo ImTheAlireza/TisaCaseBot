@@ -78,12 +78,46 @@ async def cb_open(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if entry is None:
         await query.message.reply_text("این کارت پیدا نشد؛ احتمالاً تاریخچه پاک شده است.")
         return
-    report = str(entry.get("report") or "")
-    body = result_card(entry)
-    if report:
-        body += "\n\n——— پیش‌نمایشی که تأیید شد ———\n" + report
-    text, mode = _clip(body)
-    await query.message.reply_text(text, **({"parse_mode": mode} if mode else {}))
+    markup = None
+    if entry.get("report"):
+        markup = InlineKeyboardMarkup([[
+            InlineKeyboardButton("👁 پیش‌نمایش", callback_data=f"products:report:{key}")
+        ]])
+    await query.message.reply_text(result_card(entry), parse_mode="HTML", reply_markup=markup)
+
+
+async def cb_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show the approved field-by-field preview only when someone asks for it."""
+    query = update.callback_query
+    key = (query.data or "").rsplit(":", 1)[-1]
+    entry = products_ledger.find(key)
+    report = str(entry.get("report") or "") if entry else ""
+    if not report:
+        await query.answer("پیش‌نمایش پیدا نشد.", show_alert=True)
+        return
+    await query.answer()
+    text, mode = _clip(report)
+    await query.edit_message_text(
+        text,
+        **({"parse_mode": mode} if mode else {}),
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("↩️ خلاصه", callback_data=f"products:summary:{key}")
+        ]]),
+    )
+
+
+async def cb_summary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    key = (query.data or "").rsplit(":", 1)[-1]
+    entry = products_ledger.find(key)
+    if not entry:
+        await query.answer("این کارت پیدا نشد.", show_alert=True)
+        return
+    await query.answer()
+    markup = InlineKeyboardMarkup([[
+        InlineKeyboardButton("👁 پیش‌نمایش", callback_data=f"products:report:{key}")
+    ]]) if entry.get("report") else None
+    await query.edit_message_text(result_card(entry), parse_mode="HTML", reply_markup=markup)
 
 
 async def cb_parser_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -276,6 +310,8 @@ async def on_parser_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 def register(app: Application) -> None:
     app.add_handler(CallbackQueryHandler(cb_recent, pattern=f"^{CB.PRODUCTS_RECENT}$"))
     app.add_handler(CallbackQueryHandler(cb_open, pattern=f"^{CB.PRODUCTS_OPEN}:\\w+$"))
+    app.add_handler(CallbackQueryHandler(cb_report, pattern=r"^products:report:\w+$"))
+    app.add_handler(CallbackQueryHandler(cb_summary, pattern=r"^products:summary:\w+$"))
     app.add_handler(CallbackQueryHandler(cb_parser_test, pattern=f"^{CB.PARSER_TEST}$"))
     app.add_handler(CallbackQueryHandler(cb_parser_test_cancel, pattern=f"^{CB.PARSER_TEST_CANCEL}$"))
     # Group 1, not 0: while a product conversation is open its handlers win, so

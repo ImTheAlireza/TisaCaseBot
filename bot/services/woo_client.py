@@ -183,21 +183,21 @@ def describe_exception(exc: BaseException) -> str:
     separately by :class:`WooClient` without query parameters.
     """
     if isinstance(exc, httpx.ReadTimeout):
-        detail = "سرور فروشگاه در مهلت مقرر پاسخ نداد؛ ممکن است درخواست اعمال شده باشد"
+        detail = "پاسخ فروشگاه نرسید؛ ممکن است درخواست انجام شده باشد"
     elif isinstance(exc, httpx.ConnectTimeout):
-        detail = "اتصال به سرور فروشگاه در مهلت مقرر برقرار نشد"
+        detail = "مهلت اتصال به فروشگاه تمام شد"
     elif isinstance(exc, httpx.WriteTimeout):
-        detail = "ارسال درخواست به سرور فروشگاه در مهلت مقرر کامل نشد"
+        detail = "ارسال درخواست کامل نشد"
     elif isinstance(exc, httpx.PoolTimeout):
-        detail = "اتصال آزاد به سرور فروشگاه در دسترس نبود"
+        detail = "اتصال آزاد در دسترس نبود"
     elif isinstance(exc, httpx.TimeoutException):
-        detail = "مهلت درخواست به سرور فروشگاه تمام شد"
+        detail = "مهلت درخواست تمام شد"
     elif isinstance(exc, httpx.ConnectError):
-        detail = "اتصال به سرور فروشگاه برقرار نشد"
+        detail = "اتصال به فروشگاه برقرار نشد"
     elif isinstance(exc, httpx.RemoteProtocolError):
-        detail = "ارتباط با سرور فروشگاه پیش از دریافت پاسخ کامل قطع شد"
+        detail = "ارتباط پیش از پاسخ قطع شد"
     elif isinstance(exc, httpx.TransportError):
-        detail = "خطای ارتباط شبکه با سرور فروشگاه"
+        detail = "خطای شبکه"
     else:
         detail = redact(str(exc).strip()) or "جزئیات خطا در دسترس نیست"
     return f"{type(exc).__name__}: {detail}"

@@ -75,6 +75,9 @@ class _DraftLike:
     warnings: list = field(default_factory=list)
     user_edits: dict = field(default_factory=dict)
     suggestions: list = field(default_factory=list)
+    stock: int | None = None
+    stock_status: str = ""
+    sale_price: int = 0
     variation_count: int = 0
     evidence: dict = field(default_factory=dict)
     notes: list = field(default_factory=list)
@@ -96,6 +99,12 @@ class TestFieldParsers(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             de.parse_price("5")
         self.assertIn("بازهٔ مجاز", str(ctx.exception))
+
+    def test_stock_status_accepts_all_shop_states(self):
+        self.assertEqual(de.parse_stock_status("موجود"), "instock")
+        self.assertEqual(de.parse_stock_status("ناموجود"), "outofstock")
+        self.assertEqual(de.parse_stock_status("پیش‌فروش"), "onbackorder")
+        self.assertEqual(de.parse_stock_status("حذف"), "")
 
     def test_title_rejects_a_number_line(self):
         with self.assertRaises(ValueError):
@@ -194,6 +203,13 @@ class TestApplyEdit(unittest.TestCase):
         self.assertEqual(data.attributes["رنگ"], ["مشکی", "سفید"])
         self.assertEqual(data.model_colors, {"iPhone 13": ["مشکی"]})
 
+    def test_stock_status_is_in_the_field_picker_and_editable(self):
+        data = _draft(stock_status="instock")
+        rows = {key: value for key, _label, value in de.editable_fields(data)}
+        self.assertEqual(rows["stock_status"], "موجود")
+        self.assertIsNone(de.apply_edit(data, "stock_status", "پیش‌فروش"))
+        self.assertEqual(data.stock_status, "onbackorder")
+
     def test_removing_colors_drops_the_axis_entirely(self):
         data = _draft(attributes={"رنگ": ["مشکی", "سفید"]})
         self.assertIsNone(de.apply_edit(data, "colors", "حذف"))
@@ -205,6 +221,16 @@ class TestApplyEdit(unittest.TestCase):
         self.assertIn("attr:طرح", keys)
         self.assertIsNone(de.apply_edit(data, "attr:طرح", "پلومریا، گلی"))
         self.assertEqual(data.attributes["طرح"], ["پلومریا", "گلی"])
+
+    def test_custom_attribute_can_be_deleted_and_keeps_a_removal_lock(self):
+        data = _draft(attributes={"طرح": ["پلومریا", "برگی"]})
+        self.assertIsNone(de.apply_edit(data, "attr:طرح", "حذف"))
+        self.assertNotIn("طرح", data.attributes)
+        self.assertEqual(data.user_edits["attr:طرح"], [])
+
+        data.attributes["طرح"] = ["مقدار جدید", "مقدار دیگر"]
+        de.apply_locks(data)
+        self.assertNotIn("طرح", data.attributes, "a later extraction cannot restore a deleted axis")
 
     def test_prompt_shows_the_current_value(self):
         data = _draft(title="قاب سیلیکونی")
@@ -400,7 +426,33 @@ class TestFieldFlow(unittest.TestCase):
         markup = messages[0][1]["reply_markup"]
         buttons = [b.callback_data for row in markup.inline_keyboard for b in row]
         self.assertIn("product:field:0", buttons)
-        self.assertIn("product:edit:free", buttons)
+        self.assertNotIn("product:edit:free", buttons)
+
+    def test_picker_has_one_tap_delete_for_colors_and_custom_attributes(self):
+        data = _draft(attributes={"رنگ": ["مشکی", "سفید"], "طرح": ["گل", "ساده"]})
+        session = PF.ProductSession(data=data)
+        PF.sessions[7] = session
+        update, messages = self._query("product:edit")
+        asyncio.run(PF.edit(update, SimpleNamespace()))
+        buttons = [
+            button.callback_data
+            for row in messages[0][1]["reply_markup"].inline_keyboard
+            for button in row
+        ]
+        self.assertIn(f"product:field:delete:{session.field_keys.index('colors')}", buttons)
+        self.assertIn(f"product:field:delete:{session.field_keys.index('attr:طرح')}", buttons)
+
+    def test_deleting_a_custom_attribute_needs_no_text_prompt(self):
+        session = PF.ProductSession(data=_draft(attributes={"طرح": ["گل", "ساده"]}))
+        PF.sessions[7] = session
+        session.field_keys = [key for key, _label, _value in de.editable_fields(session.data)]
+        index = session.field_keys.index("attr:طرح")
+        update, messages = self._query(f"product:field:delete:{index}")
+        result = asyncio.run(PF.delete_attribute_field(update, SimpleNamespace()))
+        self.assertEqual(result, PF.REVIEW)
+        self.assertNotIn("طرح", session.data.attributes)
+        self.assertEqual(len(messages), 1, "delete returns directly to preview; it does not ask for text")
+        self.assertIn("پیش‌نمایش", messages[0][0])
 
     def test_picking_a_field_asks_for_the_value(self):
         session = PF.ProductSession(data=_draft(title="قاب سیلیکونی"))

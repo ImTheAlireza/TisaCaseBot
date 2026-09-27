@@ -348,7 +348,7 @@ def _keyboard(session: ProductSession | None = None) -> InlineKeyboardMarkup:
             ])
         if _open_questions(session):
             rows.append([InlineKeyboardButton(
-                "✅ بله، این‌ها درست است", callback_data=CB.PRODUCT_CONFIRM_GUESSED
+                "✅ تأیید حدس‌ها", callback_data=CB.PRODUCT_CONFIRM_GUESSED
             )])
         rows.append([InlineKeyboardButton("✏️ اصلاح فیلد خاص", callback_data="product:edit"),
                      InlineKeyboardButton("➕ افزودن عکس یا متن", callback_data="product:addmore")])
@@ -381,8 +381,13 @@ def _fields_keyboard(session: ProductSession) -> InlineKeyboardMarkup:
         label, _, current = next(
             (row for row in draft_edits.editable_fields(session.data) if row[0] == key), (key, key, "")
         )
-        rows.append([InlineKeyboardButton(f"{label}: {_short(current)}", callback_data=f"product:field:{index}")])
-    rows.append([InlineKeyboardButton("📝 نوشتن متن آزاد (روش قبلی)", callback_data="product:edit:free")])
+        edit_button = InlineKeyboardButton(
+            f"✏️ {label}: {_short(current, 24)}", callback_data=f"product:field:{index}"
+        )
+        if (key == "colors" and current != "—") or key.startswith("attr:"):
+            rows.append([edit_button, InlineKeyboardButton("🗑 حذف", callback_data=f"product:field:delete:{index}")])
+        else:
+            rows.append([edit_button])
     rows.append([InlineKeyboardButton("↩️ بازگشت", callback_data="product:fields:back")])
     return InlineKeyboardMarkup(rows)
 
@@ -533,101 +538,56 @@ def _caption(messages: list[Message]) -> str:
     return "\n".join((m.caption or m.text or "") for m in sorted(messages, key=lambda x: x.message_id) if (m.caption or m.text))
 
 
-def _category_outline(categories: list[str]) -> list[str]:
-    """Render taxonomy paths as a nested Telegram-friendly bullet list."""
-    tree: dict[str, dict] = {}
-    for raw_path in categories:
-        parts = [part.strip() for part in re.split(r"\s*(?:>|&gt;)\s*", html.unescape(raw_path)) if part.strip()]
-        branch = tree
-        for part in parts:
-            branch = branch.setdefault(part, {})
-
-    lines: list[str] = []
-    def walk(branch: dict[str, dict], depth: int = 0) -> None:
-        for name, children in branch.items():
-            # Telegram HTML does not support the nbsp entity reliably and
-            # renders it as literal text. Use visible Unicode indentation.
-            indent = "　" * (depth * 2)
-            marker = "•" if depth == 0 else "◦"
-            lines.append(f"{indent}{marker} {html.escape(name)}")
-            walk(children, depth + 1)
-    walk(tree)
-    return lines
-
-
 def _preview(session: ProductSession) -> str:
-    """The review screen: what will be created, and everything we are unsure of.
-
-    The variation number comes from the very same
-    :class:`bot.services.plan.VariationPlan` the WooCommerce writer and the ZIP
-    manifest read, so «پیش‌نمایش = واقعیت» is structural instead of a coincidence
-    (it used to be a second, independent count that did not dedupe values).
-    """
+    """Short review of the fields that will be sent to the store."""
     data = session.data
     if data is None:
-        return "❌ هنوز چیزی برای استخراج نیست؛ عکس‌ها و متن اطلاعات محصول را بفرست."
+        return "❌ هنوز اطلاعات محصولی ندارم."
     plan = plan_from_dict(data.to_dict())
     data.variation_count = plan.count
 
-    lines = ["📦 <b>پیش‌نمایش محصول</b>", ""]
+    lines = ["📦 <b>پیش‌نمایش</b>"]
     if settings.woo_dry_run:
-        lines.append("🧪 <b>حالت آزمایشی (TISA_DRY_RUN) روشن است</b> — «تأیید و ساخت» هیچ محصولی در سایت نمی‌سازد.")
-    lines.append(f"<b>عنوان:</b> {html.escape(data.title) if data.title else '⚠️ <b>تشخیص داده نشد</b>'}")
+        lines.append("🧪 حالت آزمایشی")
+    lines.append(f"<b>عنوان:</b> {html.escape(data.title) if data.title else '⚠️ پیدا نشد'}")
 
     if data.prices:
         price_text = " | ".join(f"{group}: {value:,} تومان" for group, value in data.prices.items())
         if data.price:
-            price_text += f" <i>(پایه: {data.price:,})</i>"
-    elif data.price:
-        price_text = f"{data.price:,} تومان"
+            price_text += f" (پایه: {data.price:,} تومان)"
     else:
-        price_text = "تغییری ندارد / دریافت نشده"
+        price_text = f"{data.price:,} تومان" if data.price else "—"
     lines.append(f"<b>قیمت:</b> {price_text}")
 
-    # The scope has to be on the card: «موجودی ۲۰» read as «۲۰ تا کلاً» while the shop will
-    # store 20 on each of four variations is exactly the surprise this preview exists to kill.
-    scope = f"روی هر {plan.count} واریژن" if plan.is_variable else "روی خود محصول"
+    scope = f"هر {plan.count} واریژن" if plan.is_variable else "محصول"
     if data.sale_price:
         lines.append(f"<b>قیمت ویژه:</b> {data.sale_price:,} تومان ({scope})")
     if data.stock is not None:
-        status = {"outofstock": "، ناموجود", "onbackorder": "، سفارش پس‌ازموجودی"}.get(data.stock_status, "")
+        status = {"outofstock": "، ناموجود", "onbackorder": "، پیش‌فروش"}.get(data.stock_status, "")
         lines.append(f"<b>موجودی:</b> {data.stock:,} عدد ({scope}{status})")
     elif data.stock_status == "outofstock":
         lines.append("<b>موجودی:</b> ناموجود")
-    lines.append(
-        f"<b>پیشوند SKU:</b> {html.escape(data.sku_prefix) if data.sku_prefix else '⚠️ <b>تشخیص داده نشد</b>'}"
-    )
-    lines.append(
-        "<b>مدل‌ها (" + str(len(data.models)) + "):</b> "
-        + (" | ".join(html.escape(model) for model in data.models) or "⚠️ هیچ مدلی پیدا نشد")
-    )
+    elif data.stock_status == "onbackorder":
+        lines.append("<b>وضعیت:</b> پیش‌فروش")
+    sku = html.escape(data.sku_prefix) if data.sku_prefix else "⚠️ پیدا نشد"
+    lines.append(f"<b>SKU:</b> {sku}")
+
+    models = data.models or []
+    shown_models = " | ".join(html.escape(model) for model in models[:5])
+    if len(models) > 5:
+        shown_models += f" … +{len(models) - 5}"
+    lines.append(f"<b>مدل‌ها ({len(models)}):</b> {shown_models or '⚠️ پیدا نشد'}")
 
     other_axes = [(name, values) for name, values in plan.axes if name != "مدل"]
     if other_axes:
-        lines += ["", "<b>ویژگی‌ها:</b>"]
         for name, values in other_axes:
             lines.append(f"<b>{html.escape(name)}:</b> " + " | ".join(html.escape(value) for value in values))
+    lines.append(f"🎨 {plan.count} واریژن" if plan.is_variable else "📦 محصول ساده")
+    if plan.restricted:
+        lines.append(f"⚠️ رنگ‌ها برای {len(plan.restrictions)} مدل محدود شده")
 
-    if plan.axes:
-        lines.append("")
-        lines.append(f"<b>تعداد variation:</b> {plan.count}")
-        if plan.restricted:
-            lines.append(
-                f"🎨 <b>رنگ هر مدل:</b> {len(plan.restrictions)} مدل فقط رنگ‌های موجود خودش را می‌گیرد "
-                f"({plan.naive_count} ترکیب کامل ← {plan.count} ترکیب معتبر)"
-            )
-    else:
-        lines += ["", "<b>ویژگی‌ها:</b>"]
-        lines.append("⚠️ هیچ ویژگی‌ای با دو یا چند مقدار نمانده؛ محصول <b>simple</b> ساخته می‌شود.")
-    for name, had, left in plan.dropped:
-        lines.append(
-            f"⚠️ ویژگی «{html.escape(name)}» از {had} مقدار به {left} رسید (تکراری حذف شد)؛ "
-            "اعمال نمی‌شود."
-        )
-
-    categories = [x for x in data.categories if x not in FORBIDDEN]
-    lines += ["", "<b>دسته‌بندی‌ها:</b>"]
-    lines.extend(_category_outline(categories) or ["- تشخیص داده نشد"])
+    categories = [html.escape(x.replace(" > ", " ← ")) for x in data.categories if x not in FORBIDDEN]
+    lines.append("<b>دسته:</b> " + (" · ".join(categories) if categories else "—"))
 
     issues = validate_draft(
         data.to_dict(),
@@ -640,18 +600,16 @@ def _preview(session: ProductSession) -> str:
             unmatched_model_words("\n".join((session.model_text, session.info_text)))
         ),
     )
-    provenance = ev.preview_html(data.evidence, data.notes)
-    if provenance:
-        lines.append(provenance)
-    questions = _open_questions(session)
-    if questions:
-        lines += ["", *questions]
-    if issues.issues:
-        lines += ["", "<b>نکته‌ها و هشدارها:</b>", issues.as_html()]
-        if issues.blocking:
-            lines.append("")
-            lines.append("⛔ تا حل نشدن این موارد، ساخت انجام نمی‌شود.")
-    lines += ["", "اطلاعات را بررسی کن؛ در صورت نیاز «✏️ اصلاح اطلاعات» و سپس تأیید بزن."]
+    if issues.blocking:
+        lines.extend(f"⛔ {html.escape(issue.message)}" for issue in issues.errors[:3])
+    elif issues.warnings:
+        lines.append(f"⚠️ {html.escape(issues.warnings[0].message)}")
+    lines.extend(_open_questions(session))
+    for note in getattr(data, "notes", []) or []:
+        match = re.search(r"برند\s*[«\"]([^»\"]+)[»\"]\s*در کاتالوگ ربات نیست", str(note))
+        if match:
+            lines.append(f"⚠️ برند {html.escape(match.group(1))} در کاتالوگ نیست؛ مدل‌ها را بررسی کن.")
+            break
     return "\n".join(lines)
 
 
@@ -671,15 +629,7 @@ def _pending_hint(rules: list[learning.Rule]) -> str:
 
 
 def _open_questions(session: ProductSession) -> list[str]:
-    """Fields the bot only *inferred*, phrased as a question.
-
-    Trust lives in :mod:`bot.services.postmodel`; what it does not have is a way to
-    ask. A value whose best evidence is the AI, an OCR line or a file name is a
-    guess, and a seller skimming twenty lines does not read a footnote about it —
-    they tap. So the preview turns each guess into a question with a one-tap
-    answer, and «درست است» moves the field to «ویرایش شما» instead of storing a
-    second "was checked" flag nobody else would honor.
-    """
+    """A short heads-up for inferred fields; their actual values are already above."""
     data = session.data
     if data is None:
         return []
@@ -687,14 +637,12 @@ def _open_questions(session: ProductSession) -> list[str]:
     guessed = [name for name in ev.inferred_fields(evidence) if name not in set(session.verified_fields)]
     if not guessed:
         return []
-    labels = {key: (label, value) for key, label, value in draft_edits.editable_fields(data)}
-    lines = [f"<b>❓ {len(guessed)} مقدار را من حدس زده‌ام، نه اینکه نوشته باشی:</b>"]
-    for name in guessed:
-        label, current = labels.get(name, (name, ""))
-        shown = _short(str(current), 48) or "—"
-        lines.append(f"• {label}: «{html.escape(shown, quote=False)}»")
-    lines.append("اگر درست است «✅ بله، این‌ها درست است» را بزن؛ اگر نه، «✏️ اصلاح فیلد خاص».")
-    return lines
+    editable = {key: label for key, label, _value in draft_edits.editable_fields(data)}
+    aliases = {"category": "categories", "colors": "colors", "model": "models"}
+    labels = list(dict.fromkeys(
+        editable.get(aliases.get(name, name), name) for name in guessed
+    ))
+    return ["⚠️ حدسی: " + "، ".join(labels)]
 
 
 def _learn_from_diff(
@@ -1341,14 +1289,7 @@ def _queue_for_retry(
 
 
 def _queued_note(queued: bool) -> str:
-    if not queued:
-        return ""
-    hours = round(outbox.MAX_AGE_SECONDS / 3600)
-    return (
-        f"\n\n🐇 این خطا موقتی است؛ در صفِ تلاش مجدد گذاشتمش "
-        f"({outbox.REMAINING_TRIES_AFTER_FIRST} بار دیگر، تا {hours} ساعت، بدون اینکه کاری کنی) "
-        "و نتیجه را همین‌جا می‌گویم."
-    )
+    return "\n🐇 در صفِ تلاش مجدد است؛ نتیجه را همین‌جا می‌فرستم." if queued else ""
 
 
 async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1668,10 +1609,7 @@ async def edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         # the information we are waiting for instead of a "proposal".
         return COLLECT
     session.field_keys = [key for key, _label, _current in draft_edits.editable_fields(session.data)]
-    await query.message.reply_text(
-        "✏️ کدام فیلد را عوض کنم؟ (هرچه دستی بنویسی، در استخراج‌های بعدی هم حفظ می‌شود)",
-        reply_markup=_fields_keyboard(session),
-    )
+    await query.message.reply_text("✏️ فیلد را انتخاب کن:", reply_markup=_fields_keyboard(session))
     return REVIEW
 
 
@@ -1802,13 +1740,42 @@ async def pick_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     session.editing_field = key
     # An edit step must be escapable with a button, not only by remembering the
     # word «انصراف» — that is how a person ends up stuck typing into a field.
-    await query.message.reply_html(
+    await query.message.edit_text(
         draft_edits.prompt_for(key, session.data),
+        parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("↩️ انصراف و بازگشت", callback_data="product:field:cancel")
+            InlineKeyboardButton("↩️ انصراف", callback_data="product:field:cancel")
         ]]),
     )
     return EDITING_FIELD
+
+
+async def delete_attribute_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Remove a variation attribute directly from its picker row."""
+    query = update.callback_query
+    session = _session_of(query.from_user.id if query.from_user else 0, context)
+    if session is None or session.data is None:
+        await query.answer("پیش‌نمایش منقضی شده است.", show_alert=True)
+        return REVIEW
+    try:
+        index = int(query.data.rsplit(":", 1)[1])
+        key = session.field_keys[index]
+    except (ValueError, IndexError):
+        await query.answer("این گزینه منقضی شده است.", show_alert=True)
+        return REVIEW
+    if key != "colors" and not key.startswith("attr:"):
+        await query.answer("این فیلد قابل حذف نیست.", show_alert=True)
+        return REVIEW
+
+    error = draft_edits.apply_edit(session.data, key, "حذف")
+    if error:
+        await query.answer(error, show_alert=True)
+        return REVIEW
+    session.editing_field = ""
+    session.data.variation_count = plan_from_dict(session.data.to_dict()).count
+    await query.answer("ویژگی حذف شد")
+    await query.message.edit_text(_preview(session), parse_mode="HTML", reply_markup=_keyboard(session))
+    return REVIEW
 
 
 async def cancel_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -2058,6 +2025,7 @@ def register(app: Application) -> None:
         CallbackQueryHandler(accept_suggestion, pattern=r"^product:sug:\d+$"),
         CallbackQueryHandler(dismiss_suggestion, pattern=r"^product:sug:no:\d+$"),
         CallbackQueryHandler(confirm_guessed, pattern=f"^{CB.PRODUCT_CONFIRM_GUESSED}$"),
+        CallbackQueryHandler(delete_attribute_field, pattern=r"^product:field:delete:\d+$"),
         CallbackQueryHandler(pick_field, pattern=r"^product:field:\d+$"),
         CallbackQueryHandler(back_from_picker, pattern=r"^product:fields:back$"),
         CallbackQueryHandler(show_preview, pattern=r"^product:preview$"),
