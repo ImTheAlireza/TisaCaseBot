@@ -7,7 +7,7 @@ import re
 import time
 from dataclasses import asdict, dataclass, field
 from typing import Any
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 import httpx
 
@@ -697,6 +697,7 @@ async def extract_product(
     color_suppressed: set[str] | None = None,
     *,
     client: httpx.AsyncClient | None = None,
+    diagnostic: Callable[[str], None] | None = None,
 ) -> ProductData:
     # Keep one AI request, but preserve provenance. The deterministic parser
     # receives PRODUCT INFO first so its title/SKU/price precedence is stable.
@@ -875,8 +876,14 @@ async def extract_product(
         # catalog) is a note for the owner, not a silent correction.
         result.warnings = [str(x).strip() for x in _list_field(obj, "warnings") if str(x).strip()]
         result.notes.extend(f"هوش مصنوعی گزارش داد: {text}" for text in result.warnings)
+        if diagnostic is not None:
+            diagnostic("استخراج جزئیات: پاسخ AI پردازش شد")
         return _apply_learned_terms(result, source_for_fallback)
     except Exception as exc:
+        if diagnostic is not None:
+            diagnostic(
+                f"استخراج جزئیات: خطای {type(exc).__name__}؛ از متن و پارسر قطعی استفاده شد"
+            )
         # Silent failure used to look like «the bot misread me»; say what
         # happened in the log and in the preview so the user knows the text was
         # read without the model's help.

@@ -419,6 +419,35 @@ class TestExtractionFastPaths(FlowStateTestCase):
 
 
 @needs_flow
+class TestMediaDownloadSafety(FlowStateTestCase):
+    def test_partial_telegram_download_is_removed_before_retry(self):
+        from tempfile import TemporaryDirectory
+        from unittest.mock import AsyncMock, patch
+
+        from telegram.error import TimedOut
+
+        calls = 0
+
+        async def download_to_drive(*, custom_path):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                Path(custom_path).write_bytes(b"partial")
+                raise TimedOut("read timed out")
+            Path(custom_path).write_bytes(b"complete")
+
+        telegram_file = SimpleNamespace(file_size=8, download_to_drive=download_to_drive)
+        context = SimpleNamespace(bot=SimpleNamespace(get_file=AsyncMock(return_value=telegram_file)))
+        with TemporaryDirectory() as directory, patch.object(PF.asyncio, "sleep", new=AsyncMock()):
+            target = Path(directory) / "image.jpg"
+            size = asyncio.run(PF._download_with_retry(context, "opaque-file-id", target))
+            self.assertEqual(8, size)
+            self.assertEqual(b"complete", target.read_bytes())
+        self.assertEqual(2, calls)
+        self.assertEqual(2, context.bot.get_file.await_count)
+
+
+@needs_flow
 class TestNoPhantomSession(FlowStateTestCase):
     def test_media_without_a_session_ends_the_flow_instead_of_inventing_one(self):
         update, sent = _update("", chat_id=7)

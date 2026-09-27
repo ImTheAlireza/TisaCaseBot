@@ -81,6 +81,11 @@ COUNTERS: dict[str, Counter] = {
         Counter("buttons_denied", "دکمه بدون دسترسی", hint="کسی دکمه‌ای را زده که حقش نبوده (یا منوی کهنه داشته)."),
         Counter("tracking_converted", "فایل ردیابی تبدیل‌شده"),
         Counter("tracking_review_rows", "ردیفِ نیازمندِ بازبینی (فایل‌های ردیابی)"),
+        Counter("compress_batches", "دستهٔ عکس‌های فشرده‌شده"),
+        Counter("compress_images", "عکس فشرده و ارسال‌شده"),
+        Counter("compress_download_ms", "دریافت عکس", kind="ms"),
+        Counter("compress_cpu_ms", "فشرده‌سازی عکس", kind="ms"),
+        Counter("compress_upload_ms", "ارسال عکس", kind="ms"),
     )
 }
 

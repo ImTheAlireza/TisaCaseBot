@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -114,6 +115,9 @@ class Journal:
 
         if self.stages:
             lines += ["", *self._stage_lines()]
+        diagnostics = self._diagnostic_lines()
+        if diagnostics:
+            lines += ["", "🔎 پایش عملیات:", *[f"   · {line}" for line in diagnostics]]
         if self.warnings:
             shown = self.warnings[:_MAX_LIST_ITEMS]
             lines += ["", f"⚠️ {len(self.warnings)} هشدار:"] + [f"   · {w}" for w in shown]
@@ -122,6 +126,39 @@ class Journal:
         if self.errors:
             lines += ["", "❌ خطاها:"] + [f"   · {e}" for e in self.errors[:_MAX_LIST_ITEMS]]
         return clip("\n".join(lines), note="\n… (کارت بلند بود؛ ادامه در logs/bot.log)")
+
+    def _diagnostic_lines(self) -> list[str]:
+        """Include one compact network/AI digest on every group card.
+
+        Full traces stay opt-in, but the outcome, request count/latency and every
+        transport failure are always visible in LOG_CHAT_ID without a message flood.
+        """
+        raw_lines = "\n".join(self.trace).splitlines()
+        http_done = [line for line in raw_lines if line.startswith("[http:done]")]
+        elapsed = [
+            int(match.group(1))
+            for line in http_done
+            if (match := re.search(r"در (\d+) ms", line))
+        ]
+        http_retries = [line for line in raw_lines if line.startswith("[retry]")]
+        ai_lines = [line for line in raw_lines if line.startswith("[ai:summary]")]
+        ai_diagnostics = [
+            line for line in raw_lines if line.startswith("[ai:diagnostic]")
+        ]
+        failures = [
+            line for line in raw_lines
+            if line.startswith(("[http:error]", "[media:error]", "[variation:error]", "[sku:error]"))
+        ]
+        result: list[str] = []
+        if http_done:
+            timing = f"؛ جمع پاسخ‌ها {sum(elapsed)} ms" if elapsed else ""
+            result.append(f"HTTP: {len(http_done)} درخواست{timing}")
+        if http_retries:
+            result.append(f"تلاش مجدد شبکه: {len(http_retries)}")
+        result.extend(ai_lines[-2:])
+        result.extend(ai_diagnostics[-4:])
+        result.extend(failures[-5:])
+        return result
 
     def _stage_lines(self) -> list[str]:
         """The road this product took. Long runs are folded — a card is not a scroll."""

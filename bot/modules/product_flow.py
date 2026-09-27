@@ -138,6 +138,8 @@ class ProductSession:
     #: purpose. One-shot — it is cleared as soon as the gate is passed, so the next
     #: tap has to be asked again.
     force_publish: bool = False
+    # Sanitized AI outcomes collected during one extraction and drained to its log card.
+    ai_diagnostics: list[str] = field(default_factory=list)
 
 
 sessions: dict[int, ProductSession] = {}
@@ -857,7 +859,47 @@ def _extract_fingerprint(session: ProductSession) -> str:
     ).hexdigest()
 
 
+def _expected_ai_requests(session: ProductSession, *, defer_details: bool = False) -> int:
+    """Network calls the configured extraction path will attempt for these inputs."""
+    if not (settings.ai_base_url and settings.ai_token and settings.ai_model):
+        return 0
+    has_source = bool(session.model_text.strip() or session.info_text.strip())
+    if not has_source:
+        return 0
+    return 1 + int(has_source and not defer_details)
+
+
+class _AIFlowLogSink:
+    """Keep only useful, secret-free AI outcomes for the eventual group card."""
+
+    def __init__(self, destination: list[str]) -> None:
+        self.destination = destination
+
+    def add(self, level: int, message: str, *args: object) -> None:
+        if "AI normalization failed" in message:
+            detail = f"نرمال‌سازی مدل: خطای {args[0] if args else 'AI'}؛ پارسر قطعی حفظ شد"
+        elif "AI omitted" in message:
+            detail = f"نرمال‌سازی مدل: {args[0] if args else 0} نامزد قطعی حفظ شد"
+        elif "AI returned" in message:
+            detail = f"نرمال‌سازی مدل: پاسخ AI شامل {args[0] if args else '؟'} مدل بود"
+        elif "AI is not configured" in message and level >= logging.WARNING:
+            detail = "AI تنظیم نیست و نامزد قطعی برای بازبینی مشکوک تشخیص داده شد"
+        else:
+            return
+        if detail not in self.destination:
+            self.destination.append(detail)
+
+
+async def _log_ai_diagnostics(
+    context: ContextTypes.DEFAULT_TYPE, session: ProductSession
+) -> None:
+    for detail in session.ai_diagnostics:
+        await _telegram_log(context, f"[ai:diagnostic] {detail}")
+    session.ai_diagnostics.clear()
+
+
 async def _extract(session: ProductSession, *, learn: bool = True) -> ProductData:
+    session.ai_diagnostics.clear()
     # ``learn=False`` is the parser-test sandbox: reading a sample must not add it
     # to the replay corpus of real products (see bot/services/learning_corpus.py).
     # The first message is the media caption and is used only for model
@@ -900,7 +942,12 @@ async def _extract(session: ProductSession, *, learn: bool = True) -> ProductDat
             ai_client = await stack.enter_async_context(ai_client_session())
         normalize_kwargs = {"client": ai_client} if ai_client is not None else {}
         ai_models = (
-            await ai_normalize(model_source, deterministic, **normalize_kwargs)
+            await ai_normalize(
+                model_source,
+                deterministic,
+                job_log=_AIFlowLogSink(session.ai_diagnostics),
+                **normalize_kwargs,
+            )
             if model_source
             else deterministic
         )
@@ -927,6 +974,7 @@ async def _extract(session: ProductSession, *, learn: bool = True) -> ProductDat
                 caption=caption_text,
                 info_text=info_text,
                 color_suppressed=set(session.suppressed_colors),
+                diagnostic=session.ai_diagnostics.append,
                 **extract_kwargs,
             )
     session.data.user_edits = carried_edits
@@ -1020,10 +1068,17 @@ async def _extract(session: ProductSession, *, learn: bool = True) -> ProductDat
     return session.data
 
 
-async def extract_product_metadata(model_text: str, info_text: str) -> tuple[list[str], dict[str, list[str]]]:
-    """Use the actual product-flow parser/AI pipeline without recording a product."""
+async def extract_product_metadata(
+    model_text: str,
+    info_text: str,
+    *,
+    diagnostics: list[str] | None = None,
+) -> tuple[list[str], dict[str, list[str]]]:
+    """Use the product parser without recording a product; optionally return its warnings."""
     session = ProductSession(model_text=model_text or "", info_text=info_text or "")
     data = await _extract(session, learn=False)
+    if diagnostics is not None:
+        diagnostics.extend(session.ai_diagnostics)
     return session.models, data.attributes if data is not None else {}
 
 
@@ -1100,11 +1155,22 @@ async def _download_with_retry(
             if tg_file.file_size and tg_file.file_size > settings.max_download_mb * 1024 * 1024:
                 raise ValueError(f"فایل بزرگ‌تر از سقف مجاز ({settings.max_download_mb:g} MB) است.")
             await tg_file.download_to_drive(custom_path=target)
-            return tg_file.file_size or 0
+            actual_size = target.stat().st_size if target.exists() else 0
+            maximum = int(settings.max_download_mb * 1024 * 1024)
+            if actual_size > maximum:
+                target.unlink(missing_ok=True)
+                raise ValueError(f"فایل بزرگ‌تر از سقف مجاز ({settings.max_download_mb:g} MB) است.")
+            return actual_size or tg_file.file_size or 0
         except (TimedOut, NetworkError, TimeoutError) as exc:
             last_error = exc
+            target.unlink(missing_ok=True)
             if attempt == attempts:
                 raise
+            await _telegram_log(
+                context,
+                f"[telegram:retry] دانلود عکس تلاش {attempt}/{attempts} شکست خورد "
+                f"({type(exc).__name__}); تلاش مجدد با تأخیر.",
+            )
             await asyncio.sleep(attempt * 1.5)
     raise last_error if last_error else RuntimeError("download failed")
 
@@ -1163,16 +1229,28 @@ async def _prepare_files(user_id: int, messages: list[Message], context: Context
     session.files = previous_files + new_files
     session.model_text = _append_model_caption(session.model_text, _caption(messages))
     fingerprint = _extract_fingerprint(session)
+    extraction_ms = 0.0
+    expected_ai_requests = 0
     if fingerprint == session.last_extract_hash and session.data is not None:
         await _telegram_log(context, f"[product:{user_id}] استخراج تکراری رد شد؛ متن کپشن/اطلاعات تغییری نکرده است.")
     else:
         await _status(context, user_id, session, "🤖 مرحله ۳ از ۴: تشخیص مدل‌ها و اطلاعات با AI...")
         session.defer_details = not bool(session.info_text.strip())
+        expected_ai_requests = _expected_ai_requests(
+            session, defer_details=session.defer_details
+        )
+        started = time.perf_counter()
         try:
             await _extract(session)
         finally:
+            extraction_ms = (time.perf_counter() - started) * 1000
             session.defer_details = False
+        await _log_ai_diagnostics(context, session)
         session.last_extract_hash = fingerprint
+    await _telegram_log(
+        context,
+        f"[ai:summary] استخراج محصول: {expected_ai_requests} درخواست، {extraction_ms:.0f} ms",
+    )
     session.processing_media = False
     await _telegram_log(context, f"[product:{user_id}] مدل‌های نهایی تشخیص‌داده‌شده:\n{chr(10).join(session.models) or '<هیچ مدلی تشخیص داده نشد>'}")
     if session.color_summary:
@@ -1319,8 +1397,18 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         )
         return WAITING
     previous = session.data
+    expected_ai_requests = _expected_ai_requests(
+        session, defer_details=session.defer_details
+    )
+    extraction_started = time.perf_counter()
     data = await _extract(session)
+    extraction_ms = (time.perf_counter() - extraction_started) * 1000
+    await _log_ai_diagnostics(context, session)
     session.last_extract_hash = fingerprint
+    await _telegram_log(
+        context,
+        f"[ai:summary] استخراج محصول: {expected_ai_requests} درخواست، {extraction_ms:.0f} ms",
+    )
     # Persistent self-learning is sudo-only: a rule rewrites how EVERY later
     # product is parsed, so it should not be creatable by a shared admin account.
     # The correction still applies to this session for everyone — that part is
@@ -2116,7 +2204,17 @@ async def accept_proposal(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     incoming, session.pending_text = session.pending_text, ""
     session.info_text = (session.info_text + "\n" + incoming).strip()
     await _telegram_log(context, f"[product:{user_id}] متن پیشنهادی تأیید و اعمال شد:\n{incoming}")
+    expected_ai_requests = _expected_ai_requests(
+        session, defer_details=session.defer_details
+    )
+    extraction_started = time.perf_counter()
     data = await _extract(session)
+    extraction_ms = (time.perf_counter() - extraction_started) * 1000
+    await _log_ai_diagnostics(context, session)
+    await _telegram_log(
+        context,
+        f"[ai:summary] استخراج محصول: {expected_ai_requests} درخواست، {extraction_ms:.0f} ms",
+    )
     session.data = data
     flow_state.record(user_id, chat_id=session.chat_id or user_id, mode=session.mode,
                       images=len(session.files), step="متن تأییدشده اعمال شد")

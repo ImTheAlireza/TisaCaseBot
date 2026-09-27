@@ -222,6 +222,25 @@ class TestProductJournal(unittest.TestCase):
         self.assertIn("⚠️ 1 هشدار", card)
         self.assertIn("قیمت از سقف رد شد", card)
 
+    def test_every_product_card_contains_compact_http_and_ai_diagnostics(self):
+        journal = Journal()
+        journal.line(
+            "[http:done] #1 GET /wp-json/wc/v3/products → HTTP 200 در 120 ms"
+        )
+        journal.line(
+            "[http:done] #2 POST /wp-json/wc/v3/products → HTTP 201 در 80 ms"
+        )
+        journal.line("[retry] #3 درخواست پس از 1s تکرار شد")
+        journal.line("[ai:summary] استخراج محصول: 2 درخواست، 900 ms")
+        journal.line("[ai:diagnostic] نرمال‌سازی مدل: خطای ReadTimeout؛ پارسر قطعی حفظ شد")
+        journal.line("[http:error] #4 GET /wp-json/wc/v3/categories پس از 500 ms: ConnectError")
+        card = journal.card("created")
+        self.assertIn("HTTP: 2 درخواست؛ جمع پاسخ‌ها 200 ms", card)
+        self.assertIn("تلاش مجدد شبکه: 1", card)
+        self.assertIn("استخراج محصول: 2 درخواست، 900 ms", card)
+        self.assertIn("خطای ReadTimeout", card)
+        self.assertIn("[http:error] #4", card)
+
     def test_a_fact_the_flow_never_reached_reads_as_a_dash_not_zero(self):
         journal = Journal()
         journal.line("یک خط trace")

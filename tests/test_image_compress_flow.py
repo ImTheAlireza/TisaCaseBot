@@ -1,6 +1,7 @@
 """Checks model and feature summaries produced by the compression tool."""
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import os
 import unittest
@@ -136,6 +137,71 @@ class TestImageCompressAnalysis(unittest.IsolatedAsyncioTestCase):
         with patch.object(fallback.product_journal, "send_log_message", new=sender):
             await fallback.on_error(None, context)
         sender.assert_not_awaited()
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("telegram") and importlib.util.find_spec("httpx"),
+        "Telegram/httpx runtime dependencies are not installed",
+    )
+    async def test_album_is_downloaded_and_compressed_concurrently_with_one_status_and_analysis(self) -> None:
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+
+        from bot.modules import image_compress
+
+        compressed_ids: list[str] = []
+        status_edits = AsyncMock()
+
+        def photo(message_id: int, caption: str):
+            return SimpleNamespace(
+                message_id=message_id,
+                media_group_id="album-1",
+                caption=caption,
+                photo=[SimpleNamespace(file_id=f"photo-{message_id}")],
+                document=None,
+                reply_text=AsyncMock(return_value=SimpleNamespace(edit_text=status_edits)),
+            )
+
+        messages = [photo(44, "iPhone 15"), photo(45, "iPhone 16")]
+        bot = SimpleNamespace(send_document=AsyncMock())
+        context = SimpleNamespace(bot=bot, user_data={})
+        def update(message):
+            return SimpleNamespace(
+                effective_message=message, effective_user=SimpleNamespace(id=7)
+            )
+
+        async def downloaded(_context, file_id, target):
+            target.write_bytes(file_id.encode())
+            return len(file_id)
+
+        def compressed(source, directory):
+            directory.mkdir(parents=True, exist_ok=True)
+            output = directory / f"{source.stem}_compressed.jpg"
+            output.write_bytes(b"compressed")
+            compressed_ids.append(source.read_text())
+            return output
+
+        with (
+            TemporaryDirectory() as directory,
+            patch.object(image_compress, "TEMP_DIR", Path(directory)),
+            patch.object(image_compress, "_download", new=downloaded),
+            patch.object(image_compress, "compress_image", new=compressed),
+            patch.object(image_compress, "_log_to_group", new=AsyncMock()) as log,
+            patch.object(image_compress, "_try_send_analysis", new=AsyncMock()) as analysis,
+            patch.object(image_compress.metrics, "observe"),
+            patch.object(image_compress.metrics, "incr"),
+            patch.object(image_compress.asyncio, "sleep", new=AsyncMock()),
+        ):
+            for message in messages:
+                await image_compress.on_media(update(message), context)
+            tasks = list(image_compress.album_tasks.values())
+            await asyncio.gather(*tasks)
+
+        self.assertCountEqual(["photo-44", "photo-45"], compressed_ids)
+        self.assertEqual(2, bot.send_document.await_count)
+        self.assertEqual(1, messages[0].reply_text.await_count)
+        messages[1].reply_text.assert_not_awaited()
+        analysis.assert_awaited_once()
+        self.assertTrue(any("دستهٔ 2 عکس" in call.args[1] for call in log.await_args_list))
 
     @unittest.skipUnless(
         importlib.util.find_spec("telegram") and importlib.util.find_spec("httpx"),
