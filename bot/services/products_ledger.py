@@ -81,6 +81,7 @@ def record(
     report: str = "",
     key: str | None = None,
     batch_id: str = "",
+    changes: Iterable[str] = (),
 ) -> dict[str, Any]:
     """Append one result card and return it (also used directly as the message).
 
@@ -115,6 +116,8 @@ def record(
         "images": int(images or 0),
         "categories": [str(x) for x in categories][:6],
         "warnings": [str(x) for x in warnings][:8],
+        #: an update's own list of what moved («💰 قیمت: ۶۹۸٬۰۰۰ ← ۷۲۰٬۰۰۰»)
+        "changes": [str(x) for x in changes][:12],
         "error": (error or "")[:400],
         "report": (report or "")[:REPORT_LIMIT],
         "batch_id": batch_id,
@@ -148,7 +151,7 @@ def _count(entry: dict[str, Any], *, previous: str = "") -> None:
         metrics.incr("products_created")
         if entry.get("variations"):
             metrics.incr("variations_created", int(entry["variations"]))
-    elif status == "restocked":
+    elif status in ("restocked", "updated"):
         metrics.incr("restocks_applied")
     elif status == "queued":
         metrics.incr("publish_queued")
@@ -216,7 +219,7 @@ def summary(entry: dict[str, Any]) -> str:
     status = str(entry.get("status"))
     mark = {
         "created": "✅", "zip": "📦", "failed": "❌", "dry": "🧪", "pending": "⏳",
-        "queued": "🐇", "restocked": "🔄",
+        "queued": "🐇", "restocked": "🔄", "updated": "🔄",
     }.get(status, "•")
     title = str(entry.get("title") or "(بدون عنوان)")
     bits = [f"{mark} {title[:38]}"]
@@ -225,7 +228,7 @@ def summary(entry: dict[str, Any]) -> str:
     if entry.get("variations"):
         bits.append(f"{entry['variations']} واریژن")
     if entry.get("mode") in ("update", "restock"):
-        bits.append("شارژ")
+        bits.append("اپدیت")
     if entry.get("error"):
         error = str(entry["error"])
         bits.append(error.partition(":")[0] if status == "queued" else error[:40])

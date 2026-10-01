@@ -20,7 +20,6 @@ import os
 import shutil
 import tempfile
 import unittest
-import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -551,18 +550,6 @@ class TestFlowGate(unittest.IsolatedAsyncioTestCase):
         self.assertRegex(entry["batch_id"], r"^[0-9a-f]{12}$")
         self.assertEqual(4, json.loads(meta[publish_batch.META_SOURCE])["variations"])
         self.assertEqual(9, json.loads(meta[publish_batch.META_SOURCE])["chat_id"])
-
-    async def test_zip_path_carries_the_same_id(self) -> None:
-        """مسیر ZIP هم شناسه را می‌برد؛ افزونهٔ وردپرس با آن از واردکردن دوباره جلوگیری می‌کند."""
-        self._new_session(mode="update")
-        result, _seen, ctx = await self._confirm()
-        self.assertEqual(PF.ConversationHandler.END, result)
-        handle = ctx.bot.documents[0]["document"]
-        with zipfile.ZipFile(Path(handle.name)) as archive:
-            manifest = json.loads(archive.read("product.json"))
-        self.assertRegex(manifest["batch_id"], r"^[0-9a-f]{12}$")
-        self.assertEqual(products_ledger.recent(1)[0]["batch_id"], manifest["batch_id"])
-        self.assertEqual([], self.calls, "مسیر ZIP نباید به REST برود")
 
     async def test_the_override_button_is_a_real_conversation_handler(self) -> None:
         """دکمه‌ای که هندلرش در مکالمه نیست، فقط یک متن کلیک‌نشدنی است.

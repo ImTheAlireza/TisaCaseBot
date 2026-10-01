@@ -56,9 +56,12 @@ def clear_category_cache() -> None:
 # from this module; it lives in :mod:`bot.services.woo_client` because every HTTP layer failure
 # — not just this one — is reported with it.
 __all__ = [
+    "PUBLISH_MIN_REQUEST_INTERVAL_SECONDS",
     "WooCommerceAPIError",
     "create_draft",
+    "images_by_color",
     "product_description",
+    "upload_images",
 ]
 
 def product_description(data: dict[str, Any]) -> str:
@@ -209,6 +212,18 @@ def _images_by_color(uploads: list[tuple[int, Path]], colors: Sequence[str]) -> 
                 out[str(color)] = media_id
                 break
     return out
+
+
+# The two media helpers below are what an *update* needs as well (see bot.services.update_apply):
+# one upload policy, one colour-by-file-name rule. Public names, same functions.
+async def upload_images(client: WooClient, paths: list[Path], audit: Sink) -> list[tuple[int, Path]]:
+    """Upload ``paths`` one at a time; ``(media id, source file)`` per image, in order."""
+    return await _upload_media_many(client, paths, audit)
+
+
+def images_by_color(uploads: list[tuple[int, Path]], colors: Sequence[str]) -> dict[str, int]:
+    """``colour -> media id`` for uploads whose file name says that colour."""
+    return _images_by_color(uploads, colors)
 
 
 async def _create_without_sku_then_set(

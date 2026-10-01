@@ -357,15 +357,31 @@ class TestNextProductEntry(LedgerTestCase):
         )
         return SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=user_id)), actions
 
-    def test_next_keeps_the_mode_and_starts_clean(self):
+    def test_next_new_keeps_the_mode_and_starts_clean(self):
         PF = self.PF
         PF.sessions[7] = PF.ProductSession(mode="new", info_text="قبلی")
-        update, actions = self._query("product:next:update")
+        update, actions = self._query("product:next:new")
         result = asyncio.run(PF.entry(update, SimpleNamespace()))
         self.assertEqual(result, PF.WAITING)
-        self.assertEqual(PF.sessions[7].mode, "update")
+        self.assertEqual(PF.sessions[7].mode, "new")
         self.assertEqual(PF.sessions[7].info_text, "", "the previous product's text must not leak")
         self.assertEqual(actions[0][0], "reply", "the result card must stay readable")
+
+    def test_next_update_opens_the_search_under_the_result_card(self):
+        # «اپدیت بعدی» has no «same settings» to repeat — the settings are the shop's own product —
+        # so it starts where an update starts: the search. The finished card is not edited.
+        from bot.modules import restock_flow as RF
+
+        PF = self.PF
+        PF.sessions[7] = PF.ProductSession(mode="update", info_text="قبلی")
+        update, actions = self._query("product:next:update")
+        result = asyncio.run(PF.entry(update, SimpleNamespace()))
+        self.addCleanup(RF.sessions.clear)
+        self.assertEqual(result, RF.RESTOCK_MATCH)
+        self.assertNotIn(7, PF.sessions, "the previous update's draft must not leak into the next")
+        self.assertIn(7, RF.sessions)
+        self.assertEqual(actions[0][0], "reply", "the result card must stay readable")
+        self.assertIn("SKU", actions[0][1])
 
     def test_next_still_respects_the_permission_gate(self):
         PF = self.PF

@@ -469,9 +469,14 @@ def _demo_product() -> dict[str, Any]:
         "stock_quantity": None,
         "stock_status": "instock",
         "purchasable": True,
+        # Two pictures, so a rehearsal of an update can say «جایگزین ۲ تصویر فعلی».
+        "images": [{"id": 700_001, "src": "https://dry.run/demo-1.jpg"},
+                   {"id": 700_002, "src": "https://dry.run/demo-2.jpg"}],
         "attributes": [
-            {"name": "مدل", "variation": True, "options": ["iPhone 13 Pro Max", "S24 Ultra"]},
-            {"name": "رنگ", "variation": True, "options": ["مشکی", "سفید"]},
+            {"id": 0, "name": "مدل", "position": 0, "visible": True, "variation": True,
+             "options": ["iPhone 13 Pro Max", "S24 Ultra"]},
+            {"id": 0, "name": "رنگ", "position": 1, "visible": True, "variation": True,
+             "options": ["مشکی", "سفید"]},
         ],
     }
 
@@ -587,7 +592,10 @@ def dry_run_transport(audit: Sink) -> httpx.MockTransport:
                 if isinstance(row, dict):
                     echoed.append({key: value for key, value in row.items() if key != "id"}
                                   | {"id": row.get("id")})
-            return httpx.Response(201, json={"create": created, "update": echoed})
+            # `delete` is echoed the way WooCommerce does (the removed objects), so the update
+            # writer verifies deletions in a rehearsal exactly as it does for real.
+            removed = [{"id": variation_id} for variation_id in sent.get("delete") or []]
+            return httpx.Response(201, json={"create": created, "update": echoed, "delete": removed})
         if method == "POST" and "/variations" in path:
             ids["variation"] += 1
             return httpx.Response(201, json={"id": ids["variation"]})

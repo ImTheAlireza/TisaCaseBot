@@ -1,7 +1,16 @@
-"""Conversation-driven product package builder.
+"""Conversation-driven product builder: one intake, two destinations.
 
-The bot never calls the shared-host WordPress installation. It prepares a ZIP
-which the future WordPress importer can turn into a draft variable product.
+The seller sends photos, a caption and a few lines; the bot reads them into a draft and shows
+one live preview card that follows the conversation. Where the draft goes depends on the mode:
+
+* ``new`` — «🆕 محصول جدید»: the draft becomes a **new draft product** in the shop
+  (:func:`bot.services.woocommerce_direct.create_draft`);
+* ``update`` — «🔄 اپدیت محصول»: the product was picked first
+  (:mod:`bot.modules.restock_flow`), and the card shows only what differs from **that product**
+  (:mod:`bot.services.update_plan`); «✅ اعمال تغییرات» writes just that diff
+  (:mod:`bot.services.update_apply`).
+
+Both write through the shop's REST API; the bot no longer builds ZIP files.
 """
 from __future__ import annotations
 
@@ -16,7 +25,6 @@ import re
 import shutil
 import time
 import traceback
-import zipfile
 from contextlib import AsyncExitStack, asynccontextmanager
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
@@ -44,8 +52,11 @@ from bot.services import (
     learning_impact,
     metrics,
     outbox,
+    product_match,
     products_ledger,
     publish_batch,
+    update_apply,
+    update_plan,
     workspace,
 )
 from bot.services import postmodel as ev, product_journal
@@ -64,13 +75,14 @@ from bot.services.stock_matrix import parse_stock_matrix_sources, strip_stock_ma
 from bot.services.validation import validate_draft
 from bot.services.image_compressor import compress_image, compressed_size_savings
 from bot.services.product_extractor import (
+    TITLE_LABEL_RE,
     ProductData,
     _fallback,
     _number_from_line,
     extract_accessory_models,
     extract_product,
 )
-from bot.services.woo_client import describe_exception
+from bot.services.woo_client import Audit, describe_exception
 from bot.services.woocommerce_direct import WooCommerceAPIError, create_draft, product_description
 
 # One session owns one persistent Telegram card. COLLECT accepts images and the
@@ -136,7 +148,12 @@ class ProductSession:
     #: request, so undoing a misread correction can never make things worse.
     history: list[_DraftSnapshot] = field(default_factory=list)
     mode: str = "new"
-    image_mode: str = "keep"
+    #: «اپدیت»: the shop's product this session compares its draft with — read when it was
+    #: picked, and read again at confirm so the diff that is written is the diff of *now*.
+    target: product_match.ShopProduct | None = None
+    #: True once an update already replaced the gallery with this session's photos. A retry after
+    #: a half-failed write must not upload (and orphan) the same pictures a second time.
+    gallery_applied: bool = False
     processing_media: bool = False
     # Human-readable trace of the detected per-model color matrix (for the log group).
     color_summary: str = ""
@@ -275,7 +292,7 @@ async def _delete_card(bot: Any, session: ProductSession, target: dict[str, obje
 async def _react_failure(
     context: ContextTypes.DEFAULT_TYPE,
     user_id: int,
-    session: ProductSession,
+    session: ProductSession | None,
     message: Message | None,
 ) -> bool:
     """Put a transient ⚡ reaction on the message whose processing failed.
@@ -535,15 +552,9 @@ def _already_published_note(entry: dict[str, object]) -> str:
 
 
 def _keyboard(session: ProductSession | None = None) -> InlineKeyboardMarkup:
-    confirm_label = "✅ تأیید و ساخت پیش‌نویس" if not session or session.mode == "new" else "✅ تأیید و ساخت ZIP"
+    updating = bool(session and session.mode == "update")
+    confirm_label = "✅ اعمال تغییرات" if updating else "✅ تأیید و ساخت پیش‌نویس"
     rows = [[InlineKeyboardButton(confirm_label, callback_data="product:confirm")]]
-    if session and session.mode == "update":
-        keep = "✅ تصاویر فعلی" if session.image_mode == "keep" else "تصاویر فعلی"
-        replace = "✅ جایگزینی تصاویر" if session.image_mode == "replace" else "جایگزینی تصاویر"
-        rows.insert(0, [
-            InlineKeyboardButton(keep, callback_data=CB.PHONE_IMAGE_KEEP),
-            InlineKeyboardButton(replace, callback_data=CB.PHONE_IMAGE_REPLACE),
-        ])
     data = session.data if session else None
     if data is not None:
         dismissed = set(session.dismissed)
@@ -590,11 +601,24 @@ def _short(text: str, limit: int = 32) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
+#: Fields an update never writes: the SKU is the product's identity, and its categories and
+#: description are not something a stock/price/photo update is allowed to rewrite.
+_UPDATE_HIDDEN_FIELDS = frozenset({"sku_prefix", "categories", "wholesale_price"})
+
+
+def _editable(session: ProductSession) -> list[tuple[str, str, str]]:
+    """The rows of the «✏️ اصلاح فیلد خاص» picker — fewer in an update, where some fields are inert."""
+    rows = draft_edits.editable_fields(session.data)
+    if session.mode == "update":
+        rows = [row for row in rows if row[0] not in _UPDATE_HIDDEN_FIELDS]
+    return rows
+
+
 def _fields_keyboard(session: ProductSession) -> InlineKeyboardMarkup:
     rows = []
     for index, key in enumerate(session.field_keys):
         label, _, current = next(
-            (row for row in draft_edits.editable_fields(session.data) if row[0] == key), (key, key, "")
+            (row for row in _editable(session) if row[0] == key), (key, key, "")
         )
         edit_button = InlineKeyboardButton(
             f"✏️ {label}: {_short(current, 24)}", callback_data=f"product:field:{index}"
@@ -619,7 +643,7 @@ def _color_source_keyboard(session: ProductSession) -> InlineKeyboardMarkup:
 def _record_result(
     user_id: int, session: ProductSession, data: ProductData, *, status: str, error: str = "",
     product_id: object = None, edit_url: str = "", warnings: Sequence[str] = (),
-    key: str | None = None, batch_id: str = "",
+    key: str | None = None, batch_id: str = "", changes: Sequence[str] = (),
 ) -> dict[str, object]:
     """Store the outcome, and return the entry the card is built from.
 
@@ -651,6 +675,9 @@ def _record_result(
         "error": error,
         "report": _preview(session),
     }
+    if changes:
+        # An update's card lists *what changed*; a new product's has no such list.
+        fields["changes"] = [str(line) for line in changes][:12]
     if key:
         finished = products_ledger.update(key, **fields)
         if finished is not None:
@@ -676,6 +703,11 @@ def _zip_manifest(
     mode: str = "new",
 ) -> dict[str, object]:
     """``product.json`` inside the ZIP — the same facts the REST writer was given.
+
+    The bot itself no longer builds ZIP files — a new product *and* an update are written through
+    REST — so nothing here calls this any more. It stays as the documented contract of the
+    WordPress importer plugin (docs/IMPORTER-CONTRACT.md), which can still be fed such a file by
+    hand, and its tests keep that contract from drifting.
 
     Two shapes for the same product is how a seller ends up with two different shops, so the
     keys are written from here and nowhere else. ``model_colors`` travels with the ZIP so the
@@ -908,8 +940,13 @@ def _category_rows(data: ProductData) -> list[str]:
 
 def _validation_issues(session: ProductSession) -> Any:
     data = session.data
+    payload = data.to_dict() if data is not None else {}
+    if session.mode == "update" and session.target is not None and not payload.get("models"):
+        # A model-specific price names a model of *this product*; when the update does not list
+        # models, the ones the shop has are what those names are checked against.
+        payload["models"] = session.target.model_values()
     return validate_draft(
-        data.to_dict() if data is not None else {},
+        payload,
         mode=session.mode,
         image_count=len(session.files),
         price_min=settings.price_min,
@@ -943,6 +980,8 @@ def _card_text(
     data = session.data if data is None else data
     if data is None:
         return "❌ هنوز اطلاعات محصولی ندارم."
+    if session.mode == "update":
+        return _update_card_text(session, stage=stage, data=data, footer=footer)
     plan = plan_from_dict(data.to_dict())
     data.variation_count = plan.count
     placeholder = stage == "full"
@@ -966,6 +1005,70 @@ def _card_text(
     if footer:
         lines.extend(["", footer])
     return "\n".join(lines)
+
+
+def _update_card_text(session: ProductSession, *, stage: str, data: ProductData, footer: str) -> str:
+    """The update card: the draft compared with the product the shop has — only what changes.
+
+    Same fill-in order as a new product's card (title, price and stock first; models once they
+    are read; the whole picture last) and the same renderer for the half-filled and the final
+    card, so the numbers the seller watched appear are the ones they approve.
+    """
+    product = session.target
+    if product is None:
+        return "❌ محصولی برای اپدیت انتخاب نشده است."
+    plan = _plan_for(session, product, data)
+    lines = ["🔄 <b>پیش‌نمایش اپدیت</b>"]
+    if settings.woo_dry_run:
+        lines.append("🧪 حالت آزمایشی")
+    sku = f" · SKU: {html.escape(product.sku)}" if product.sku else ""
+    lines.append(f"🛍 {html.escape(plan.title_now or '—')} · #{product.product_id}{sku}")
+    lines.append("")
+    lines.extend(plan.rows(stage))
+    if stage == "full":
+        lines.extend(_issue_rows(_validation_issues(session)))
+    if footer:
+        lines.extend(["", footer])
+    return "\n".join(lines)
+
+
+def _says_title(session: ProductSession, data: ProductData) -> bool:
+    """Did the seller *state* a title — «عنوان: …», or a field edit — rather than the parser guess one?
+
+    A new product needs a title, so the parser falls back to the first prose line of the text.
+    In an update that guess would overwrite a real title with «سلام» or «ممنون»: silence about
+    the title must stay silence, so only a stated one counts.
+    """
+    if "title" in (getattr(data, "user_edits", None) or {}):
+        return True
+    for text in (session.info_text, session.model_text):
+        for line in (text or "").splitlines():
+            match = TITLE_LABEL_RE.match(line)
+            if match and match.group(1).strip():
+                return True
+    return False
+
+
+def _plan_for(session: ProductSession, product: product_match.ShopProduct,
+              data: ProductData) -> update_plan.UpdatePlan:
+    """The diff of this session's draft against ``product`` — the one place it is built."""
+    payload = data.to_dict()
+    guessed = ""
+    if not _says_title(session, data):
+        guessed = str(payload.get("title") or "").strip()
+        payload["title"] = ""
+    plan = update_plan.build(product, payload, image_count=_new_photo_count(session))
+    if guessed and " ".join(guessed.split()) != plan.title_now:
+        shown = _short(guessed, 60)
+        plan.notes.append(
+            f"از متن «{shown}» به‌عنوان عنوان برداشت شد ولی دست نمی‌خورد؛ "
+            "برای عوض‌کردن عنوان بنویس «عنوان: …».")
+    return plan
+
+
+def _new_photo_count(session: ProductSession) -> int:
+    """Photos the next write would upload — none once a failed attempt already replaced the gallery."""
+    return 0 if session.gallery_applied else len(session.files)
 
 
 def _preview(session: ProductSession) -> str:
@@ -1764,6 +1867,7 @@ async def _prepare_files_impl(user_id: int, messages: list[Message], context: Co
     # A second batch (or a late album photo) must ADD images, never silently
     # replace the ones already collected for this product.
     session.files = previous_files + new_files
+    session.gallery_applied = False       # a new photo is a new gallery to write
     session.model_text = _append_model_caption(session.model_text, _caption(messages))
     extraction_ms = 0.0
     expected_ai_requests = 0
@@ -1835,7 +1939,9 @@ async def _prepare_files_impl(user_id: int, messages: list[Message], context: Co
                 f"[ai:summary] استخراج دوبارهٔ متن هم‌زمان: "
                 f"{requests} درخواست، {extraction_ms:.0f} ms",
             )
-        if session.info_text:
+        # In an update the photos *are* an update: the card with the gallery change is shown
+        # at once, and any text that follows only adds to it.
+        if session.info_text or session.mode == "update":
             await painter.paint("full")
         else:
             await _render_card(
@@ -1871,13 +1977,12 @@ async def _flush_album(key: tuple[int, str], context: ContextTypes.DEFAULT_TYPE)
                 )
 
 
-async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE, *,
-                mode_override: str | None = None) -> int:
+async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Menu/preview entry point.
 
-    ``mode_override`` is how the restock flow hands a chat to the ZIP builder
-    (:func:`begin_update`): the same permissions and cleanup, with the mode stated instead of
-    read back out of the callback data.
+    «🔄 اپدیت محصول» (the menu button, or «اپدیت بعدی» on a result card) opens the product
+    *search* — nothing is built until a product has been picked, and the builder itself
+    starts in :func:`begin_update` with that product in hand.
     """
     user = update.effective_user
     query = update.callback_query
@@ -1886,34 +1991,32 @@ async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE, *,
     # a plain handler) is what makes the flow's own states catch the messages
     # after the tap — an ordinary handler would leave the user talking to nobody.
     data = query.data or ""
-    restock = data == CB.PHONE_RESTOCK and mode_override is None
-    mode = mode_override or ("update" if data == CB.PHONE_RESTOCK or data.endswith(":update")
-                             else "new")
-    key = "product_restock" if mode == "update" else "product_new"
+    updating = data == CB.PHONE_RESTOCK or data.endswith(":update")
+    key = "product_restock" if updating else "product_new"
     if not user or not feature_allowed(user.id, key):
         await query.answer("⛔ دسترسی ندارید.", show_alert=True)
         return ConversationHandler.END
     await query.answer()
     chat_id = query.message.chat_id if query.message else user.id
-    flow_state.record(user.id, chat_id=chat_id, mode="restock" if restock else mode,
-                      step="منتظر SKU/عنوان" if restock else "منتظر تصاویر")
+    flow_state.record(user.id, chat_id=chat_id, mode="restock" if updating else "new",
+                      step="منتظر SKU/عنوان" if updating else "منتظر تصاویر")
     # Starting a new product must never inherit the previous product's images,
     # text or half-finished AI state — and its temp files must really go away.
     _cleanup(user.id)
     # …nor should another flow stay open behind it: one active flow per user.
     closed = flow_guard.close_others("product", user.id)
-    if restock:
-        # Lookup first, in the shop's own data: no ProductSession, no images, no ZIP.
-        return await restock_flow.start(update, context, closed=closed)
-    session = ProductSession(mode=mode)
+    if updating:
+        # The shop's own catalogue first: no ProductSession, no images, until a product is picked.
+        return await restock_flow.start(update, context, closed=closed,
+                                        keep_card=data.startswith(CB.PRODUCT_NEXT_PREFIX))
+    session = ProductSession(mode="new")
     session.user_id = user.id
     session.chat_id = chat_id
     session.thread_id = getattr(query.message, "message_thread_id", None) if query.message else None
     sessions[user.id] = session
-    await _telegram_log(context, f"[product:{user.id}] ورود به جریان محصول: {mode}")
-    prompt = ("🔄 عکس‌ها و مدل‌های محصول موجود را بفرست. سپس قیمت و ویژگی‌های جدید را ارسال کن. "
-              "عنوان و SKU محصول موجود تغییر نمی‌کند." if mode == "update" else
-              "📦 عکس‌های محصول را بفرست. کپشن عکس‌ها باید مدل‌های گوشی باشد؛ بعد از آن متن قیمت، عنوان، پیشوند SKU و ویژگی‌های دیگر را ارسال کن.")
+    await _telegram_log(context, f"[product:{user.id}] ورود به جریان محصول: new")
+    prompt = ("📦 عکس‌های محصول را بفرست. کپشن عکس‌ها باید مدل‌های گوشی باشد؛ بعد از آن متن قیمت، عنوان، "
+              "پیشوند SKU و ویژگی‌های دیگر را ارسال کن.")
     if closed:
         prompt += "\n\n↩️ جریان «" + "»، «".join(closed) + "» قبلی‌ات بسته شد."
     # The guide is written ONCE and then never touched: no edit, no deletion, no
@@ -1934,6 +2037,76 @@ async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE, *,
         guide = await context.bot.send_message(
             text=prompt, reply_markup=_collect_keyboard(), **_target(session, user.id)
         )
+        session.guide_message_id = getattr(guide, "message_id", None)
+    return COLLECT
+
+
+def _update_guide(product: product_match.ShopProduct) -> str:
+    """The one instruction message of an update: which product it is, and what a message does."""
+    title = html.unescape(product.title).strip() or "(بدون عنوان)"
+    facts = [f"#{product.product_id}"]
+    if product.sku:
+        facts.append(f"SKU: {product.sku}")
+    facts.append(f"{len(product.variations)} واریژن" if product.is_variable else "محصول ساده")
+    facts.append(f"{len(product.image_ids)} تصویر")
+    lines = ["🔄 اپدیت محصول", f"🛍 {title}", " · ".join(facts)]
+    if product.is_variable:
+        models = product.model_values()
+        colors = product.color_values()
+        if models:
+            lines.append("مدل‌ها: " + "، ".join(models[:6]) + (f" … (+{len(models) - 6})" if len(models) > 6 else ""))
+        if colors:
+            lines.append("رنگ‌ها: " + "، ".join(colors[:8]))
+        prices = sorted({row.regular_price for row in product.variations if row.regular_price})
+    else:
+        prices = [product.regular_price] if product.regular_price else []
+    if prices:
+        lines.append("قیمت فعلی: " + (f"{prices[0]:,}" if len(prices) == 1
+                                       else f"{prices[0]:,} تا {prices[-1]:,}") + " تومان")
+    for note in product.notes:
+        lines.append(f"⚠️ {note}")
+    lines += [
+        "",
+        "عکس‌ها، کپشن و اطلاعات تازه را بفرست — همان‌طور که برای «محصول جدید» می‌فرستی.",
+        "پیش‌نمایش فقط چیزهایی را نشان می‌دهد که با محصول فعلی فرق دارد؛ هرچه نفرستی دست‌نخورده می‌ماند:",
+        "• قیمت نفرستی ← قیمت فعلی می‌ماند",
+        "• فهرست مدل بفرستی ← جای همهٔ مدل‌های فعلی می‌نشیند",
+        "• عکس بفرستی ← جای عکس‌های فعلی می‌نشیند",
+    ]
+    return "\n".join(lines)
+
+
+async def begin_update(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                       product: product_match.ShopProduct) -> int:
+    """A product was picked in the search: open the builder against it.
+
+    The search message is edited into the guide — a button tap edits in place — and from here the
+    chat behaves exactly like a new product's: photos and text become the draft, the card moves
+    to the bottom, and only «✅ اعمال تغییرات» writes. :func:`_cleanup` runs first so the search
+    session ends where the product session begins (one flow at a time, no leftover diff).
+    """
+    query = update.callback_query
+    user = update.effective_user
+    if query is None or user is None:
+        return ConversationHandler.END
+    message = query.message
+    chat_id = message.chat_id if message else user.id
+    _cleanup(user.id)
+    session = ProductSession(mode="update", target=product)
+    session.user_id = user.id
+    session.chat_id = chat_id
+    session.thread_id = getattr(message, "message_thread_id", None) if message else None
+    sessions[user.id] = session
+    flow_state.record(user.id, chat_id=chat_id, mode="update", step="منتظر عکس و اطلاعات")
+    await _telegram_log(
+        context, f"[product:{user.id}] ورود به اپدیت محصول #{product.product_id} (SKU: {product.sku or '—'})")
+    prompt = _update_guide(product)
+    if message is not None:
+        session.guide_message_id = message.message_id
+        await _edit_message_if_changed(query, prompt, reply_markup=_collect_keyboard())
+    else:
+        guide = await context.bot.send_message(
+            text=prompt, reply_markup=_collect_keyboard(), **_target(session, user.id))
         session.guide_message_id = getattr(guide, "message_id", None)
     return COLLECT
 
@@ -2115,23 +2288,6 @@ async def _refresh_preview(
     )
 
 
-async def set_image_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    user = update.effective_user
-    session = sessions.get(user.id if user else 0)
-    if not session or session.mode != "update":
-        await query.answer("این گزینه فقط برای شارژ محصول موجود است.", show_alert=True)
-        return REVIEW
-    session.image_mode = "replace" if query.data == CB.PHONE_IMAGE_REPLACE else "keep"
-    await query.answer("حالت تصاویر ذخیره شد.")
-    if session.data:
-        await _render_card(
-            context, user.id, session, _preview(session),
-            parse_mode="HTML", reply_markup=_keyboard(session),
-        )
-    return REVIEW
-
-
 def _queue_for_retry(
     exc: BaseException, *, user_id: int, session: ProductSession, data: ProductData,
     batch: str, error: str, ledger_key: str | None,
@@ -2140,7 +2296,8 @@ def _queue_for_retry(
 
     Three doors have to be open: the failure is one a later attempt can fix
     (:func:`bot.services.outbox.is_transient`), this is a real publish (dry-run queues nothing),
-    and it is the REST mode (a ZIP is a file the seller uploads themselves). Nothing here may
+    and it is a *new product* — an update is a diff against the shop, asking again recomputes it,
+    and a queued copy of yesterday's diff is the one thing that would be wrong. Nothing here may
     raise: a queue that cannot be written is a worse message, not a crashed flow.
     """
     if settings.woo_dry_run or session.mode != "new" or not outbox.is_transient(exc):
@@ -2168,6 +2325,8 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await query.answer("اول عکس و اطلاعات محصول را بفرست.", show_alert=True)
         return REVIEW
     data = session.data
+    if session.mode == "update":
+        return await _confirm_update(context, query, user, session)
     data.categories = _canonical_category_paths(
         apply_sku_category_policy(data.categories, data.sku_prefix)
     )
@@ -2416,46 +2575,170 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             )
             session.submitting = False
             return REVIEW
+    # Every mode but «new» (REST draft above) and «update» (dispatched at the top) is unknown:
+    # the bot no longer builds ZIP files, so there is nothing honest to do with it.
+    session.submitting = False
+    await query.answer("این حالت پشتیبانی نمی‌شود؛ از منو دوباره شروع کن.", show_alert=True)
+    return REVIEW
+
+
+async def _confirm_update(context: ContextTypes.DEFAULT_TYPE, query: Any, user: Any,
+                          session: ProductSession) -> int:
+    """«✅ اعمال تغییرات»: write the diff the card showed — and only that — to the shop.
+
+    The card was built against the product as it was when it was picked. Between then and this
+    tap anyone may have edited it, so the product is read again and the plan re-computed; if the
+    two plans differ the card is shown again with the fresh numbers and nothing is written.
+    Errors never open a new message: a gate that fails answers with a toast, and a write that
+    fails shows its reason as a line on the same card, with the diff that is still to do.
+    """
+    data = session.data
+    target = session.target
+    if data is None or target is None:
+        await query.answer("محصولی برای اپدیت انتخاب نشده؛ از منو دوباره شروع کن.", show_alert=True)
+        return REVIEW
+    issues = _validation_issues(session)
+    plan = _plan_for(session, target, data)
+    if issues.blocking:
+        await query.answer(f"⛔ {issues.errors[0].message}", show_alert=True)
+        await _edit_message_if_changed(
+            query, _preview(session), parse_mode="HTML", reply_markup=_keyboard(session))
+        return REVIEW
+    if plan.blocking:
+        await query.answer(f"⛔ {plan.errors[0]}", show_alert=True)
+        return REVIEW
+    if plan.empty:
+        await query.answer("هیچ تفاوتی با محصول فعلی نیست؛ قیمت، موجودی، مدل یا عکس تازه بفرست.",
+                           show_alert=True)
+        return REVIEW
+    if session.submitting:
+        await query.answer("⏳ همین حالا یک اپدیت در جریان است؛ لطفاً صبر کن.", show_alert=True)
+        return REVIEW
+    session.submitting = True
+    # A toast, not a status message: the card stays exactly as it is while the shop is written.
+    await query.answer("در حال خواندن محصول و اعمال تغییرات…")
+    try:
+        return await _apply_update(context, query, user, session, plan)
+    except BaseException:
+        # A bug (or a cancelled task) after the toast must not leave a card nobody can tap:
+        # PTB's error handler reports it, and the seller can press the button again.
+        session.submitting = False
+        raise
+
+
+async def _apply_update(context: ContextTypes.DEFAULT_TYPE, query: Any, user: Any,
+                        session: ProductSession, plan: update_plan.UpdatePlan) -> int:
+    """The part of «✅ اعمال تغییرات» that talks to the shop (the gates are in the caller)."""
+    data = session.data
+    target = session.target
+    if data is None or target is None:                         # pragma: no cover - checked by the caller
+        return REVIEW
+    await _status(context, user.id, session, f"🔄 اپدیت #{target.product_id}: {plan.summary()}")
     await _telegram_log(
-        context,
-        f"[product:{user.id}] حالت ZIP/شارژ انتخاب شد؛ هشدارها: "
-        + ("؛ ".join(issue.message for issue in issues.issues) or "هیچ"),
+        context, f"[product:{user.id}] تأیید اپدیت #{target.product_id}؛ {plan.summary()}\n"
+        + "\n".join(plan.change_lines()))
+    audit = Audit()
+    fresh_plan = plan
+    result: update_apply.ApplyResult | None = None
+    banner = ""
+    try:
+        async with _typing_indicator(context, user.id, session):
+            fresh = await product_match.read(
+                target.product_id, audit=audit, dry_run=settings.woo_dry_run)
+            fresh_plan = _plan_for(session, fresh, data)
+            if fresh_plan.signature() != plan.signature():
+                session.target = fresh
+                banner = "⚠️ فروشگاه از آخرین بررسی عوض شده؛ تغییرات را دوباره ببین و تأیید کن."
+            else:
+                result = await update_apply.apply(
+                    fresh_plan, session.files, audit=audit, dry_run=settings.woo_dry_run)
+    except Exception as exc:
+        reason = describe_exception(exc)
+        await _telegram_log(
+            context, f"[product:{user.id}] اپدیت #{target.product_id} ناموفق بود: {reason}\n"
+            + traceback.format_exc())
+        await _flush_journal(context, status="update_failed", data=data, session=session,
+                             product_id=target.product_id, errors=[reason])
+        banner = f"❌ اپدیت ناموفق بود: {reason}"
+    if result is None:
+        return await _update_stays_open(context, query, user, session, banner)
+
+    final_title = fresh_plan.new_title or fresh_plan.title_now
+    shown = copy.copy(data)
+    shown.title = final_title
+    shown.variation_count = fresh_plan.variations_after
+    problems = [*result.failed[:3], *result.errors[:2]]
+    if result.skipped_deletes:
+        problems.append(f"{result.skipped_deletes} واریژن قدیمی هنوز حذف نشده")
+    if result.unconfirmed:
+        problems.append(f"{len(result.unconfirmed)} واریژن فرستاده شد و فروشگاه مقدار جدید را برنگرداند — در سایت چک کن")
+    warnings = [*fresh_plan.warnings, *fresh_plan.notes]
+    if result.dry_run:
+        warnings.append("🧪 حالت آزمایشی روشن است: هیچ چیزی در سایت نوشته نشد.")
+    # Green only when the shop confirmed everything that was sent: a half-done update is a
+    # «failed» card with the reason — the history must not read as success.
+    complete = result.ok and result.changed
+    status = ("dry" if result.dry_run else "updated") if complete else "failed"
+    edit_url = "" if result.dry_run or not settings.woocommerce_url else (
+        f"{settings.woocommerce_url.rstrip('/')}/wp-admin/post.php?post={target.product_id}&action=edit")
+    entry = _record_result(
+        user.id, session, shown, status=status, product_id=target.product_id, edit_url=edit_url,
+        error="؛ ".join(problems) if problems else "", warnings=[*warnings, *problems],
+        # What was *planned* is listed as a change only when it all landed.
+        changes=fresh_plan.change_lines() if complete else (),
     )
-    zip_path = TEMP_DIR / f"product_{user.id}_{int(time.time())}.zip"
-    zip_path.parent.mkdir(parents=True, exist_ok=True)
-    usable_attributes = {name: values for name, values in data.attributes.items() if len(values) >= 2}
-    if len(data.models) >= 2:
-        usable_attributes = {"مدل": data.models, **usable_attributes}
-    manifest = _zip_manifest(data, usable_attributes=usable_attributes, image_mode=session.image_mode,
-                             batch=batch, mode=session.mode)
+    await _telegram_log(
+        context, f"[product:{user.id}] " + result.summary().replace("\n", " | "))
+    await _flush_journal(
+        context, status="update_failed" if status == "failed" else status, data=shown,
+        session=session, product_id=target.product_id, warnings=warnings,
+        errors=problems if not result.ok else (),
+    )
+    if audit.lines and not settings.verbose_log:
+        # The HTTP trace belongs in the log group, never in the owner's private chat.
+        await product_journal.send_publish_trace(context.bot, audit.lines, dry_run=settings.woo_dry_run)
+    if complete:
+        await _render_card(
+            context, user.id, session, result_card(entry), parse_mode="HTML",
+            reply_markup=result_keyboard(entry),
+        )
+        _cleanup(user.id)
+        return ConversationHandler.END
+    # Half-done (or not done): what landed is no longer a difference, so a fresh read shows
+    # exactly what is left — «✅ اعمال تغییرات» again sends only that.
+    if result.images:
+        session.gallery_applied = True
+    if result.changed:
+        try:
+            session.target = await product_match.read(
+                target.product_id, audit=Audit(), dry_run=settings.woo_dry_run)
+        except Exception as exc:                              # the old baseline is still honest enough to show
+            logger.warning("re-read after a partial update failed: %s", exc)
+    return await _update_stays_open(context, query, user, session, _unfinished_banner(result))
 
-    def _pack_zip(target_zip: Path, json_manifest: dict[str, object], files: list[Path]) -> None:
-        with zipfile.ZipFile(target_zip, "w", zipfile.ZIP_DEFLATED) as archive:
-            archive.writestr("product.json", json.dumps(json_manifest, ensure_ascii=False, indent=2))
-            for index, path in enumerate(files, 1):
-                archive.write(path, f"images/{index:02d}_{path.name}")
 
-    await _status(context, user.id, session, "📦 در حال ساخت و ارسال فایل ZIP...")
-    async with _typing_indicator(context, user.id, session):
-        await asyncio.to_thread(_pack_zip, zip_path, manifest, list(session.files))
-        await _telegram_log(context, f"[product:{user.id}] ZIP ساخته شد: {zip_path.name}؛ تعداد تصاویر: {len(session.files)}")
-        with zip_path.open("rb") as handle:
-            await context.bot.send_document(
-                filename="product.zip",
-                document=handle,
-                caption="✅ فایل محصول آماده شد. این فایل را در افزونه وردپرس آپلود کن.",
-                **_target(session, user.id),  # type: ignore[arg-type]
-            )
-    await _telegram_log(context, f"[product:{user.id}] ZIP برای کاربر ارسال شد.")
-    await _edit_message_if_changed(query, "✅ ZIP ساخته و ارسال شد.")
-    entry = _record_result(user.id, session, data, status="zip", batch_id=batch,
-                           warnings=[issue.message for issue in issues.warnings])
-    await _flush_journal(context, status="zip", data=data, session=session, batch=batch,
-                         warnings=[issue.message for issue in issues.warnings])
-    await context.bot.send_message(text=result_card(entry), parse_mode="HTML",
-                                   reply_markup=result_keyboard(entry), **_target(session, user.id))
-    _cleanup(user.id)
-    return ConversationHandler.END
+def _unfinished_banner(result: update_apply.ApplyResult) -> str:
+    """One line on the card: how far the write got, why it stopped, and what the next tap does."""
+    head = "⚠️ بخشی اعمال شد" if result.changed else "❌ چیزی اعمال نشد"
+    why = list(result.failed[:2]) or list(result.errors[:1])
+    if result.unconfirmed:
+        why.append(f"{len(result.unconfirmed)} واریژن را فروشگاه تأیید نکرد")
+    if result.skipped_deletes:
+        why.append(f"{result.skipped_deletes} واریژن قدیمی هنوز حذف نشده")
+    reason = (": " + "؛ ".join(why)) if why else ""
+    return f"{head}{reason}. «✅ اعمال تغییرات» را دوباره بزن؛ فقط باقی‌مانده فرستاده می‌شود."
+
+
+async def _update_stays_open(context: ContextTypes.DEFAULT_TYPE, query: Any, user: Any,
+                             session: ProductSession, banner: str) -> int:
+    """Show the card again — in place — with one line saying why nothing was finished."""
+    session.submitting = False
+    card = _preview(session)
+    if banner:
+        card = f"{html.escape(banner)}\n\n{card}"
+    await _render_card(
+        context, user.id, session, card, parse_mode="HTML", reply_markup=_keyboard(session))
+    return REVIEW
 
 
 async def force_publish(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -2533,13 +2816,15 @@ async def on_timeout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     """An idle flow is over: drop the state and its files, and say so."""
     user = update.effective_user
     restock_open = bool(user and restock_flow.sessions.get(user.id))
-    product_open = bool(user and user.id in sessions)
+    open_session = sessions.get(user.id) if user else None
     # Which flow gave up is both a number and a sentence — the metric wants a key, the
-    # user has to be told «شارژ محصول» — so one branch decides both and they cannot drift.
-    if product_open:
+    # user has to be told «اپدیت محصول» — so one branch decides both and they cannot drift.
+    if open_session is not None and open_session.mode == "update":
+        kind, label = "restock", "اپدیت محصول"
+    elif open_session is not None:
         kind, label = "product", "ساخت محصول"
     elif restock_open:
-        kind, label = "restock", "شارژ محصول"
+        kind, label = "restock", "اپدیت محصول"
     else:
         kind, label = "flow", "جریان"
     metrics.note_abandoned(kind)
@@ -2569,7 +2854,7 @@ async def edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if session is None or session.data is None:
         await query.answer("اول اطلاعات محصول را بفرست تا چیزی برای اصلاح باشد.", show_alert=True)
         return COLLECT
-    session.field_keys = [key for key, _label, _current in draft_edits.editable_fields(session.data)]
+    session.field_keys = [key for key, _label, _current in _editable(session)]
     await query.answer()
     await _render_card(
         context, user_id, session, "✏️ فیلد را انتخاب کن:",
@@ -2908,22 +3193,31 @@ async def reject_proposal(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     return REVIEW
 
 
+def _cancelled_text(user_id: int | None) -> str:
+    """«ساخت محصول» or «اپدیت محصول» — whichever was really open — and that nothing was written."""
+    session = sessions.get(user_id) if user_id else None
+    searching = bool(user_id and restock_flow.sessions.get(user_id))
+    if searching or (session is not None and session.mode == "update"):
+        return "❌ اپدیت محصول لغو شد؛ چیزی در فروشگاه عوض نشد. برای شروع دوباره /start را بزن."
+    return "❌ ساخت محصول لغو شد. برای شروع دوباره /start را بزن."
+
+
 async def exit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
+    text = _cancelled_text(user.id if user else None)
     if user:
         _cleanup(user.id)
-    await update.effective_message.reply_text("❌ ساخت محصول لغو شد. برای شروع دوباره /start را بزن.")
+    await update.effective_message.reply_text(text)
     return ConversationHandler.END
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
     await update.callback_query.answer()
+    text = _cancelled_text(user.id if user else None)
     if user:
         _cleanup(user.id)
-    await _edit_message_if_changed(
-        update.callback_query, "❌ ساخت محصول لغو شد. برای شروع دوباره /start را بزن."
-    )
+    await _edit_message_if_changed(update.callback_query, text)
     return ConversationHandler.END
 
 
@@ -2933,8 +3227,8 @@ async def notify_interrupted_flows(app: Application) -> None:
     Without this the bot simply forgets the half-built product and the user
     assumes their photos vanished on Telegram's side.
     """
-    names = {"new": "ساخت محصول", "update": "ساخت فایل برای محصول موجود",
-             "restock": "شارژ محصول موجود"}
+    names = {"new": "ساخت محصول", "update": "اپدیت محصول موجود",
+             "restock": "اپدیت محصول موجود"}
     for user_id, info in flow_state.take_pending().items():
         chat_id = info.get("chat_id") or user_id
         mode = str(info.get("mode") or "new")
@@ -2953,15 +3247,6 @@ async def notify_interrupted_flows(app: Application) -> None:
             logger.warning("could not announce the interrupted flow to %s: %s", chat_id, exc)
 
 
-async def begin_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Enter the builder in update mode from another flow (the restock «📦 فایل/ZIP» button).
-
-    Deliberately a call to :func:`entry` and not a copy of it: the permission check, the
-    cleanup and the flow guard must not exist twice, or one of them will start lying.
-    """
-    return await entry(update, context, mode_override="update")
-
-
 def close_for(user_id: int) -> bool:
     """End this user's product flow (session, album buffers, temp files).
 
@@ -2978,7 +3263,7 @@ def close_for(user_id: int) -> bool:
 flow_guard.register("product", "ساخت محصول", close_for)
 # Starting the builder closes an open restock diff, and vice versa (both entry paths call
 # close_others), so a stale «✅ اعمال» can never write over a product being built.
-flow_guard.register("restock", "شارژ محصول موجود", restock_flow.cleanup)
+flow_guard.register("restock", "اپدیت محصول موجود", restock_flow.cleanup)
 
 
 def register(app: Application) -> None:
@@ -2988,7 +3273,6 @@ def register(app: Application) -> None:
     review_callbacks = [
         CallbackQueryHandler(confirm, pattern=r"^product:confirm$"),
         CallbackQueryHandler(force_publish, pattern=r"^product:force$"),
-        CallbackQueryHandler(set_image_mode, pattern=f"^({CB.PHONE_IMAGE_KEEP}|{CB.PHONE_IMAGE_REPLACE})$"),
         CallbackQueryHandler(edit, pattern=r"^product:edit$"),
         CallbackQueryHandler(edit_free, pattern=r"^product:edit:free$"),
         CallbackQueryHandler(open_color_sources, pattern=r"^product:colorsrc$"),
@@ -3028,7 +3312,7 @@ def register(app: Application) -> None:
             CallbackQueryHandler(cancel_field, pattern=r"^product:field:cancel$"),
             CallbackQueryHandler(cancel_field, pattern=r"^product:fields:back$"),
         ],
-        # «شارژ محصول موجود» is a second path through this one conversation (see
+        # «اپدیت محصول موجود» starts as a second path through this one conversation (see
         # bot/modules/restock_flow.py). Sharing the ConversationHandler is what makes the
         # handover to the ZIP builder honest: a second conversation would leave the framework's
         # state pointing at the flow the user just left, and their next message would talk to

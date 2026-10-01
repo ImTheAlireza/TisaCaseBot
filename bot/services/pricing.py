@@ -12,6 +12,18 @@ from collections.abc import Mapping, Sequence
 from bot.services.color_matrix import model_signature
 
 
+_IPHONE_RE = re.compile(r"(?i)\b(?:iphone|apple)\b|آیفون|ایفون|اپل")
+
+
+def price_group(model: str) -> str:
+    """The legacy price group a model belongs to: ``iphone`` or ``android``.
+
+    One definition for the resolver below and for anything that has to guess «what does a model
+    like this one cost» (an update that adds a model without being told its price).
+    """
+    return "iphone" if _IPHONE_RE.search(model or "") else "android"
+
+
 def price_for_model(
     model: str,
     common: int,
@@ -33,9 +45,7 @@ def price_for_model(
         if len(matches) > 1 and len(set(matches)) == 1:
             return matches[0]
 
-    is_iphone = bool(re.search(r"(?i)\b(?:iphone|apple)\b|آیفون|ایفون|اپل", model or ""))
-    group = "iphone" if is_iphone else "android"
-    group_price = int(groups.get(group) or 0)
+    group_price = int(groups.get(price_group(model)) or 0)
     return group_price or int(common or 0)
 
 
@@ -87,4 +97,4 @@ def map_labels(
     return matched, unmatched
 
 
-__all__ = ["map_labels", "match_model_labels", "price_for_model", "unresolved_models"]
+__all__ = ["map_labels", "match_model_labels", "price_for_model", "price_group", "unresolved_models"]

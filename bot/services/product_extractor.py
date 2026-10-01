@@ -115,6 +115,14 @@ The input has two labeled sources. PRODUCT INFO is the authoritative source for 
 """
 
 
+#: A line that *states* the title («عنوان: قاب مگنتی»). The reader falls back to the first prose
+#: line when there is none; an update trusts only this form (see bot/modules/product_flow.py).
+TITLE_LABEL_RE = re.compile(
+    r"^\s*(?:عنوان|نام\s*محصول|اسم\s*محصول|title|product\s+name)\s*[:：]\s*(.*?)\s*$",
+    re.I,
+)
+
+
 def _endpoint() -> str:
     base = settings.ai_base_url.rstrip("/")
     if not base:
@@ -702,10 +710,7 @@ def _fallback(
                 prefix = block.text().upper()
                 prefix_block = block
                 break
-    title_label = re.compile(
-        r"^\s*(?:عنوان|نام\s*محصول|اسم\s*محصول|title|product\s+name)\s*[:：]\s*(.*?)\s*$",
-        re.I,
-    )
+    title_label = TITLE_LABEL_RE
     explicit_title = ""
     explicit_title_block: Block | None = None
     # Prefer PRODUCT INFO as a source, then use the newest labeled title inside

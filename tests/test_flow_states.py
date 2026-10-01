@@ -918,39 +918,35 @@ class TestChatRouting(FlowStateTestCase):
         self.assertEqual([], calls["messages"] + calls["edits"])
         self.assertIsNone(session.status_message_id, "progress must not create a new message")
 
-    def test_zip_result_document_and_card_follow_the_flow(self):
-        """مسیر ZIP: فایل و کارت هم باید به همان چت/تاپیک بروند.
+    def test_update_result_card_follows_the_flow_chat_and_thread(self):
+        """«اپدیت محصول»: the result card and the log trace go where the flow started.
 
-        این تست عمداً مسیر «.zip» را end-to-end می‌راند: کارت نتیجه و send_document
-        مدت‌ها `user.id` را hard-code داشتند و هیچ تستی آن مسیر را اجرا نمی‌کرد —
-        یعنی دقیقاً همان‌جا که فاز ۳c قول همسویی داده بود، پوششی وجود نداشت.
+        The routing has to hold for every proactive message — `user.id` was a private-chat assumption
+        for a long time, and a forum topic is exactly where it breaks. The update is a rehearsal
+        (dry-run) here so that no shop is needed: the card is still built from the same plan.
         """
         import shutil
         import tempfile
 
-        from bot.services import products_ledger
+        import _flow_harness as h
+        from bot.services import products_ledger, product_match
         from bot.services.product_extractor import ProductData
 
         tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, tmp, True)
         image = tmp / "01.jpg"
         image.write_bytes(b"z" * 64)
-
+        self.enterContext(h.temp_ledger())
+        self.enterContext(h.patched_settings(h.settings_with(woo_dry_run=True, log_chat_id=-1001)))
+        self.enterContext(h.no_sleep())
         self._temp_dir = PF.TEMP_DIR
         PF.TEMP_DIR = tmp
         self.addCleanup(setattr, PF, "TEMP_DIR", self._temp_dir)
-        self._ledger_file = products_ledger.FILE
-        products_ledger.FILE = tmp / "recent_products.json"
-        self.addCleanup(setattr, products_ledger, "FILE", self._ledger_file)
-        self._sudo = PF.rbac.is_sudo
-        PF.rbac.is_sudo = lambda user_id: True
-        self.addCleanup(setattr, PF.rbac, "is_sudo", self._sudo)
 
+        target = asyncio.run(product_match.read(850_001, dry_run=True))
         session = PF.ProductSession(
-            mode="update", files=[image], chat_id=77, thread_id=5, workspace=tmp,
-            data=ProductData(title="قاب سیلیکونی", price=698_000, sku_prefix="BO",
-                             models=["iPhone 17 Pro Max", "iPhone 17 Pro"],
-                             attributes={"رنگ": ["سفید", "مشکی"]}),
+            mode="update", target=target, files=[image], chat_id=77, thread_id=5, workspace=tmp,
+            data=ProductData(price=720_000), user_id=7,
         )
         PF.sessions[7] = session
 
@@ -960,29 +956,26 @@ class TestChatRouting(FlowStateTestCase):
             sent.append(kwargs)
             return SimpleNamespace(message_id=1)
 
-        doc_names: list[str] = []
-
-        async def send_document(**kwargs):
-            sent.append(kwargs)
-            doc_names.append(getattr(kwargs.get("document"), "name", ""))
-            return SimpleNamespace(message_id=2)
+        async def noop(*args, **kwargs):
+            return None
 
         context = SimpleNamespace(
-            bot=SimpleNamespace(send_message=send_message, send_document=send_document,
-                                edit_message_text=lambda **k: None),
+            bot=SimpleNamespace(send_message=send_message, edit_message_text=noop,
+                                send_chat_action=noop),
             chat_data={}, job_queue=SimpleNamespace(run_once=lambda *a, **k: None),
         )
         update, _seen = _query("product:confirm", chat_id=77, thread_id=5)
         result = asyncio.run(PF.confirm(update, context))
 
-        self.assertEqual(result, -1, "ZIP هم جریان را تمام می‌کند")
-        self.assertTrue(sent, "پیامی باید رفته باشد")
-        for item in sent:
-            self.assertEqual(item.get("chat_id"), 77, f"به چت خصوصی رفت: {item}")
+        self.assertEqual(result, -1, "اپدیت هم جریان را تمام می‌کند")
+        seller_side = [item for item in sent if item.get("chat_id") != -1001]
+        self.assertTrue(seller_side, "کارتِ نتیجه باید رفته باشد")
+        for item in seller_side:
+            self.assertEqual(item.get("chat_id"), 77, f"به چت دیگری رفت: {item}")
             self.assertEqual(item.get("message_thread_id"), 5, "تاپیک گم شد")
-        self.assertTrue(any("filename" in item for item in sent), "فایل ZIP باید ارسال شده باشد")
-        self.assertTrue(any(Path(n).name.startswith("product_7_") for n in doc_names),
-                        f"فایل باید در TEMP_DIR جریان ساخته شده باشد، نه: {doc_names}")
+        self.assertTrue([item for item in sent if item.get("chat_id") == -1001],
+                        "ردپای فنی به گروه لاگ می‌رود، نه به چت فروشنده")
+        self.assertEqual(products_ledger.recent(1)[0]["mode"], "update")
 
     def test_a_message_in_a_thread_adopts_that_thread(self):
         session = PF.ProductSession(mode="new")

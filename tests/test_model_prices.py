@@ -291,7 +291,9 @@ class TestTheGateBeforeWooCommerce(unittest.TestCase):
         self.assertEqual(1, len(errors))
         self.assertIn("iPhone 17 Pro", errors[0].message)
 
-    def test_model_prices_are_refused_on_the_zip_route(self) -> None:
+    def test_model_prices_are_valid_in_an_update(self) -> None:
+        # An update writes each variation's price through REST, so a model-specific price is as
+        # applicable there as in a new product (it used to be refused on the ZIP route).
         report = validate_draft(
             {
                 "title": "قاب گوشی اپل",
@@ -304,7 +306,22 @@ class TestTheGateBeforeWooCommerce(unittest.TestCase):
             image_count=1,
             require_models=False,
         )
-        self.assertIn("E_MODEL_PRICES_MODE", [issue.code for issue in report.errors])
+        self.assertNotIn("E_MODEL_PRICES_MODE", [issue.code for issue in report.issues])
+        self.assertFalse(report.blocking, report.as_html())
+
+    def test_an_update_may_leave_a_model_without_a_price(self) -> None:
+        # «no price for this model» means «keep the shop's price» in an update; only a new
+        # product cannot be made without one.
+        report = validate_draft(
+            {"price": 0, "models": ["iPhone 17", "iPhone 17 Pro"], "model_prices": {"iPhone 17": 598_000}},
+            mode="update", image_count=0)
+        self.assertNotIn("E_MODEL_PRICE_MISSING", [issue.code for issue in report.errors])
+
+    def test_a_model_price_for_a_model_the_product_does_not_have_still_blocks_in_an_update(self) -> None:
+        report = validate_draft(
+            {"models": ["iPhone 17", "iPhone 17 Pro"], "model_prices": {"iPhone 99": 598_000}},
+            mode="update", image_count=0)
+        self.assertIn("E_MODEL_PRICES_LABEL", [issue.code for issue in report.errors])
 
     def test_a_sale_price_above_a_model_price_blocks_for_that_model(self) -> None:
         # قیمت پایه 598 است و مدل iPhone 17 ارزان‌تر (498)؛ تخفیف 520 زیر پایه است

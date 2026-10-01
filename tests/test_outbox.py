@@ -305,8 +305,9 @@ class TestQueueIsCreatedFromTheFlow(QueueTestCase):
             await self._confirm()
         self.assertEqual(0, outbox.pending(), "در حالت آزمایشی چیزی برای تلاش مجدد نیست")
 
-    async def test_the_zip_mode_never_queues_anything(self) -> None:
-        # حالت ZIP یعنی «فایل را خودت آپلود کن»؛ قولِ تلاشِ خودکار ربات در آن دروغ است.
+    async def test_an_update_never_queues_anything(self) -> None:
+        # An update is a diff against the shop: asking again recomputes it, so there is nothing
+        # to replay later — and a queued copy of a stale diff is the one thing that would be wrong.
         PF.sessions[7].mode = "update"
         self._fail_with(WooCommerceAPIError(503, "سایت مشغول است"))
         await self._confirm()

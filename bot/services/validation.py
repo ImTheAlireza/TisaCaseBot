@@ -137,9 +137,18 @@ def validate_draft(
             report.add(LEVEL_ERROR, "E_NO_PRICE", "هیچ قیمتی پیدا نشد.",
                        "یک خط قیمت بنویس: «قیمت 698000 تومان»")
     else:
-        if not price and not prices and not models and not attributes:
+        # An update changes only what it is told about, so «told nothing» is the one thing it
+        # cannot do. (Whether what it was told *differs* from the shop is a question for the
+        # product it is compared with — see bot/services/update_plan.py.)
+        said = (
+            title or price or prices or model_prices or models or attributes or image_count
+            or data.get("sale_price") or data.get("stock") not in (None, "")
+            or str(data.get("stock_status") or "").strip() or data.get("stock_matrix")
+        )
+        if not said:
             report.add(LEVEL_ERROR, "E_NOTHING_TO_APPLY",
-                       "هیچ تغییری برای اعمال وجود ندارد (قیمت، مدل یا ویژگی جدید بفرست).")
+                       "هیچ تغییری برای اعمال وجود ندارد.",
+                       "عکس، قیمت، موجودی، مدل یا رنگ تازه بفرست؛ چیزی که نفرستی دست‌نخورده می‌ماند.")
 
     stock = data.get("stock")
     stock = None if stock in (None, "") else int(stock)
@@ -164,8 +173,8 @@ def validate_draft(
         if mode != "new":
             report.add(
                 LEVEL_ERROR, "E_STOCK_MATRIX_MODE",
-                "ماتریس موجودی فقط برای ساخت محصول جدید پشتیبانی می‌شود.",
-                "برای شارژ محصول موجود، از جریان «شارژ محصول موجود» استفاده کن.",
+                "ماتریس موجودی (طرح × مدل) فقط برای ساخت محصول جدید پشتیبانی می‌شود.",
+                "برای اپدیت، موجودی را به‌صورت یک عدد بنویس (مثلاً «موجودی ۲۰»).",
             )
         if stock is not None or stock_status:
             report.add(
@@ -237,14 +246,12 @@ def validate_draft(
                 + "، ".join(dict.fromkeys(unmatched))[:160],
                 "نام مدل باید دقیقاً یکی از گزینه‌های همین محصول باشد (مثلاً «iPhone 17 Pro»).",
             )
-        if mode != "new":
-            report.add(
-                LEVEL_ERROR, "E_MODEL_PRICES_MODE",
-                "قیمت‌های مدل‌محور فقط در ساخت محصول جدید اعمال می‌شوند؛ "
-                "افزونهٔ ZIP این کلیدها را نمی‌خواند و همهٔ واریژن‌ها یک قیمت می‌گیرند.",
-                "از «تأیید و ساخت پیش‌نویس مستقیم» استفاده کن.",
-            )
-        missing_models = pricing.unresolved_models(models, price, prices, model_prices)
+        # An update writes each variation's price through REST, so a model-specific price is as
+        # applicable there as in a new product. What differs is «no price at all for a model»:
+        # a new product cannot be made without one, an update simply keeps the old price.
+        missing_models = (
+            pricing.unresolved_models(models, price, prices, model_prices) if mode == "new" else []
+        )
         if missing_models:
             report.add(
                 LEVEL_ERROR, "E_MODEL_PRICE_MISSING",
