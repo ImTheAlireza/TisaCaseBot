@@ -398,8 +398,9 @@ class TestFieldFlow(unittest.TestCase):
         PF.album_tasks.clear()
 
     def _query(self, data, *, user_id=7):
-        """A callback query that records every text (and markup) it is shown."""
+        """A callback query that records transient answers and message text."""
         messages: list = []
+        self.answers: list = []
 
         async def reply_html(text, **kwargs):
             messages.append((text, kwargs))
@@ -413,7 +414,7 @@ class TestFieldFlow(unittest.TestCase):
             messages.append((text, kwargs))
 
         async def answer(*a, **k):
-            return None
+            self.answers.append((a, k))
 
         query = SimpleNamespace(
             data=data, from_user=SimpleNamespace(id=user_id), answer=answer,
@@ -422,17 +423,37 @@ class TestFieldFlow(unittest.TestCase):
         )
         return SimpleNamespace(callback_query=query), messages
 
+    def _context(self, messages):
+        async def send_message(text=None, **kwargs):
+            messages.append((text, kwargs))
+            return SimpleNamespace(message_id=99)
+
+        async def edit_message_text(text=None, **kwargs):
+            messages.append((text, kwargs))
+            return SimpleNamespace(message_id=kwargs.get("message_id", 99))
+
+        async def send_chat_action(**kwargs):
+            return None
+
+        bot = SimpleNamespace(
+            send_message=send_message,
+            edit_message_text=edit_message_text,
+            send_chat_action=send_chat_action,
+        )
+        return SimpleNamespace(bot=bot, chat_data={})
+
     def test_edit_without_a_draft_asks_for_input_first(self):
         update, messages = self._query("product:edit")
-        result = asyncio.run(PF.edit(update, SimpleNamespace()))
+        result = asyncio.run(PF.edit(update, self._context(messages)))
         self.assertEqual(result, PF.COLLECT, "no draft yet ⇒ still collecting, not reviewing")
-        self.assertIn("عکس", messages[0][0])
+        self.assertEqual(messages, [], "the reminder is a callback toast, not a new message")
+        self.assertIn("اطلاعات محصول", self.answers[0][0][0])
 
     def test_picker_lists_the_fields_with_their_current_values(self):
         session = PF.ProductSession(data=_draft(title="قاب سیلیکونی", price=698000))
         PF.sessions[7] = session
         update, messages = self._query("product:edit")
-        asyncio.run(PF.edit(update, SimpleNamespace()))
+        asyncio.run(PF.edit(update, self._context(messages)))
         self.assertIn("title", session.field_keys)
         self.assertIn("price", session.field_keys)
         markup = messages[0][1]["reply_markup"]
@@ -445,7 +466,7 @@ class TestFieldFlow(unittest.TestCase):
         session = PF.ProductSession(data=data)
         PF.sessions[7] = session
         update, messages = self._query("product:edit")
-        asyncio.run(PF.edit(update, SimpleNamespace()))
+        asyncio.run(PF.edit(update, self._context(messages)))
         buttons = [
             button.callback_data
             for row in messages[0][1]["reply_markup"].inline_keyboard
@@ -460,7 +481,7 @@ class TestFieldFlow(unittest.TestCase):
         session.field_keys = [key for key, _label, _value in de.editable_fields(session.data)]
         index = session.field_keys.index("attr:طرح")
         update, messages = self._query(f"product:field:delete:{index}")
-        result = asyncio.run(PF.delete_attribute_field(update, SimpleNamespace()))
+        result = asyncio.run(PF.delete_attribute_field(update, self._context(messages)))
         self.assertEqual(result, PF.REVIEW)
         self.assertNotIn("طرح", session.data.attributes)
         self.assertEqual(len(messages), 1, "delete returns directly to preview; it does not ask for text")
@@ -471,15 +492,15 @@ class TestFieldFlow(unittest.TestCase):
         session.field_keys = ["title"]
         PF.sessions[7] = session
         update, messages = self._query("product:field:0")
-        result = asyncio.run(PF.pick_field(update, SimpleNamespace()))
+        result = asyncio.run(PF.pick_field(update, self._context(messages)))
         self.assertEqual(result, PF.EDITING_FIELD)
         self.assertEqual(session.editing_field, "title")
         self.assertIn("قاب سیلیکونی", messages[0][0])
         cancel = [b.callback_data for row in messages[0][1]["reply_markup"].inline_keyboard for b in row]
         self.assertIn("product:field:cancel", cancel, "an edit step needs a visible way out")
 
-    def test_typed_value_is_answered_with_a_diff_not_a_re_render(self):
-        session = PF.ProductSession(data=_draft(title="قدیمی", price=100000))
+    def test_typed_value_updates_the_existing_preview_card(self):
+        session = PF.ProductSession(data=_draft(title="قدیمی", price=100000), status_message_id=77)
         session.field_keys = ["price"]
         session.editing_field = "price"
         PF.sessions[7] = session
@@ -488,43 +509,37 @@ class TestFieldFlow(unittest.TestCase):
             effective_user=SimpleNamespace(id=7),
             effective_message=SimpleNamespace(text="698000", reply_text=_recorder(self.messages)),
         )
-        result = asyncio.run(PF.field_value(update, SimpleNamespace()))
+        result = asyncio.run(PF.field_value(update, self._context(self.messages)))
         self.assertEqual(result, PF.REVIEW, "after an edit the owner is back on the review screen")
         self.assertEqual(session.data.price, 698000)
         self.assertEqual(session.editing_field, "")
-        text, kwargs = self.messages[-1]
-        self.assertIn("اعمال شد", text)
-        self.assertIn("قیمت: 100,000 تومان ← 698,000 تومان", text)
+        self.assertEqual(1, len(self.messages), "one card edit only; no bot reply")
+        text, kwargs = self.messages[0]
+        self.assertEqual(77, kwargs["message_id"])
+        self.assertIn("698,000 تومان", text)
         buttons = [b.callback_data for row in kwargs["reply_markup"].inline_keyboard for b in row]
-        self.assertIn("product:preview", buttons, "the full preview stays one tap away")
         self.assertIn("product:confirm", buttons)
-
-
 
     def test_a_bad_value_keeps_the_user_in_the_step(self):
         session = PF.ProductSession(data=_draft(price=100000))
         session.editing_field = "price"
         PF.sessions[7] = session
-        replies = []
-
-        async def reply_text(text, **kwargs):
-            replies.append(text)
-
+        messages = []
         update = SimpleNamespace(
             effective_user=SimpleNamespace(id=7),
-            effective_message=SimpleNamespace(text="5", reply_text=reply_text),
+            effective_message=SimpleNamespace(text="5", reply_text=_recorder(messages)),
         )
-        result = asyncio.run(PF.field_value(update, SimpleNamespace()))
+        result = asyncio.run(PF.field_value(update, self._context(messages)))
         self.assertEqual(result, PF.EDITING_FIELD)
         self.assertEqual(session.data.price, 100000)
-        self.assertTrue(replies[0].startswith("⚠️"))
+        self.assertTrue(messages[0][0].startswith("⚠️"))
 
     def test_cancellation_returns_to_the_preview(self):
         session = PF.ProductSession(data=_draft(title="قاب"))
         session.editing_field = "title"
         PF.sessions[7] = session
         update, _messages = self._query("product:field:cancel")
-        result = asyncio.run(PF.cancel_field(update, SimpleNamespace()))
+        result = asyncio.run(PF.cancel_field(update, self._context(_messages)))
         self.assertEqual(result, PF.REVIEW)
         self.assertEqual(session.editing_field, "")
 
@@ -545,10 +560,10 @@ class TestFieldFlow(unittest.TestCase):
         self.addCleanup(setattr, PF, "_extract", original)
 
         update, _messages = self._query("product:colorsrc:1")
-        asyncio.run(PF.toggle_color_source(update, SimpleNamespace()))
+        asyncio.run(PF.toggle_color_source(update, self._context(_messages)))
         self.assertEqual(session.suppressed_colors, ["caption"])
         update, _messages = self._query("product:colorsrc:1")
-        asyncio.run(PF.toggle_color_source(update, SimpleNamespace()))
+        asyncio.run(PF.toggle_color_source(update, self._context(_messages)))
         self.assertEqual(session.suppressed_colors, [])
         self.assertEqual(calls, [["caption"], []])
 
@@ -571,7 +586,7 @@ class TestFieldFlow(unittest.TestCase):
         self.addCleanup(setattr, PF, "_extract", original)
         PF.sessions[7] = session
         update, _messages = self._query("product:sug:0")
-        asyncio.run(PF.accept_suggestion(update, SimpleNamespace()))
+        asyncio.run(PF.accept_suggestion(update, self._context(_messages)))
         self.assertEqual(session.data.suggestions, [])
         self.assertIn("brand:Nubia", session.dismissed)
         # the offer must not come back on the next render
@@ -595,7 +610,7 @@ class TestFieldFlow(unittest.TestCase):
         self.addCleanup(setattr, PF, "_extract", original)
 
         update, _messages = self._query("product:sug:no:0")
-        asyncio.run(PF.dismiss_suggestion(update, SimpleNamespace()))
+        asyncio.run(PF.dismiss_suggestion(update, self._context(_messages)))
         self.assertIn("brand:Nubia", session.dismissed)
         self.assertTrue(session.data.suggestions, "the draft keeps the note, only the nag stops")
 

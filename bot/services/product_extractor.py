@@ -320,6 +320,10 @@ def _split_lines(text: str) -> list[str]:
 _STOCK_LABEL_RE = re.compile(r"(?i)^\s*(?:موجودی|موجوديت\s*(?:فعلی)?|stock|quantity)\s*[:=]?\s*(.*)$")
 _COUNT_SUFFIX_RE = re.compile(r"([\d\u0660-\u0669\u06f0-\u06f9][\d,\u0660-\u0669\u06f0-\u06f9]{0,6})\s*(?:عدد)\b")
 _SALE_LABEL_RE = re.compile(r"(?i)^\s*(?:قیمت\s*(?:فروش\s*)?ویژه|قیمت\s*ویژه|sale[_ ]?price)\s*[:=]?\s*(.*)$")
+_SKU_PREFIX_LINE_RE = re.compile(
+    r"(?i)^\s*(?:sku(?:\s*(?:prefix|code))?|پیشوند(?:\s*sku)?)"
+    r"\s*[:：=]\s*([A-Za-z]{1,12})(?:[-_/ ]?\d+)?\s*$"
+)
 _OUT_OF_STOCK_RE = re.compile(r"(?i)(?:تمام\s*شده|ناموجود|بدون\s*موجودی|out\s*of\s*stock)")
 #: «پیش‌فروش» and «پیش فروش» differ by a ZWNJ, which ``\s`` does not match — so the
 #: separator class has to name it, or pre-order products silently read as ordinary stock.
@@ -333,57 +337,151 @@ def _small_int(raw: object) -> int:
     return int(digits) if digits.isdigit() and len(digits) <= 7 else 0
 
 
+def _ai_amount(raw: object) -> int:
+    """Parse and range-check a price from untrusted AI JSON without failing the whole parse."""
+    text = str(raw or "").strip()
+    if not text:
+        return 0
+    value = money.parse_line_amount(text)
+    return value if value and money.in_accepted_range(value) else 0
+
+
+def _availability_status(text: str) -> str:
+    """Read a clearly stated availability label without mistaking negation for absence."""
+    clean = re.sub(r"[\u200b\u200f]+", "", (text or "")).strip()
+    negated = re.search(
+        rf"(?i)(?:ناموجود|بدون{_SEP}موجودی|تمام{_SEP}شده)\s*(?:نیست|نمی{_SEP}(?:باشد|شود)|نشده)",
+        clean,
+    ) or re.search(r"(?i)not\s+out\s+of\s+stock", clean)
+    if negated:
+        return "instock"
+    unavailable = re.search(
+        rf"(?i)(?:موجود(?:ه|{_SEP}است|{_SEP}هست)?|available|in{_SEP}stock)"
+        rf"{_SEP}(?:نیست|نمی{_SEP}(?:باشد|شود)|not)",
+        clean,
+    ) or re.search(r"(?i)not{_SEP}(?:available|in{_SEP}stock)", clean)
+    if unavailable:
+        return "outofstock"
+    if _OUT_OF_STOCK_RE.search(clean):
+        return "outofstock"
+    if _BACKORDER_RE.search(clean):
+        return "onbackorder"
+    in_stock = re.fullmatch(
+        r"(?i)\s*(?:(?:وضعیت(?:\s*موجودی)?|stock(?:[ _]status)?|availability)\s*[:：=]\s*)?"
+        r"(?:موجود(?:ه|\s+است|\s+هست|\s+می[\s\u200c]*باشد)?|"
+        r"ناموجود\s+نیست|تمام\s+نشده|available|in\s+stock|instock)"
+        r"[.!؟。]?\s*",
+        clean,
+    )
+    return "instock" if in_stock else ""
+
+
 def scan_stock_and_sale(blocks: Sequence[Block | str]) -> dict[str, Any]:
-    """Read «موجودی ۲۰» / «۲۰ عدد» / «قیمت ویژه ۴۹۸» out of the lines that *say* them.
+    """Read stock, availability and sale price, honoring corrections and source trust.
 
-    Two rules keep this boring on purpose:
-
-    * a stock number must be called stock (a label, or an «عدد» suffix) — a bare «۲۰» in
-      a caption is a model, a weight or a date, and guessing it would put a wrong
-      quantity on the shop's shelf;
-    * nothing is derived from anything else: «ناموجود» sets ``stock_status`` and leaves
-      ``stock`` alone, because «صفر عدد» and «موجودی ردیابی نمی‌شود» are different
-      statements and the second is the safe default.
+    A field's newest valid statement wins *within one source*. PRODUCT INFO remains
+    authoritative over the media caption, regardless of their relative timestamps.
+    This lets a later Telegram message correct an earlier value without letting a
+    caption silently overwrite an explicit seller instruction.
     """
-    lines = [block.text() if isinstance(block, Block) else str(block) for block in blocks]
-    out: dict[str, Any] = {"stock": None, "stock_status": "", "sale_price": 0,
-                           "stock_quote": "", "sale_quote": ""}
-    for index, line in enumerate(lines):
-        text = (line or "").strip()
-        if not text:
-            continue
-        if not out["stock_status"]:
-            if _OUT_OF_STOCK_RE.search(text):
-                out["stock_status"] = "outofstock"
-            elif _BACKORDER_RE.search(text):
-                out["stock_status"] = "onbackorder"
-        sale = _SALE_LABEL_RE.match(text)
-        if sale and not out["sale_price"]:
-            out["sale_price"] = money.parse_line_amount(sale.group(1)) or _small_int(sale.group(1))
-            out["sale_quote"] = text[:60]
-            continue
-        label = _STOCK_LABEL_RE.match(text)
-        if label and out["stock"] is None:
-            value = _small_int(label.group(1))
-            if not value:
-                # «موجودی:» on its own line, the number on the next one — sellers do this.
-                for follow in lines[index + 1:index + 3]:
-                    value = _small_int(follow)
-                    if value:
-                        break
-            if value:
-                out["stock"] = value
-                out["stock_quote"] = text[:60]
-            continue
-        count = _COUNT_SUFFIX_RE.search(text)
-        if count and out["stock"] is None and not money.states_price_explicitly(text):
-            value = _small_int(count.group(1))
-            if value:
-                out["stock"] = value
-                out["stock_quote"] = text[:60]
-    if out["stock"] == 0:
-        out["stock"] = None      # «۰ عدد» is not a reading we can trust as an intent
+    grouped: dict[str, list[str]] = {}
+    for item in blocks:
+        source = item.message if isinstance(item, Block) else ""
+        line = item.text() if isinstance(item, Block) else str(item)
+        grouped.setdefault(source, []).append(line)
+
+    out: dict[str, Any] = {
+        "stock": None,
+        "stock_status": "",
+        "sale_price": 0,
+        "stock_quote": "",
+        "stock_status_quote": "",
+        "sale_quote": "",
+        "stock_source": "",
+        "stock_status_source": "",
+        "sale_source": "",
+    }
+    chosen: set[str] = set()
+
+    for source, lines in grouped.items():
+        local: dict[str, Any] = {
+            "stock": None,
+            "stock_status": "",
+            "sale_price": 0,
+            "stock_quote": "",
+            "stock_status_quote": "",
+            "sale_quote": "",
+        }
+        for index, line in enumerate(lines):
+            text = (line or "").strip()
+            if not text:
+                continue
+            status = _availability_status(text)
+            if status:
+                local["stock_status"] = status
+                local["stock_status_quote"] = text[:60]
+
+            sale = _SALE_LABEL_RE.match(text)
+            if sale:
+                value = money.parse_line_amount(sale.group(1)) or _small_int(sale.group(1))
+                if value:
+                    local["sale_price"] = value
+                    local["sale_quote"] = text[:60]
+                continue
+
+            label = _STOCK_LABEL_RE.match(text)
+            if label:
+                value = _bare_stock_count(label.group(1)) or 0
+                quote = text
+                if not value:
+                    # «موجودی:» on its own line, the number on the next one — sellers do this.
+                    # Only a bare count is accepted; a price/model/date below is not stock.
+                    for follow in lines[index + 1:index + 3]:
+                        candidate = _bare_stock_count(follow)
+                        if candidate is not None:
+                            value = candidate
+                            quote = f"{text} {follow.strip()}"
+                            break
+                        if (follow or "").strip():
+                            break
+                if value:
+                    local["stock"] = value
+                    local["stock_quote"] = quote[:60]
+                continue
+
+            count = _COUNT_SUFFIX_RE.search(text)
+            if count and not money.states_price_explicitly(text):
+                value = _small_int(count.group(1))
+                if value:
+                    local["stock"] = value
+                    local["stock_quote"] = text[:60]
+
+        for field_name in ("stock", "stock_status", "sale_price"):
+            if field_name in chosen or not local[field_name]:
+                continue
+            chosen.add(field_name)
+            out[field_name] = local[field_name]
+            source_field = {
+                "stock": "stock_source",
+                "stock_status": "stock_status_source",
+                "sale_price": "sale_source",
+            }[field_name]
+            out[source_field] = source
+            quote_field = "sale_quote" if field_name == "sale_price" else (
+                "stock_status_quote" if field_name == "stock_status" else "stock_quote"
+            )
+            out[quote_field] = local[quote_field]
     return out
+
+
+def _bare_stock_count(line: str) -> int | None:
+    """Parse only a count token, never another field's digits (e.g. its price)."""
+    clean = money.digits((line or "").strip()).replace("٬", ",").replace("،", ",")
+    match = re.fullmatch(r"([0-9][0-9,]*)\s*(?:عدد|تا|تکه|pcs|pieces)?", clean, re.I)
+    if not match:
+        return None
+    value = _small_int(match.group(1))
+    return value or None
 
 
 def _fallback(
@@ -430,18 +528,49 @@ def _fallback(
         return any(block.has(role) for role in roles)
 
     prefix = ""
-    for block in all_blocks:
-        if re.fullmatch(r"[A-Za-z]{1,12}", block.text()) and not flagged(block, ev.ROLE_PRICE, ev.ROLE_META):
-            prefix = block.text().upper()
+    prefix_block: Block | None = None
+    # An explicit SKU label beats heuristics; within PRODUCT INFO the newest
+    # labeled code wins. A brand header such as «Apple» is never a SKU prefix.
+    for group in groups:
+        group_prefix = ""
+        group_block: Block | None = None
+        for block in group:
+            match = _SKU_PREFIX_LINE_RE.match(block.text())
+            if match:
+                group_prefix = match.group(1).upper()
+                group_block = block
+        if group_prefix:
+            prefix, prefix_block = group_prefix, group_block
             break
-    explicit_title = next(
-        (
-            re.sub(r"^\s*(?:عنوان|نام\s*محصول)\s*[:：]\s*", "", block.text()).strip()
-            for block in all_blocks
-            if re.match(r"^\s*(?:عنوان|نام\s*محصول)\s*[:：]", block.text(), re.I)
-        ),
-        "",
+    if not prefix:
+        for block in all_blocks:
+            if (
+                re.fullmatch(r"[A-Za-z]{1,12}", block.text())
+                and not flagged(block, ev.ROLE_PRICE, ev.ROLE_META, ev.ROLE_BRAND, ev.ROLE_MODEL)
+            ):
+                prefix = block.text().upper()
+                prefix_block = block
+                break
+    title_label = re.compile(
+        r"^\s*(?:عنوان|نام\s*محصول|اسم\s*محصول|title|product\s+name)\s*[:：]\s*(.*?)\s*$",
+        re.I,
     )
+    explicit_title = ""
+    explicit_title_block: Block | None = None
+    # Prefer PRODUCT INFO as a source, then use the newest labeled title inside
+    # that source. Telegram text is cumulative, so the newest explicit title is
+    # usually the seller correcting an earlier message, not a second product.
+    for group in groups:
+        group_title = ""
+        title_group_block: Block | None = None
+        for block in group:
+            match = title_label.match(block.text())
+            if match and match.group(1).strip():
+                group_title = match.group(1).strip()
+                title_group_block = block
+        if group_title:
+            explicit_title, explicit_title_block = group_title, title_group_block
+            break
     def availability_only(block: Block) -> bool:
         """خطی که چیزی جز وضعیت موجودی نمی‌گوید: «ناموجود»، «⛔ تمام شده»، «پیش‌فروش».
 
@@ -463,6 +592,7 @@ def _fallback(
         and not availability_only(block)
         and not flagged(block, ev.ROLE_META, ev.ROLE_BRAND, ev.ROLE_ATTRIBUTE)
         and not re.search(r"تومان|تومن|هزار|قیمت|price", block.text(), re.I)
+        and not re.match(r"^\s*(?:sku|شناسه|کد|مدل|مدل‌ها|رنگ|عنوان|نام\s*محصول|اسم\s*محصول)\s*[:：]?\s*$", block.text(), re.I)
         and not re.match(r"^\s*(?:sku|شناسه|کد|مدل|مدل‌ها|رنگ)\s*[:：]?", block.text(), re.I)
         and not re.fullmatch(r"\d[\d,،.]*[tTkKت]?", _digits(block.text()))
     ]
@@ -483,7 +613,9 @@ def _fallback(
         (block.text() for block in candidates if block.has(ev.ROLE_PROSE) and descriptive(block)),
         "",
     ) or next((block.text() for block in candidates if descriptive(block)), "")
-    title_block = next((block for block in candidates if block.text() == title), None)
+    title_block = explicit_title_block or next(
+        (block for block in candidates if block.text() == title), None
+    )
 
     attrs: dict[str, list[str]] = {}
     # Without the AI the only attribute that can be read reliably is the color
@@ -498,7 +630,7 @@ def _fallback(
     by_message: dict[str, list[str]] = {}
     ignored = set(ignore_color_messages or ())
     for block in all_blocks:
-        if block.text() == title or block.message in ignored:
+        if block is title_block or block.text() == title or block.message in ignored:
             continue
         for color in extract_colors(block.text(), allow_unknown=False):
             key = color_key(color)
@@ -520,7 +652,12 @@ def _fallback(
             quote=ev.describe(title_block) if title_block is not None else title,
         )
     if prefix:
-        ev.merge(evidence, "sku_prefix", ev.CAPTION, quote=prefix)
+        ev.merge(
+            evidence,
+            "sku_prefix",
+            _source_of(prefix_block) if prefix_block is not None else ev.CAPTION,
+            quote=ev.describe(prefix_block) if prefix_block is not None else prefix,
+        )
     if colors:
         ev.merge(
             evidence,
@@ -552,9 +689,14 @@ def _fallback(
             )
     stock_scan = scan_stock_and_sale(all_blocks)
     if stock_scan["stock"] is not None:
-        ev.merge(evidence, "stock", ev.CAPTION, quote=stock_scan["stock_quote"])
+        stock_source = ev.INFO if stock_scan["stock_source"] == "info" else ev.CAPTION
+        ev.merge(evidence, "stock", stock_source, quote=stock_scan["stock_quote"])
+    elif stock_scan["stock_status"]:
+        status_source = ev.INFO if stock_scan["stock_status_source"] == "info" else ev.CAPTION
+        ev.merge(evidence, "stock", status_source, quote=stock_scan["stock_status_quote"])
     if stock_scan["sale_price"]:
-        ev.merge(evidence, "sale_price", ev.CAPTION, quote=stock_scan["sale_quote"])
+        sale_source = ev.INFO if stock_scan["sale_source"] == "info" else ev.CAPTION
+        ev.merge(evidence, "sale_price", sale_source, quote=stock_scan["sale_quote"])
         if price and stock_scan["sale_price"] >= price:
             notes.append(
                 f"قیمت ویژه ({money.format_toman(stock_scan['sale_price'])}) از قیمت اصلی کمتر نیست"
@@ -664,27 +806,33 @@ def _merge_stock_and_sale(
         "sale_price": fallback.sale_price,
         "ai_used": False,
     }
-    if out["stock"] is None:
-        ai_stock = _small_int(obj.get("stock"))
+    note_list = notes if notes is not None else fallback.notes
+    evidence_map = evidence if evidence is not None else fallback.evidence
+    if out["stock"] is None and not out["stock_status"]:
+        ai_stock = _bare_stock_count(str(obj.get("stock") or "")) or _small_int(obj.get("stock"))
         if ai_stock:
             out["stock"] = ai_stock
             out["ai_used"] = True
-            ev.merge(evidence if evidence is not None else fallback.evidence, "stock", ev.AI,
-                     quote="عدد موجودی را هوش مصنوعی خوانده", overwrite=True)
-            (notes if notes is not None else fallback.notes).append(
+            ev.merge(evidence_map, "stock", ev.AI, quote="عدد موجودی را هوش مصنوعی خوانده")
+            note_list.append(
                 "موجودی را هوش مصنوعی از متن درآورده؛ اگر دقیق نیست با «✏️ ویرایش» عوضش کن"
             )
     if not out["sale_price"]:
         raw_sale = obj.get("sale_price")
-        ai_sale = money.parse_line_amount(str(raw_sale or "")) or _small_int(raw_sale)
+        ai_sale = _ai_amount(raw_sale)
         if ai_sale:
             out["sale_price"] = ai_sale
             out["ai_used"] = True
-            ev.merge(evidence if evidence is not None else fallback.evidence, "sale_price", ev.AI,
-                     quote="قیمت ویژه را هوش مصنوعی خوانده", overwrite=True)
+            ev.merge(evidence_map, "sale_price", ev.AI,
+                     quote=f"قیمت ویژهٔ خوانده‌شده: {money.format_toman(ai_sale)}")
+            note_list.append("قیمت ویژه را هوش مصنوعی خوانده؛ لطفاً با متن پیام مقایسه کن")
     wanted_status = str(obj.get("stock_status") or "").strip().lower()
     if not out["stock_status"] and wanted_status in ("instock", "outofstock", "onbackorder"):
         out["stock_status"] = wanted_status
+        out["ai_used"] = True
+        if out["stock"] is None:
+            ev.merge(evidence_map, "stock", ev.AI, quote=f"وضعیت موجودی را هوش مصنوعی خوانده: {wanted_status}")
+        note_list.append("وضعیت موجودی را هوش مصنوعی برداشت کرده؛ لطفاً بررسی کن")
     return out
 
 
@@ -793,14 +941,18 @@ async def extract_product(
                 group = "android"
             else:
                 continue
-            parsed = _number_from_line(str(value))
-            if not parsed:
-                try:
-                    parsed = int(_digits(str(value)).replace(",", ""))
-                except ValueError:
-                    parsed = 0
+            parsed = _ai_amount(value)
             if parsed:
                 prices[group] = parsed
+        ai_price_groups = set(prices) - set(fallback.prices)
+        ai_price_conflicts = {
+            group: (prices[group], fallback.prices[group])
+            for group in set(prices) & set(fallback.prices)
+            if prices[group] != fallback.prices[group]
+        }
+        # Text-backed group prices are authoritative. AI may fill a missing group,
+        # but it may neither replace a written amount nor collapse the other group.
+        prices.update(fallback.prices)
         if not prices:
             prices = fallback.prices
         ai_categories = [str(category) for category in _list_field(obj, "categories")]
@@ -808,27 +960,61 @@ async def extract_product(
             r"[^A-Za-z0-9]", "", str(fallback.sku_prefix or obj.get("sku_prefix") or "")
         ).upper()
         categories = apply_sku_category_policy(ai_categories, final_sku_prefix)
-        ai_price = int(_digits(str(obj.get("price") or 0)).replace(",", "") or 0)
+        ai_price = _ai_amount(obj.get("price"))
         # A bare amount such as `768t` is deterministic and must win over an
         # AI hallucination based on a model number (for example iPhone 17).
         final_price = fallback.price if fallback.price else ai_price
-        if fallback.price and not fallback.prices:
+        discarded_ai_group_prices = bool(fallback.price and not fallback.prices and prices)
+        if discarded_ai_group_prices:
             prices = {}
+            ai_price_groups.clear()
         # Provenance: which field came from the model, and which AI answer the
         # deterministic reading of the text overrode. Everything the AI adds is
         # still an interpretation — the preview must not dress it as a fact.
         evidence = dict(fallback.evidence)
         notes = list(fallback.notes)
+        raw_ai_price = obj.get("price")
+        if not fallback.price and ai_price:
+            ev.merge(evidence, "price", ev.AI,
+                     quote=f"قیمت خوانده‌شده: {money.format_toman(ai_price)}")
+            notes.append("قیمت را هوش مصنوعی از متن خوانده؛ لطفاً پیش از ساخت بررسی کن")
+        elif not fallback.price and raw_ai_price not in (None, "", 0, "0"):
+            notes.append("قیمت خروجی هوش مصنوعی نامعتبر یا خارج از بازه بود و اعمال نشد")
+        if final_sku_prefix and not fallback.sku_prefix:
+            ev.merge(evidence, "sku_prefix", ev.AI, quote=final_sku_prefix)
+            notes.append("پیشوند SKU را هوش مصنوعی برداشت کرده؛ لطفاً بررسی کن")
         ai_title = str(obj.get("title") or "").strip()
+        fallback_title_source = evidence.get("title")
+        info_title_is_authoritative = bool(
+            fallback.title
+            and fallback_title_source is not None
+            and fallback_title_source.source == ev.INFO
+        )
+        final_title = fallback.title if info_title_is_authoritative else (ai_title or fallback.title)
         if ai_title and ai_title != fallback.title:
-            ev.merge(evidence, "title", ev.AI, quote=ai_title, overwrite=True)
-            notes.append("عنوان را هوش مصنوعی نوشته؛ اگر لازم شد اصلاحش کن")
+            if info_title_is_authoritative:
+                notes.append("عنوان هوش مصنوعی کنار گذاشته شد؛ متن اطلاعات محصول معتبرتر است")
+            else:
+                ev.merge(evidence, "title", ev.AI, quote=ai_title, overwrite=True)
+                notes.append("عنوان را هوش مصنوعی نوشته؛ اگر لازم شد اصلاحش کن")
         if fallback.price and ai_price and ai_price != fallback.price:
             notes.append("قیمت هوش مصنوعی کنار گذاشته شد؛ عددی که خودت نوشتی معتبرتر است")
-        if fallback.price and prices and not fallback.prices:
-            notes.append("قیمت گروهی هوش مصنوعی حذف شد چون کپشن یک قیمت صریح داشت")
-        if not fallback.prices and prices:
-            ev.merge(evidence, "prices", ev.AI, quote="قیمت جدا برای هر گروه", overwrite=True)
+        if ai_price_conflicts:
+            group_labels = {"iphone": "آیفون", "android": "اندروید"}
+            for group, (guessed, explicit) in sorted(ai_price_conflicts.items()):
+                label = group_labels.get(group, group)
+                notes.append(
+                    f"قیمت گروهی هوش مصنوعی برای {label} ({money.format_toman(guessed)}) کنار گذاشته شد؛ "
+                    f"مقدار صریح متن ({money.format_toman(explicit)}) معتبرتر است"
+                )
+        if discarded_ai_group_prices:
+            notes.append("قیمت گروهی هوش مصنوعی حذف شد؛ متن محصول یک قیمت واحد و صریح داشت")
+        if ai_price_groups and prices:
+            group_labels = {"iphone": "آیفون", "android": "اندروید"}
+            guessed_groups = "، ".join(group_labels.get(group, group) for group in sorted(ai_price_groups))
+            ev.merge(evidence, "prices", ev.AI,
+                     quote=f"قیمت گروهیِ خوانده‌شده برای {guessed_groups}", overwrite=True)
+            notes.append("بخشی از قیمت گروهی را هوش مصنوعی برداشت کرده؛ لطفاً بررسی کن")
         if suppressed:
             # The AI reads the same text we do, and it is eager: it would put
             # back the colors the owner just marked as «مال محصول دیگر». After a
@@ -848,15 +1034,16 @@ async def extract_product(
             for name, values in clean_attrs.items():
                 ev.merge(evidence, name if name in ev.PREVIEW_FIELDS else "colors",
                          ev.AI, quote="، ".join(values[:4]), overwrite=True)
-        if ai_categories and not fallback.categories:
-            ev.merge(evidence, "category", ev.AI, quote="، ".join(ai_categories)[:60], overwrite=True)
+        if categories and not fallback.categories:
+            ev.merge(evidence, "category", ev.AI,
+                     quote="، ".join(categories)[:60], overwrite=True)
         if str(obj.get("description") or "").strip():
             ev.merge(evidence, "description", ev.AI, quote="نوشتهٔ هوش مصنوعی", overwrite=True)
         # Stock and the sale price: the deterministic reading of the text wins, exactly
         # like the price does — a model that sees «۲۰ عدد» is free to invent it too.
         stock_sale = _merge_stock_and_sale(fallback, obj, evidence=evidence, notes=notes)
         result = ProductData(
-            title=str(obj.get("title") or fallback.title).strip(),
+            title=final_title.strip(),
             price=final_price,
             prices=prices,
             stock=stock_sale["stock"],

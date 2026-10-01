@@ -1,11 +1,9 @@
-"""Phase 3c: what a state is *for*, and who is allowed to talk to the flow.
+"""Product intake's one-card UX, state transitions, and chat routing.
 
-The review screen used to accept any typed text as product information, which is
-how a sentence meant for a human («نه صبر کن، قیمت را عوض نکن») could end up in
-the draft. The fix is structural: COLLECT means «I am still being fed», REVIEW
-means «a proposal now needs your yes». The other half of the phase is the guard:
-one flow per user, no session invented behind the user's back, and messages that
-go back to the chat (and thread) they started in.
+Free text is appended in both COLLECT and REVIEW; previews edit the same bot
+message and progress uses only Telegram's transient chat action. The routing
+guard still ensures one flow per user and keeps all work in its starting chat
+and forum topic.
 
 Run with ``python3 -m unittest discover -s tests``; the whole module skips itself
 when python-telegram-bot is not installed.
@@ -18,6 +16,7 @@ import os
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 from types import SimpleNamespace
 
 os.environ.setdefault("BOT_TOKEN", "123456:TEST")
@@ -61,6 +60,29 @@ def _update(text="", **extra):
         effective_user=SimpleNamespace(id=7, username="t", first_name="t"),
         effective_message=message,
     ), sent
+
+
+def _context():
+    """Small Telegram bot stub that records card edits, sends and chat actions."""
+    calls = {"edits": [], "messages": [], "actions": []}
+
+    async def edit_message_text(text=None, **kwargs):
+        calls["edits"].append({"text": text, **kwargs})
+        return SimpleNamespace(message_id=kwargs.get("message_id", 99))
+
+    async def send_message(text=None, **kwargs):
+        calls["messages"].append({"text": text, **kwargs})
+        return SimpleNamespace(message_id=100 + len(calls["messages"]))
+
+    async def send_chat_action(**kwargs):
+        calls["actions"].append(kwargs)
+
+    bot = SimpleNamespace(
+        edit_message_text=edit_message_text,
+        send_message=send_message,
+        send_chat_action=send_chat_action,
+    )
+    return SimpleNamespace(bot=bot, chat_data={}), calls
 
 
 def _query(data, *, text=None, chat_id=7, thread_id=None):
@@ -124,102 +146,132 @@ class FlowStateTestCase(unittest.TestCase):
 @needs_flow
 class TestCollectVersusReview(FlowStateTestCase):
     def test_text_while_collecting_is_the_product_information(self):
-        session = PF.ProductSession(mode="new")
+        session = PF.ProductSession(mode="new", status_message_id=77)
         session.files = [Path("/tmp/1.jpg")]
         PF.sessions[7] = session
         self.fake_extract()
-        update, _sent = _update("قیمت 698000")
-        result = asyncio.run(PF.on_text(update, SimpleNamespace()))
+        update, user_replies = _update("قیمت 698000")
+        context, calls = _context()
+        result = asyncio.run(PF.on_text(update, context))
         self.assertEqual(result, PF.REVIEW, "a preview was rendered ⇒ we are reviewing now")
         self.assertEqual(session.info_text, "قیمت 698000")
+        self.assertEqual([], user_replies, "text intake must not create a bot reply")
+        self.assertEqual([], calls["messages"], "the anchored card must be edited, not replaced")
+        self.assertEqual(77, calls["edits"][0]["message_id"])
 
-    def test_text_before_the_preview_is_ready_stays_in_collect(self):
-        session = PF.ProductSession(mode="new")
+    def test_text_before_photos_still_updates_the_same_preview_card(self):
+        session = PF.ProductSession(mode="new", status_message_id=77)
         PF.sessions[7] = session
-        update, sent = _update("قیمت 698000")
-        result = asyncio.run(PF.on_text(update, SimpleNamespace()))
-        self.assertEqual(result, PF.COLLECT)
-        self.assertIn("عکس‌های دریافت‌شده پردازش شوند و به مرحلهٔ بعد بروی", sent[0][1])
-        rows = sent[0][2]["reply_markup"].inline_keyboard
-        buttons = [b.callback_data for row in rows for b in row]
-        labels = [b.text for row in rows for b in row]
-        self.assertIn("product:mediaend", buttons)
-        self.assertIn("✅ عکس‌ها تمام شد؛ ادامه", labels)
-
-    def test_typed_text_on_the_review_screen_is_only_a_proposal(self):
-        session = PF.ProductSession(mode="new", info_text="قیمت 698000")
-        session.data = ProductData(title="قاب", price=698000)
-        PF.sessions[7] = session
-        calls = self.fake_extract()
-        update, sent = _update("نه صبر کن، قیمت را عوض نکن")
-        result = asyncio.run(PF.on_review_text(update, SimpleNamespace()))
-        self.assertEqual(result, PF.REVIEW)
-        self.assertEqual(session.info_text, "قیمت 698000", "nothing may be applied before yes")
-        self.assertEqual(session.pending_text, "نه صبر کن، قیمت را عوض نکن")
-        self.assertEqual(calls, [], "no extraction for an unconfirmed text")
-        buttons = [b.callback_data for row in sent[0][2]["reply_markup"].inline_keyboard for b in row]
-        self.assertEqual(buttons, ["product:prop:yes", "product:prop:no"])
-
-    def test_confirming_a_proposal_applies_it_once(self):
-        session = PF.ProductSession(mode="new", info_text="قیمت 698000")
-        session.data = ProductData(title="قاب", price=698000)
-        session.pending_text = "رنگ: مشکی | سفید"
-        PF.sessions[7] = session
-        calls = self.fake_extract()
-        update, _sent = _query("product:prop:yes")
-        result = asyncio.run(PF.accept_proposal(update, SimpleNamespace()))
-        self.assertEqual(result, PF.REVIEW)
-        self.assertIn("رنگ: مشکی | سفید", session.info_text)
-        self.assertEqual(session.pending_text, "")
-        self.assertEqual(len(calls), 1)
-
-        # and it is not applied a second time on a repeated tap
-        update, _sent = _query("product:prop:yes")
-        asyncio.run(PF.accept_proposal(update, SimpleNamespace()))
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(session.info_text.count("رنگ: مشکی"), 1)
-
-    def test_rejecting_a_proposal_changes_nothing(self):
-        session = PF.ProductSession(mode="new", info_text="قیمت 698000")
-        session.data = ProductData()
-        session.pending_text = "بزن بریم"
-        PF.sessions[7] = session
-        update, _sent = _query("product:prop:no")
-        result = asyncio.run(PF.reject_proposal(update, SimpleNamespace()))
+        self.fake_extract()
+        update, user_replies = _update("قیمت 698000")
+        context, calls = _context()
+        result = asyncio.run(PF.on_text(update, context))
         self.assertEqual(result, PF.REVIEW)
         self.assertEqual(session.info_text, "قیمت 698000")
-        self.assertEqual(session.pending_text, "")
+        self.assertIsNotNone(session.data)
+        self.assertIn("عکسی برای این محصول", calls["edits"][0]["text"])
+        self.assertEqual([], user_replies)
+        self.assertEqual([], calls["messages"])
+
+    def test_text_on_the_review_screen_is_appended_without_confirmation(self):
+        session = PF.ProductSession(
+            mode="new", info_text="قیمت 698000", status_message_id=77
+        )
+        session.data = ProductData(title="قاب", price=698000)
+        PF.sessions[7] = session
+        calls_to_extract = self.fake_extract()
+        update, user_replies = _update("رنگ: مشکی | سفید")
+        context, calls = _context()
+        result = asyncio.run(PF.on_review_text(update, context))
+        self.assertEqual(result, PF.REVIEW)
+        self.assertEqual(session.info_text, "قیمت 698000\nرنگ: مشکی | سفید")
+        self.assertFalse(hasattr(session, "pending_text"))
+        self.assertEqual(calls_to_extract, [session.info_text])
+        self.assertEqual([], user_replies)
+        self.assertEqual([], calls["messages"])
+        self.assertEqual([77], [edit["message_id"] for edit in calls["edits"]])
+        self.assertIn("پیش‌نمایش", calls["edits"][0]["text"])
+
+    def test_every_followup_text_edits_one_anchored_message(self):
+        session = PF.ProductSession(mode="new", status_message_id=77)
+        session.data = ProductData(title="قاب", price=698000)
+        PF.sessions[7] = session
+        parsed = self.fake_extract()
+        context, calls = _context()
+        first, first_replies = _update("قیمت 698000")
+        second, second_replies = _update("رنگ: سفید")
+        self.assertEqual(PF.REVIEW, asyncio.run(PF.on_text(first, context)))
+        self.assertEqual(PF.REVIEW, asyncio.run(PF.on_review_text(second, context)))
+        self.assertEqual("قیمت 698000\nرنگ: سفید", session.info_text)
+        self.assertEqual(2, len(parsed))
+        self.assertEqual([], first_replies + second_replies)
+        self.assertEqual([], calls["messages"])
+        self.assertEqual([77, 77], [edit["message_id"] for edit in calls["edits"]])
+        self.assertEqual(2, len(calls["actions"]), "typing status is transient, not a message")
+
+    def test_stale_proposal_button_is_a_noop(self):
+        session = PF.ProductSession(mode="new", info_text="قیمت 698000")
+        session.data = ProductData()
+        PF.sessions[7] = session
+        update, sent = _query("product:prop:yes")
+        result = asyncio.run(PF.accept_proposal(update, SimpleNamespace()))
+        self.assertEqual(PF.REVIEW, result)
+        self.assertEqual("قیمت 698000", session.info_text)
+        self.assertEqual("answer", sent[0][0])
 
     def test_review_text_without_a_draft_falls_back_to_information(self):
-        session = PF.ProductSession(mode="new")
+        session = PF.ProductSession(mode="new", status_message_id=77)
         session.files = [Path("/tmp/1.jpg")]
         PF.sessions[7] = session
         self.fake_extract()
-        update, _sent = _update("قیمت 500000")
-        result = asyncio.run(PF.on_review_text(update, SimpleNamespace()))
+        update, _user_replies = _update("قیمت 500000")
+        context, calls = _context()
+        result = asyncio.run(PF.on_review_text(update, context))
         self.assertEqual(result, PF.REVIEW)
-        self.assertEqual(session.info_text, "قیمت 500000", "nothing to protect yet ⇒ it is plain info")
+        self.assertEqual(session.info_text, "قیمت 500000")
+        self.assertEqual(77, calls["edits"][0]["message_id"])
 
-    def test_add_more_returns_to_collecting(self):
+    def test_ai_added_model_is_marked_as_a_guess_for_review(self):
+        from _flow_harness import patched_settings, settings_with
+        from bot.services.product_extractor import ProductData
+
+        session = PF.ProductSession(mode="new", model_text="iPhone 15")
+        PF.sessions[7] = session
+
+        async def fake_normalize(_raw, _deterministic, job_log=None, *, client=None):
+            return "iPhone 16"
+
+        async def fake_details(_text, models, _taxonomy, **_kwargs):
+            return ProductData(title="قاب", models=list(models))
+
+        with (
+            patched_settings(settings_with(
+                ai_base_url="https://ai.example/v1", ai_token="test", ai_model="test-model"
+            )),
+            patch.object(PF, "ai_normalize", new=fake_normalize),
+            patch.object(PF, "extract_product", new=fake_details),
+        ):
+            asyncio.run(PF._extract(session, learn=False))
+
+        self.assertEqual(["iPhone 16"], session.data.models)
+        self.assertEqual("ai", session.data.evidence["models"].source)
+        self.assertIn("مدل‌ها", " ".join(PF._open_questions(session)))
+
+    def test_add_more_uses_a_toast_and_leaves_the_preview_in_place(self):
         session = PF.ProductSession(mode="new")
         session.data = ProductData(title="قاب")
         PF.sessions[7] = session
         update, sent = _query("product:addmore")
         result = asyncio.run(PF.add_more(update, SimpleNamespace()))
-        self.assertEqual(result, PF.COLLECT)
-        # the toast comes first, then the message with the collect keyboard
-        self.assertIn("عکس‌ها تمام شد؛ ادامه", sent[-1][1])
-        markup = sent[-1][2]["reply_markup"]
-        buttons = [b.callback_data for row in markup.inline_keyboard for b in row]
-        labels = [b.text for row in markup.inline_keyboard for b in row]
-        self.assertIn("product:mediaend", buttons)
-        self.assertIn("✅ عکس‌ها تمام شد؛ ادامه", labels)
+        self.assertEqual(result, PF.REVIEW)
+        self.assertEqual(["answer"], [item[0] for item in sent])
+        self.assertIn("پیش‌نمایش خودکار", sent[0][1][0])
 
 
 @needs_flow
 class TestFinishMedia(FlowStateTestCase):
     def test_pending_album_is_flushed_immediately(self):
-        session = PF.ProductSession(mode="new")
+        session = PF.ProductSession(mode="new", status_message_id=88)
         session.info_text = "قیمت 698000"
         PF.sessions[7] = session
         PF.album_buffers[(7, "grp")] = [SimpleNamespace(message_id=1)]
@@ -237,7 +289,8 @@ class TestFinishMedia(FlowStateTestCase):
         self.fake_extract()
 
         update, _sent = _query("product:mediaend")
-        result = asyncio.run(PF.finish_media(update, SimpleNamespace()))
+        context, _calls = _context()
+        result = asyncio.run(PF.finish_media(update, context))
         self.assertEqual(prepared, [(7, 1)])
         self.assertEqual(PF.album_buffers, {}, "the buffer must be empty afterwards")
         self.assertEqual(result, PF.REVIEW)
@@ -258,7 +311,7 @@ class TestFinishMedia(FlowStateTestCase):
         update, sent = _query("product:mediaend")
         result = asyncio.run(PF.finish_media(update, SimpleNamespace()))
         self.assertEqual(result, PF.COLLECT)
-        self.assertTrue(any("هنوز" in str(item) for item in sent), sent)
+        self.assertIn("آماده", sent[0][1][0])
 
 
 @needs_flow
@@ -304,6 +357,12 @@ NOTE11/11S/12S"""
         class Bot:
             async def send_message(self, *args, **kwargs):
                 return SimpleNamespace(message_id=1)
+
+            async def edit_message_text(self, *args, **kwargs):
+                return SimpleNamespace(message_id=kwargs.get("message_id", 1))
+
+            async def send_chat_action(self, **kwargs):
+                return None
 
         def photo(message_id, caption):
             return SimpleNamespace(
@@ -524,20 +583,21 @@ class TestChatRouting(FlowStateTestCase):
         session = PF.sessions[7]
         self.assertEqual((session.chat_id, session.thread_id), (77, 42))
 
-    def test_status_message_goes_to_the_thread_not_to_the_user_id(self):
+    def test_progress_uses_a_transient_action_not_a_status_message(self):
         session = PF.ProductSession(chat_id=77, thread_id=42)
-        sent = []
+        context, calls = _context()
 
-        async def send_message(**kwargs):
-            sent.append(kwargs)
-            return SimpleNamespace(message_id=99)
+        async def run():
+            await PF._status(context, 7, session, "📥 در حال دریافت…")
+            async with PF._typing_indicator(context, 7, session):
+                await asyncio.sleep(0)
 
-        context = SimpleNamespace(bot=SimpleNamespace(
-            send_message=send_message, edit_message_text=lambda **k: None))
-        asyncio.run(PF._status(context, 7, session, "📥 در حال دریافت…"))
-        self.assertEqual(sent[0]["chat_id"], 77)
-        self.assertEqual(sent[0]["message_thread_id"], 42)
-        self.assertEqual(session.status_message_id, 99)
+        asyncio.run(run())
+        self.assertEqual(1, len(calls["actions"]))
+        self.assertEqual(calls["actions"][0]["chat_id"], 77)
+        self.assertEqual(calls["actions"][0]["message_thread_id"], 42)
+        self.assertEqual([], calls["messages"] + calls["edits"])
+        self.assertIsNone(session.status_message_id, "progress must not create a new message")
 
     def test_zip_result_document_and_card_follow_the_flow(self):
         """مسیر ZIP: فایل و کارت هم باید به همان چت/تاپیک بروند.
@@ -611,7 +671,8 @@ class TestChatRouting(FlowStateTestCase):
         PF.sessions[7] = session
         self.fake_extract()
         update, _sent = _update("قیمت 698000", chat_id=555, thread_id=7)
-        asyncio.run(PF.on_text(update, SimpleNamespace()))
+        context, _calls = _context()
+        asyncio.run(PF.on_text(update, context))
         self.assertEqual((session.chat_id, session.thread_id), (555, 7))
 
 

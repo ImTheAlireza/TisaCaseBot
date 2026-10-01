@@ -62,6 +62,10 @@ class TestScanStock(unittest.TestCase):
     def test_stock_with_a_label_and_a_colon_and_latin_digits(self) -> None:
         self.assertEqual(7, _scan("موجودی: 7")["stock"])
 
+    def test_labelled_stock_accepts_a_count_suffix(self) -> None:
+        self.assertEqual(20, _scan("موجودی ۲۰ عدد")["stock"])
+        self.assertEqual(20, _scan("موجودی ۲۰ تا")["stock"])
+
     def test_count_suffix_is_stock_even_without_a_label(self) -> None:
         self.assertEqual(15, _scan("۱۵ عدد")["stock"])
 
@@ -85,12 +89,24 @@ class TestScanStock(unittest.TestCase):
 
     def test_stock_with_the_number_on_the_next_line(self) -> None:
         self.assertEqual(12, _scan("موجودی:", "۱۲")["stock"])
+        self.assertEqual(12, _scan("موجودی:", "۱۲ عدد")["stock"])
+
+    def test_latest_stock_count_corrects_an_earlier_message(self) -> None:
+        self.assertEqual(5, _scan("موجودی ۲۰", "موجودی ۵")["stock"])
+
+    def test_latest_availability_status_corrects_an_earlier_message(self) -> None:
+        self.assertEqual("instock", _scan("ناموجود", "موجود")["stock_status"])
+        self.assertEqual("instock", _scan("ناموجود نیست")["stock_status"])
+        self.assertEqual("outofstock", _scan("موجود نیست")["stock_status"])
 
     def test_sale_price_from_its_own_label(self) -> None:
         self.assertEqual(498000, _scan("قیمت ویژه 498000")["sale_price"])
 
     def test_sale_price_in_toman_shorthand(self) -> None:
         self.assertEqual(498000, _scan("قیمت فروش ویژه: 498t")["sale_price"])
+
+    def test_latest_sale_price_corrects_an_earlier_message(self) -> None:
+        self.assertEqual(390000, _scan("قیمت ویژه 420000", "قیمت ویژه 390000")["sale_price"])
 
     def test_a_price_line_never_becomes_a_sale_price(self) -> None:
         self.assertEqual(0, _scan("قیمت 698000")["sale_price"])
@@ -579,6 +595,17 @@ class TestTheAiPathDoesNotOverrideATypedNumber(unittest.TestCase):
         self.assertEqual(3, merged["stock"])
         self.assertEqual("outofstock", merged["stock_status"])
         self.assertTrue(merged["ai_used"], "باید گفته شود این عدد را آدمک خوانده، نه متن")
+        self.assertEqual("ai", fallback.evidence["stock"].source)
+        self.assertTrue(any("هوش مصنوعی" in note for note in fallback.notes))
+
+    def test_explicit_out_of_stock_status_blocks_an_ai_stock_guess(self) -> None:
+        from bot.services.product_extractor import _merge_stock_and_sale
+
+        fallback = ProductData(title="t", stock_status="outofstock")
+        merged = _merge_stock_and_sale(fallback, {"stock": 3, "sale_price": 0})
+        self.assertIsNone(merged["stock"])
+        self.assertEqual("outofstock", merged["stock_status"])
+        self.assertFalse(merged["ai_used"])
 
 
 @needs_flow
@@ -624,6 +651,24 @@ class TestSaleAndStatusLinesAreNotData(unittest.TestCase):
             with self.subTest(line=line):
                 data = _fallback(f"قاب مات آیفون 14\n{line}\nقیمت 320000", ["iPhone 14"])
                 self.assertEqual("قاب مات آیفون 14", data.title)
+
+    def test_latest_labeled_title_is_a_correction_not_a_second_product(self) -> None:
+        data = _fallback("عنوان: قاب قدیمی\nعنوان: قاب اصلاح‌شده", [])
+        self.assertEqual("قاب اصلاح‌شده", data.title)
+
+    def test_product_info_stock_and_sale_override_caption(self) -> None:
+        from bot.services.postmodel import parse_sources
+        from bot.services import postmodel as evidence
+
+        blocks = parse_sources([
+            ("info", "قاب مات\nموجودی ۱۲\nقیمت ویژه 420000"),
+            ("caption", "موجودی ۹۹\nقیمت ویژه 390000"),
+        ])
+        data = _fallback("", [], blocks=blocks)
+        self.assertEqual(12, data.stock)
+        self.assertEqual(420000, data.sale_price)
+        self.assertEqual(evidence.INFO, data.evidence["stock"].source)
+        self.assertEqual(evidence.INFO, data.evidence["sale_price"].source)
 
 
 if __name__ == "__main__":
