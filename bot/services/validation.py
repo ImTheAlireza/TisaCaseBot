@@ -18,6 +18,10 @@ from dataclasses import dataclass, field
 from typing import Any
 from collections.abc import Iterable
 
+from bot.services import pricing
+from bot.services.color_matrix import model_signature
+from bot.services.plan import plan_from_dict
+
 LEVEL_ERROR = "error"
 LEVEL_WARN = "warn"
 
@@ -91,6 +95,18 @@ def validate_draft(
     title = str(data.get("title") or "").strip()
     price = int(data.get("price") or 0)
     prices = {str(k): int(v) for k, v in (data.get("prices") or {}).items() if v}
+    model_prices = {
+        str(k).strip(): int(v)
+        for k, v in (data.get("model_prices") or {}).items()
+        if str(k).strip() and int(v or 0) > 0
+    }
+    wholesale_price = int(data.get("wholesale_price") or 0)
+    wholesale_model_prices = {
+        str(k).strip(): int(v)
+        for k, v in (data.get("wholesale_model_prices") or {}).items()
+        if str(k).strip() and int(v or 0) > 0
+    }
+    pricing_errors = [str(x) for x in (data.get("pricing_errors") or []) if str(x).strip()]
     models = [str(x).strip() for x in (data.get("models") or []) if str(x).strip()]
     attributes = data.get("attributes") or {}
     sku_prefix = str(data.get("sku_prefix") or "").strip()
@@ -117,7 +133,7 @@ def validate_draft(
                            "اگر ویژگی متغیر دیگری ندارد، محصول به‌صورت ساده در ووکامرس ساخته خواهد شد.")
         if image_count == 0:
             report.add(LEVEL_ERROR, "E_NO_IMAGES", "هیچ عکسی برای این محصول دریافت نشد.")
-        if not price and not prices:
+        if not price and not prices and not model_prices:
             report.add(LEVEL_ERROR, "E_NO_PRICE", "هیچ قیمتی پیدا نشد.",
                        "یک خط قیمت بنویس: «قیمت 698000 تومان»")
     else:
@@ -129,6 +145,119 @@ def validate_draft(
     stock = None if stock in (None, "") else int(stock)
     stock_status = str(data.get("stock_status") or "").strip()
     sale = int(data.get("sale_price") or 0)
+    raw_stock_matrix = data.get("stock_matrix") or {}
+    matrix_errors = [str(item) for item in (data.get("stock_matrix_errors") or []) if str(item).strip()]
+    matrix_active = bool(raw_stock_matrix or matrix_errors)
+    matrix_shape_ok = isinstance(raw_stock_matrix, dict)
+    matrix_plan = plan_from_dict(data) if matrix_active and matrix_shape_ok else None
+
+    if matrix_active and not matrix_shape_ok:
+        report.add(LEVEL_ERROR, "E_STOCK_MATRIX_VALUE", "ساختار ماتریس موجودی نامعتبر است.")
+    if matrix_errors:
+        for message in matrix_errors[:4]:
+            report.add(
+                LEVEL_ERROR, "E_STOCK_MATRIX_PARSE",
+                f"ماتریس موجودی قابل‌اعمال نیست: {message}",
+                "جدول را با قالب «طرح | دسته۱ | دسته۲» و یک عدد یا «-» در هر خانه اصلاح کن.",
+            )
+    if matrix_active:
+        if mode != "new":
+            report.add(
+                LEVEL_ERROR, "E_STOCK_MATRIX_MODE",
+                "ماتریس موجودی فقط برای ساخت محصول جدید پشتیبانی می‌شود.",
+                "برای شارژ محصول موجود، از جریان «شارژ محصول موجود» استفاده کن.",
+            )
+        if stock is not None or stock_status:
+            report.add(
+                LEVEL_ERROR, "E_STOCK_MATRIX_CONFLICT",
+                "موجودی ماتریسی با موجودی/وضعیت کلی هم‌زمان قابل‌اعمال نیست.",
+                "برای تعیین تعداد هر ترکیب، عدد کلی «موجودی» و وضعیت کلی را حذف کن.",
+            )
+        if matrix_plan is not None:
+            for message in matrix_plan.matrix_axis_errors:
+                report.add(
+                    LEVEL_ERROR, "E_STOCK_MATRIX_AXES",
+                    f"ماتریس موجودی با ویژگی‌ها جور نیست: {message}.",
+                    "ماتریس فقط ترکیب «مدل × طرح» را پشتیبانی می‌کند؛ نام‌ها باید دقیقاً یکی باشند.",
+                )
+            if matrix_plan.matrix_missing:
+                sample = "، ".join(
+                    f"{design} × {model}" for design, model in matrix_plan.matrix_missing[:3]
+                )
+                report.add(
+                    LEVEL_ERROR, "E_STOCK_MATRIX_INCOMPLETE",
+                    f"برای {len(matrix_plan.matrix_missing)} ترکیب موجودی مشخص نشده است؛ از جمله {sample}.",
+                    "هر خانه را با عدد (حتی ۰) یا «-» برای ترکیب ناموجود پر کن.",
+                )
+            if matrix_plan.count == 0:
+                report.add(
+                    LEVEL_ERROR, "E_STOCK_MATRIX_EMPTY",
+                    "ماتریس هیچ ترکیب قابل‌ساختی ندارد.",
+                    "حداقل یک خانهٔ عددی، از جمله ۰، لازم است.",
+                )
+        if isinstance(raw_stock_matrix, dict):
+            for design, row in raw_stock_matrix.items():
+                if not isinstance(row, dict):
+                    report.add(LEVEL_ERROR, "E_STOCK_MATRIX_VALUE", f"ردیف «{design}» ماتریس معتبر نیست.")
+                    continue
+                for model, quantity in row.items():
+                    if quantity is not None and (not isinstance(quantity, int) or isinstance(quantity, bool) or quantity < 0):
+                        report.add(
+                            LEVEL_ERROR, "E_STOCK_MATRIX_VALUE",
+                            f"موجودی «{design} × {model}» باید عدد صحیح نامنفی یا خانهٔ خالیِ مجاز باشد.",
+                        )
+                    elif isinstance(quantity, int) and quantity > 100_000:
+                        report.add(
+                            LEVEL_WARN, "W_STOCK_MATRIX_HUGE",
+                            f"موجودی «{design} × {model}» برابر {quantity:,} غیرعادی است.",
+                            "خانهٔ ماتریس را با جدول اصلی دوباره تطبیق بده.",
+                        )
+
+    # --- model-tier / wholesale pricing --------------------------------------
+    # «قیمت سری ۱۷ ۵۹۸، بقیه ۴۹۸» is a language job (series → model labels), so the
+    # mapping comes from the extractor. If that mapping is missing or partial, one
+    # amount would silently land on every variation — refuse before any request.
+    for message in pricing_errors[:3]:
+        report.add(
+            LEVEL_ERROR, "E_MODEL_PRICES_UNRESOLVED",
+            f"قیمت مدل‌محور قابل‌اعمال نیست: {message}",
+            "قیمت هر مدل را با نام کامل خودش بنویس (مثلاً «iPhone 17 Pro 598»)، "
+            "یا «بقیه/سایر سری‌ها» را به‌عنوان قیمت پایه اعلام کن.",
+        )
+    if model_prices or wholesale_model_prices:
+        signatures = pricing.match_model_labels(models)
+        unmatched: list[str] = []
+        for label in list(model_prices) + list(wholesale_model_prices):
+            if len(signatures.get(model_signature(label), [])) != 1:
+                unmatched.append(label)
+        if unmatched:
+            report.add(
+                LEVEL_ERROR, "E_MODEL_PRICES_LABEL",
+                "این قیمت‌ها به هیچ مدل یکتایی از محصول وصل نمی‌شوند: "
+                + "، ".join(dict.fromkeys(unmatched))[:160],
+                "نام مدل باید دقیقاً یکی از گزینه‌های همین محصول باشد (مثلاً «iPhone 17 Pro»).",
+            )
+        if mode != "new":
+            report.add(
+                LEVEL_ERROR, "E_MODEL_PRICES_MODE",
+                "قیمت‌های مدل‌محور فقط در ساخت محصول جدید اعمال می‌شوند؛ "
+                "افزونهٔ ZIP این کلیدها را نمی‌خواند و همهٔ واریژن‌ها یک قیمت می‌گیرند.",
+                "از «تأیید و ساخت پیش‌نویس مستقیم» استفاده کن.",
+            )
+        missing_models = pricing.unresolved_models(models, price, prices, model_prices)
+        if missing_models:
+            report.add(
+                LEVEL_ERROR, "E_MODEL_PRICE_MISSING",
+                "برای این مدل‌ها هیچ قیمتی مشخص نشد: " + "، ".join(missing_models[:6]),
+                "قیمت پایه («بقیه») را بنویس یا برای هر مدل نام‌برده قیمت همان مدل را بده.",
+            )
+    if wholesale_price and price and wholesale_price >= price:
+        report.add(
+            LEVEL_WARN, "W_WHOLESALE_ABOVE_RETAIL",
+            f"قیمت همکاری ({wholesale_price:,}) از قیمت اصلی ({price:,}) کمتر نیست.",
+            "اگر جابه‌جا نوشته شده، خط «قیمت همکاری» را اصلاح کن. "
+            "قیمت همکاری فقط ثبت و نمایش داده می‌شود و در سایت اعمال نمی‌شود.",
+        )
 
     checked: list[tuple[str, int]] = [("قیمت", price)]
     checked += [(f"قیمت {group}", value) for group, value in prices.items()]
@@ -145,7 +274,10 @@ def validate_draft(
     # «قیمت ویژه» that is not cheaper is not a discount: WooCommerce stores both
     # numbers and shows the bigger one, so the admin would publish a sale nobody sees.
     if sale:
-        for label, base in [("قیمت اصلی", price), *[(f"قیمت {group}", value) for group, value in prices.items()]]:
+        bases = [("قیمت اصلی", price)]
+        bases += [(f"قیمت {group}", value) for group, value in prices.items()]
+        bases += [(f"قیمت مدل {label}", value) for label, value in model_prices.items()]
+        for label, base in bases:
             if base and sale >= base:
                 report.add(
                     LEVEL_ERROR, "E_SALE_NOT_CHEAPER",

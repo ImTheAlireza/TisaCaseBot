@@ -134,6 +134,15 @@ class TestResultCard(LedgerTestCase):
             self.assertIn(needle, text, needle)
         self.assertIn("پیش‌نویس ساخته شد", text)
 
+    def test_stock_matrix_summary_survives_in_the_result_card(self):
+        entry = self._entry(
+            stock=None,
+            stock_matrix={"پروانه": {"iPhone 13": 7, "iPhone 14": 0}, "پاپیون": {"iPhone 14": 3}},
+        )
+        text = result_card(entry)
+        self.assertIn("2 طرح × 2 دسته", text)
+        self.assertIn("جمع 10 عدد", text)
+
     def test_failed_card_shows_the_error_not_a_green_tick(self):
         entry = self._entry(status="failed", error="HTTP 401: unauthorized")
         text = result_card(entry)

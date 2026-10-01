@@ -35,16 +35,22 @@ _CONTENT_KEYS = (
     "title",
     "price",
     "prices",
+    "model_prices",
+    "wholesale_price",
+    "wholesale_model_prices",
     "sku_prefix",
     "models",
     "attributes",
     "categories",
     "model_colors",
+    "stock_matrix",
     "variations",
     "summary",
     "description",
     "brand",
     "stock",
+    "stock_status",
+    "sale_price",
 )
 
 

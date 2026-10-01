@@ -149,6 +149,7 @@ async def _attempt(app: Application, entry: outbox.QueuedPublish) -> None:
         title=str(entry_payload.get("title") or ""),
         price=int(entry_payload.get("price") or 0),
         price_groups=dict(entry_payload.get("prices") or {}),
+        model_prices=dict(entry_payload.get("model_prices") or {}),
         sale_price=int(entry_payload.get("sale_price") or 0),
         stock=entry_payload.get("stock"),
         stock_status=str(entry_payload.get("stock_status") or ""),

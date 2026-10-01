@@ -59,9 +59,31 @@ def result_card(entry: dict[str, object]) -> str:
     )
     if int(entry.get("sale_price") or 0):
         lines.append(f"🏷 قیمت ویژه: {int(entry['sale_price']):,} تومان")
+    model_prices = entry.get("model_prices")
+    if isinstance(model_prices, dict) and model_prices:
+        lines.append(
+            "🧩 قیمت مدل‌های خاص: " + " | ".join(
+                f"{html.escape(str(model), quote=False)}: {int(value):,}"
+                for model, value in model_prices.items()
+            )
+        )
     if entry.get("stock") is not None:
         lines.append(f"📦 موجودی: {int(entry['stock']):,} عدد"
                      + (f" ({entry['stock_status']})" if entry.get("stock_status") else ""))
+    matrix = entry.get("stock_matrix")
+    if isinstance(matrix, dict) and matrix:
+        quantities = [
+            quantity
+            for row in matrix.values() if isinstance(row, dict)
+            for quantity in row.values()
+            if isinstance(quantity, int) and not isinstance(quantity, bool)
+        ]
+        designs = len(matrix)
+        models = len({str(model) for row in matrix.values() if isinstance(row, dict) for model in row})
+        lines.append(
+            f"📦 موجودی ماتریسی: {designs} طرح × {models} دسته · "
+            f"جمع {sum(quantities):,} عدد"
+        )
     if entry.get("sku_prefix"):
         lines.append(f"🏷 پیشوند SKU: <code>{html.escape(str(entry['sku_prefix']), quote=False)}</code>")
     warnings = [str(x) for x in (entry.get("warnings") or [])]

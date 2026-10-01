@@ -107,6 +107,15 @@ class TestBatchId(unittest.TestCase):
             self.assertNotEqual(base, other, f"«{key}» نباید شناسه را بی‌تغییر بگذارد")
         other_chat = publish_batch.batch_id(_data().to_dict(), [], chat_id=10)
         self.assertNotEqual(base, other_chat, "چت دیگر یعنی قصدِ دیگر")
+        matrix_a = _data().to_dict()
+        matrix_a["stock_matrix"] = {"A": {"iPhone 13": 7}}
+        matrix_b = _data().to_dict()
+        matrix_b["stock_matrix"] = {"A": {"iPhone 13": 8}}
+        self.assertNotEqual(
+            publish_batch.batch_id(matrix_a, [], chat_id=9),
+            publish_batch.batch_id(matrix_b, [], chat_id=9),
+            "تغییر موجودی یک خانه باید شناسهٔ تلاش را عوض کند",
+        )
 
     def test_cosmetic_fields_do_not_change_the_id(self) -> None:
         """یادداشت‌ها و شواهدِ پارسر بخشی از محصول نیستند؛ شناسه را عوض نکنند."""

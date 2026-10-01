@@ -12,7 +12,7 @@ from collections.abc import Callable, Sequence
 import httpx
 
 from bot.config import settings
-from bot.services import learning, metrics, model_catalog, money, phone_parser
+from bot.services import learning, metrics, model_catalog, money, phone_parser, pricing
 from bot.services.ai_normalizer import ai_client_session
 from bot.services.postmodel import (
     Block,
@@ -26,7 +26,14 @@ from bot.services.color_matrix import (
     color_key,
     confirmed_colors,
     extract_colors,
+    is_color_attribute,
     model_signature,
+)
+from bot.services.stock_matrix import (
+    StockMatrix,
+    parse_stock_matrix,
+    parse_stock_matrix_sources,
+    strip_stock_matrix_sections,
 )
 
 logger = logging.getLogger(__name__)
@@ -37,6 +44,13 @@ class ProductData:
     title: str = ""
     price: int = 0
     prices: dict[str, int] = field(default_factory=dict)
+    #: Model-specific regular-price overrides; other models use prices / price.
+    model_prices: dict[str, int] = field(default_factory=dict)
+    #: Separate wholesale tier (never the WooCommerce sale price).
+    wholesale_price: int = 0
+    wholesale_model_prices: dict[str, int] = field(default_factory=dict)
+    #: Price tiers that could not be matched safely to the product's model options.
+    pricing_errors: list[str] = field(default_factory=list)
     sku_prefix: str = ""
     models: list[str] = field(default_factory=list)
     attributes: dict[str, list[str]] = field(default_factory=dict)
@@ -57,6 +71,11 @@ class ProductData:
     #: then no stock field is sent at all — inventing a number is how a shop ends up
     #: selling what it does not have.
     stock: int | None = None
+    #: Explicit design × phone-category quantities. The outer key is the exact
+    #: «طرح» option; inner keys are exact «مدل» options; None means an explicit
+    #: unsupported combination (the input table uses «-»), while 0 is sold out.
+    stock_matrix: dict[str, dict[str, int | None]] = field(default_factory=dict)
+    stock_matrix_errors: list[str] = field(default_factory=list)
     #: WooCommerce's own vocabulary: instock | outofstock | onbackorder ("" = not stated).
     stock_status: str = ""
     #: «قیمت ویژه ۴۹۸». 0 = no sale. A sale price never replaces ``price``: WooCommerce
@@ -80,10 +99,12 @@ class ProductData:
 
 
 SYSTEM_PROMPT = """You extract WooCommerce variable-product data from informal Persian Telegram messages.
-Return ONLY JSON with keys: title, price, prices, sale_price, stock, stock_status, sku_prefix, attributes, model_colors, categories.
-sale_price is the optional discounted price, ONLY when the text says «قیمت ویژه» or «قیمت فروش ویژه», and it must be lower than price. stock is the number of pieces ONLY when the text states a stock count (e.g. «موجودی ۲۰», «۲۰ عدد») — never guess it, and never send 0 because of «ناموجود» (use stock_status outofstock instead). stock_status is exactly one of instock, outofstock, onbackorder, or omitted.
-price is the fallback/common integer price in toman; if a bare 3-digit number is clearly in thousands, multiply by 1000. Read prices ONLY from explicit price/amount lines or amounts with a currency suffix such as 768t, 768 تومان, 768k. Never use a phone model number (for example the 17 in iPhone 17) as a price.
-prices is an optional object for group pricing, using only keys iphone and android, for example {"iphone":698000,"android":598000}. When the text says «ایفون 698» and «اندروید 598», do not collapse them into one price.
+Return ONLY JSON with keys: title, price, prices, model_prices, wholesale_price, wholesale_model_prices, sale_price, stock, stock_status, sku_prefix, attributes, model_colors, categories, warnings.
+sale_price is the optional public discount, ONLY when the text explicitly says «قیمت ویژه» or «قیمت فروش ویژه». Never use a wholesale/cooperation price as sale_price. stock is the number of pieces ONLY when the text states a stock count (e.g. «موجودی ۲۰», «۲۰ عدد») — never guess it, and never send 0 because of «ناموجود» (use stock_status outofstock instead). stock_status is exactly one of instock, outofstock, onbackorder, or omitted.
+price is the regular fallback/common price in toman for models without a more specific price; if the text says «بقیه/سایر سری‌ها 498», use 498000 as this base. For a bare 3-digit amount clearly used as a price, multiply by 1000. Read prices ONLY from explicit price/amount statements or amounts with a currency suffix such as 768t, 768 تومان, 768k. Never use a phone model number (for example the 17 in iPhone 17) as a price.
+prices is the legacy group-price object, using only keys iphone and android, for example {"iphone":698000,"android":598000}. Do not collapse separately stated groups into one price.
+model_prices is an optional object of model-specific OVERRIDES for the regular retail price. Its keys MUST be exact option labels copied from PHONE MODELS, never invented labels like «سری 17». Expand a phrase such as «سری 17» to every exact supplied model in that series. When the text gives a base price for «بقیه/سایر سری‌ها» and an exception, put the base in price and only the exception(s) in model_prices. If every model is priced separately and there is no base, include every affected exact model in model_prices. Do not guess a price or assign a series to an unrelated model; if the mapping is ambiguous, omit the uncertain mapping and explain in warnings.
+wholesale_price is the base cooperation/wholesale price, and wholesale_model_prices contains exact PHONE MODELS labels for model-specific wholesale overrides. Parse «قیمت همکاری», «عمده» and «wholesale» separately from regular price. For «بقیه/سایر سری‌ها» use wholesale_price as the base and model-specific exceptions in wholesale_model_prices. These fields are NEVER sale_price and NEVER replace price/model_prices.
 sku_prefix is uppercase Latin letters such as BO. Do not invent values.
 The phone models are supplied separately and must not be put in attributes.
 attributes must be an object whose keys are Persian attribute names such as رنگ, طرح, جنس and whose values are arrays of distinct strings. Only create an attribute when it has at least TWO selectable values. A single value such as «زرد» is part of the product title/name, not an attribute. Words that describe the product name (for example «قاب پلومریا زرد») must stay in title and must not become attributes.
@@ -234,6 +255,10 @@ def _scan_prices(items: Sequence[Block | str]) -> PriceScan:
             # «قیمت ویژه …» قیمتِ اصلی نیست؛ مالِ scan_stock_and_sale است. بی این
             # خط، قاعدهٔ «آخرین قیمتِ اعلام‌شده برنده است» تخفیف را جای قیمت می‌زد.
             continue
+        if _WHOLESALE_LABEL_RE.search(line):
+            # «قیمت همکاری/عمده …» قیمت فروش نیست؛ لایهٔ همکاری جداست و نباید
+            # جای price بنشیند (وگرنه همهٔ مدل‌ها به قیمت عمده منتشر می‌شوند).
+            continue
         if block.has(ev.ROLE_META) or not block.has(ev.ROLE_PRICE):
             if money.amounts_in_line(line):
                 # It had a number and we still said no. Only a line that
@@ -320,11 +345,14 @@ def _split_lines(text: str) -> list[str]:
 _STOCK_LABEL_RE = re.compile(r"(?i)^\s*(?:موجودی|موجوديت\s*(?:فعلی)?|stock|quantity)\s*[:=]?\s*(.*)$")
 _COUNT_SUFFIX_RE = re.compile(r"([\d\u0660-\u0669\u06f0-\u06f9][\d,\u0660-\u0669\u06f0-\u06f9]{0,6})\s*(?:عدد)\b")
 _SALE_LABEL_RE = re.compile(r"(?i)^\s*(?:قیمت\s*(?:فروش\s*)?ویژه|قیمت\s*ویژه|sale[_ ]?price)\s*[:=]?\s*(.*)$")
+_EXPLICIT_COLOR_LINE_RE = re.compile(r"(?i)^\s*(?:رنگ(?:بندی|\s*بندی)?|colors?)\s*[:：=]")
 _SKU_PREFIX_LINE_RE = re.compile(
     r"(?i)^\s*(?:sku(?:\s*(?:prefix|code))?|پیشوند(?:\s*sku)?)"
     r"\s*[:：=]\s*([A-Za-z]{1,12})(?:[-_/ ]?\d+)?\s*$"
 )
 _OUT_OF_STOCK_RE = re.compile(r"(?i)(?:تمام\s*شده|ناموجود|بدون\s*موجودی|out\s*of\s*stock)")
+#: A wholesale/cooperation price line is a different tier, not the retail price.
+_WHOLESALE_LABEL_RE = re.compile(r"(?i)(?:قیمت\s*همکاری|همکاری|عمده|wholesale)")
 #: «پیش‌فروش» and «پیش فروش» differ by a ZWNJ, which ``\s`` does not match — so the
 #: separator class has to name it, or pre-order products silently read as ordinary stock.
 _SEP = r"[\s\u200c\u200f-]*"
@@ -344,6 +372,113 @@ def _ai_amount(raw: object) -> int:
         return 0
     value = money.parse_line_amount(text)
     return value if value and money.in_accepted_range(value) else 0
+
+
+def _clean_model_price_overrides(
+    raw: object, models: list[str], *, label: str
+) -> tuple[dict[str, int], list[str]]:
+    """Keep only AI price overrides that map to one exact product-model option."""
+    if not raw:
+        return {}, []
+    if not isinstance(raw, dict):
+        return {}, [f"{label}: خروجی قیمت مدل‌ها ساختار معتبری نداشت."]
+    signatures = pricing.match_model_labels(models)
+    result: dict[str, int] = {}
+    errors: list[str] = []
+    if not signatures:
+        return {}, [f"{label}: قیمت مدل‌محور تشخیص داده شد اما مدل مشخصی برای اتصال وجود ندارد."]
+    for raw_model, raw_value in raw.items():
+        signature = model_signature(str(raw_model))
+        matches = signatures.get(signature, [])
+        if len(matches) != 1:
+            errors.append(
+                f"{label}: «{raw_model}» با یک مدل یکتای محصول جور نشد؛ قیمت به مدل دیگری وصل نشد."
+            )
+            continue
+        amount = _ai_amount(raw_value)
+        if not amount:
+            errors.append(f"{label}: مبلغ مدل «{matches[0]}» معتبر یا در بازهٔ قیمت فروشگاه نبود.")
+            continue
+        if matches[0] in result and result[matches[0]] != amount:
+            errors.append(f"{label}: برای مدل «{matches[0]}» دو قیمت متفاوت استخراج شد.")
+            continue
+        result[matches[0]] = amount
+    return result, errors
+
+
+#: Shown when «قیمت ویژه» is scoped to one series/model: we cannot discount only
+#: those variations, and discounting all of them would be wrong.
+_TIER_SALE_UNSUPPORTED = (
+    "«قیمت ویژه» برای یک سری/مدل خاص نوشته شده؛ ربات فعلاً تخفیف را فقط روی همان "
+    "واریژن‌ها نمی‌گذارد و روی بقیه اعمالش نمی‌کند. یک قیمت ویژهٔ یکسان بنویس یا "
+    "تخفیف را دستی در سایت بگذار."
+)
+
+#: Shown when the text prices models in tiers but no exact model mapping exists.
+#: Deliberately blocks: guessing a series-to-model assignment is how a shop ends
+#: up selling at the wrong price for weeks.
+_TIER_PRICE_UNMAPPED = (
+    "قیمت‌ها سری/مدل‌محور نوشته شده‌اند اما نگاشت دقیق هر سری به مدل‌های همین محصول "
+    "ساخته نشد؛ اگر مبلغ یکسانی روی همه اعمال شود قیمت اشتباه منتشر می‌شود."
+)
+
+
+def _has_model_scoped_sale_text(text: str) -> bool:
+    """A «قیمت ویژه» written for one series/model can never be applied globally.
+
+    WooCommerce keeps one sale price per variation, and today's writer sends the
+    same discount to every variation. If the seller scoped the discount to a
+    series, applying it everywhere would discount models they priced higher, so
+    the publish stops and says so instead of guessing.
+    """
+    for line in strip_stock_matrix_sections(text or "").splitlines():
+        if not _SALE_LABEL_RE.match(line):
+            continue
+        if not re.search(r"(?i)(?:سری|series|مدل(?:‌ها|ها|های)?|models?)", line):
+            continue
+        if any(
+            money.in_accepted_range(money.apply_bare_policy(token, where=line).value)
+            for token in money.amounts_in_line(line)
+        ):
+            return True
+    return False
+
+
+def _has_model_tier_price_text(text: str) -> bool:
+    """Catch an apparent series/model price table the AI failed to map.
+
+    This is only a safety gate: it never assigns a price. If several different
+    regular amounts are each attached to a series/model phrase («قیمت سری ۱۷ …»,
+    «قیمت بقیه سری‌ها …») but no model map was extracted, publishing them at one
+    common price would be a silent misprice. Only price *lines that themselves*
+    name a series/model count, so an ordinary correction between two price lines
+    is not mistaken for a tier table.
+    """
+    clean = strip_stock_matrix_sections(text or "")
+    amounts: set[int] = set()
+    for line in clean.splitlines():
+        if _SALE_LABEL_RE.match(line):
+            continue
+        if re.search(r"(?i)(?:قیمت\s*همکاری|عمده|wholesale)", line):
+            continue
+        if not re.search(r"(?i)(?:قیمت|مبلغ|نرخ|price|شود|هست)", line):
+            continue
+        if not re.search(r"(?i)(?:سری|series|مدل(?:‌ها|ها|های)?|model(?:s)?)", line):
+            continue
+        for token in money.amounts_in_line(line):
+            value = money.apply_bare_policy(token, where=line).value
+            if money.in_accepted_range(value):
+                amounts.add(value)
+    return len(amounts) >= 2
+
+
+def _matrix_has_explicit_colors(*sources: str) -> bool:
+    """A color axis beside a stock matrix is allowed only when its own label is explicit."""
+    return any(
+        _EXPLICIT_COLOR_LINE_RE.match(line.strip())
+        for source in sources
+        for line in strip_stock_matrix_sections(source).splitlines()
+    )
 
 
 def _availability_status(text: str) -> str:
@@ -490,6 +625,7 @@ def _fallback(
     price_blocks: list[str] | None = None,
     blocks: list[Block] | None = None,
     ignore_color_messages: frozenset[str] | set[str] = frozenset(),
+    stock_matrix: StockMatrix | None = None,
 ) -> ProductData:
     """Read a product out of the text alone (no AI): prices, title, colors.
 
@@ -502,12 +638,27 @@ def _fallback(
     نیست»: those messages keep their title and price, but no color of theirs —
     including a color hidden inside a prose line — enters the list.
     """
+    matrix = stock_matrix if stock_matrix is not None else parse_stock_matrix(text)
+    clean_text = strip_stock_matrix_sections(text)
+    if matrix.models:
+        # The table's header is the explicit set of stock categories. In this
+        # mode it defines the actual model-axis labels, including compatibility
+        # groups such as «iPhone 13 Pro/13 Pro Max».
+        models = list(matrix.models)
     if blocks is None:
-        groups = [parse_blocks(block) for block in (price_blocks or [text])]
+        raw_groups = price_blocks or [text]
+        groups = [parse_blocks(strip_stock_matrix_sections(block)) for block in raw_groups]
     else:
         labels = list(dict.fromkeys(block.message for block in blocks))
-        groups = [[b for b in blocks if b.message == label] for label in labels]
-    all_blocks = [block for group in groups for block in group] or parse_blocks(text)
+        groups = []
+        for label in labels:
+            group = [b for b in blocks if b.message == label]
+            if matrix.found:
+                cleaned_group = strip_stock_matrix_sections("\n".join(block.raw for block in group))
+                groups.append(parse_blocks(cleaned_group, message=label))
+            else:
+                groups.append(group)
+    all_blocks = [block for group in groups for block in group] or parse_blocks(clean_text)
 
     scan = PriceScan()
     for group in groups:
@@ -632,6 +783,10 @@ def _fallback(
     for block in all_blocks:
         if block is title_block or block.text() == title or block.message in ignored:
             continue
+        # In matrix mode pattern names can contain color words («پروانه آبی»),
+        # but those words are part of the design label, not a second axis.
+        if matrix.found and not _EXPLICIT_COLOR_LINE_RE.match(block.text()):
+            continue
         for color in extract_colors(block.text(), allow_unknown=False):
             key = color_key(color)
             if key not in seen_colors:
@@ -667,6 +822,28 @@ def _fallback(
         )
     if models:
         ev.merge(evidence, "models", ev.CAPTION, quote="، ".join(models[:4]))
+    if matrix.found:
+        matrix_source = ev.INFO if matrix.source == "info" else ev.CAPTION
+        if matrix.designs:
+            # The first column is the canonical «طرح» option list for this table.
+            attrs["طرح"] = list(matrix.designs)
+        ev.merge(
+            evidence,
+            "stock_matrix",
+            matrix_source,
+            quote=f"{len(matrix.designs)} طرح × {len(matrix.models)} دسته؛ {matrix.sellable_cells} ترکیبِ قابل‌فروش",
+            overwrite=True,
+        )
+        if matrix.models:
+            ev.merge(evidence, "models", matrix_source,
+                     quote="، ".join(matrix.models[:4]), overwrite=True)
+        if matrix.errors:
+            notes.extend(f"ماتریس موجودی: {error}" for error in matrix.errors[:4])
+        else:
+            notes.append(
+                f"موجودی ماتریسی صریح ثبت شد: {matrix.sellable_cells} ترکیب، "
+                f"جمع {matrix.total_stock:,} عدد؛ هر مقدار به همان طرح و دسته وصل است"
+            )
     for rejected in scan.surprising[:2]:
         notes.append(f"«{_clip_line(rejected)}» عدد داشت ولی قیمت نشد (خارج از بازه یا بی‌واژه)")
     if price and len(prices) < 2:
@@ -701,14 +878,22 @@ def _fallback(
             notes.append(
                 f"قیمت ویژه ({money.format_toman(stock_scan['sale_price'])}) از قیمت اصلی کمتر نیست"
             )
+    pricing_errors = []
+    if _has_model_tier_price_text(clean_text):
+        pricing_errors.append(_TIER_PRICE_UNMAPPED)
+    if _has_model_scoped_sale_text(clean_text):
+        pricing_errors.append(_TIER_SALE_UNSUPPORTED)
     return ProductData(
         title=title,
         price=price,
         prices=prices,
+        pricing_errors=pricing_errors,
         sku_prefix=prefix,
         models=models,
         attributes=attrs,
         stock=stock_scan["stock"],
+        stock_matrix={design: dict(values) for design, values in matrix.quantities.items()},
+        stock_matrix_errors=list(matrix.errors),
         stock_status=stock_scan["stock_status"],
         sale_price=stock_scan["sale_price"],
         evidence=evidence,
@@ -849,7 +1034,15 @@ async def extract_product(
 ) -> ProductData:
     # Keep one AI request, but preserve provenance. The deterministic parser
     # receives PRODUCT INFO first so its title/SKU/price precedence is stable.
-    source_for_fallback = "\n".join(part for part in (info_text, caption) if part.strip()) or text
+    matrix = parse_stock_matrix_sources([("info", info_text), ("caption", caption)])
+    if not matrix.found and text.strip():
+        matrix = parse_stock_matrix(text, source=ev.CAPTION)
+    # The table is parsed deterministically and removed from ordinary text/AI
+    # extraction: its cell counts must never become a scalar stock, phone model,
+    # price, title or a color guessed from a design name.
+    info_text = strip_stock_matrix_sections(info_text)
+    caption = strip_stock_matrix_sections(caption)
+    source_for_fallback = "\n".join(part for part in (info_text, caption) if part.strip()) or strip_stock_matrix_sections(text)
     # PRODUCT INFO stays authoritative over the caption, but within it the
     # owner's newest line is a correction of the older ones (see _scan_prices).
     # Labeled blocks are what makes that precedence explainable: every value
@@ -858,12 +1051,21 @@ async def extract_product(
     if suppressed:
         caption = _drop_color_lines(caption, "caption", suppressed)
         info_text = _drop_color_lines(info_text, "info", suppressed)
-        source_for_fallback = "\n".join(part for part in (info_text, caption) if part.strip()) or text
+        source_for_fallback = "\n".join(part for part in (info_text, caption) if part.strip()) or strip_stock_matrix_sections(text)
+    if matrix.models:
+        models = list(matrix.models)
     blocks = parse_sources([("info", info_text), ("caption", caption)])
     if blocks:
-        fallback = _fallback(source_for_fallback, models, blocks=blocks, ignore_color_messages=suppressed)
+        fallback = _fallback(
+            source_for_fallback, models, blocks=blocks,
+            ignore_color_messages=suppressed, stock_matrix=matrix,
+        )
     else:
-        fallback = _fallback(source_for_fallback, models, price_blocks=[info_text, caption])
+        text_blocks = [info_text, caption] if info_text or caption else [strip_stock_matrix_sections(text)]
+        fallback = _fallback(
+            source_for_fallback, models, price_blocks=text_blocks,
+            ignore_color_messages=suppressed, stock_matrix=matrix,
+        )
     # Learned term corrections apply to the deterministic result as well, so a
     # shop with no AI configured still honors what the owner taught the bot.
     _apply_learned_terms(fallback, source_for_fallback)
@@ -929,8 +1131,31 @@ async def extract_product(
             for k, vals in attrs.items()
             if isinstance(vals, list) and len({str(v).strip() for v in vals if str(v).strip()}) >= 2
         }
+        if matrix.found:
+            # The explicit table is the source of truth for both variation axes;
+            # keep its exact labels even if AI normalizes or drops them.
+            if matrix.designs:
+                clean_attrs["طرح"] = list(matrix.designs)
+            has_labeled_colors = _matrix_has_explicit_colors(info_text, caption)
+            if not has_labeled_colors:
+                clean_attrs = {
+                    name: values for name, values in clean_attrs.items()
+                    if not is_color_attribute(name)
+                }
+            for name, values in fallback.attributes.items():
+                if name != "طرح" and (has_labeled_colors or not is_color_attribute(name)):
+                    clean_attrs.setdefault(name, list(values))
         raw_model_colors = _dict_field(obj, "model_colors")
         model_colors = _clean_model_colors(raw_model_colors, models, source_for_fallback)
+        if matrix.found:
+            model_colors = {}
+        model_prices, model_price_errors = _clean_model_price_overrides(
+            _dict_field(obj, "model_prices"), models, label="قیمت مدل‌ها"
+        )
+        wholesale_model_prices, wholesale_errors = _clean_model_price_overrides(
+            _dict_field(obj, "wholesale_model_prices"), models, label="قیمت همکاری"
+        )
+        wholesale_price = _ai_amount(obj.get("wholesale_price"))
         raw_prices = _dict_field(obj, "prices")
         prices = {}
         for key, value in raw_prices.items():
@@ -1015,6 +1240,68 @@ async def extract_product(
             ev.merge(evidence, "prices", ev.AI,
                      quote=f"قیمت گروهیِ خوانده‌شده برای {guessed_groups}", overwrite=True)
             notes.append("بخشی از قیمت گروهی را هوش مصنوعی برداشت کرده؛ لطفاً بررسی کن")
+        # --- model-tier prices: «قیمت سری ۱۷ ۵۹۸، بقیه ۴۹۸» --------------------
+        # The series→model expansion is a language job, so it comes from the model;
+        # but every label has to land on one exact product model, and the fallback
+        # price stays the base the seller wrote. Unmapped tiers block the publish
+        # instead of quietly giving every model one price.
+        tiered_text = _has_model_tier_price_text(source_for_fallback)
+        pricing_errors: list[str] = []
+        if (
+            wholesale_price
+            and not fallback.price
+            and not fallback.prices
+            and final_price == wholesale_price
+        ):
+            # The only amount in the text was the cooperation price and the AI used
+            # it as the retail one. A wholesale number must never become the price
+            # every customer pays; drop it and let the gates ask for a real price
+            # (unless every model has its own retail price).
+            final_price = 0
+            if not model_prices or pricing.unresolved_models(models, final_price, prices, model_prices):
+                pricing_errors.append(
+                    "در متن فقط «قیمت همکاری» آمده و آن قیمت فروش نیست؛ "
+                    "قیمت فروش را جدا بنویس."
+                )
+        if model_prices:
+            ev.merge(
+                evidence, "model_prices", ev.AI,
+                quote="، ".join(
+                    f"{label}: {money.format_toman(value)}"
+                    for label, value in list(model_prices.items())[:4]
+                ),
+                overwrite=True,
+            )
+            notes.append("قیمت مدل‌های خاص را هوش مصنوعی به مدل‌های همین محصول وصل کرده؛ بررسی کن")
+        if wholesale_model_prices or wholesale_price:
+            ev.merge(
+                evidence, "wholesale_price", ev.AI,
+                quote="، ".join(
+                    f"{label}: {money.format_toman(value)}"
+                    for label, value in list(wholesale_model_prices.items())[:4]
+                ) or money.format_toman(wholesale_price),
+                overwrite=True,
+            )
+            base_note = (
+                f"پایه {money.format_toman(wholesale_price)}" if wholesale_price else "بدون قیمت پایه"
+            )
+            notes.append(
+                f"قیمت همکاری ثبت شد ({base_note}؛ {len(wholesale_model_prices)} مدل خاص) — "
+                "جای قیمت اصلی را نمی‌گیرد و در سایت اعمال نمی‌شود"
+            )
+        if _has_model_scoped_sale_text(source_for_fallback):
+            pricing_errors.append(_TIER_SALE_UNSUPPORTED)
+        if tiered_text and not model_prices:
+            pricing_errors.append(_TIER_PRICE_UNMAPPED)
+        elif tiered_text:
+            missing_regular = pricing.unresolved_models(models, final_price, prices, model_prices)
+            if missing_regular:
+                pricing_errors.append(
+                    "برای این مدل‌ها قیمت مشخص نشد و حدس زده نمی‌شود: "
+                    + "، ".join(missing_regular[:6])
+                )
+        pricing_errors.extend(model_price_errors)
+        pricing_errors.extend(wholesale_errors)
         if suppressed:
             # The AI reads the same text we do, and it is eager: it would put
             # back the colors the owner just marked as «مال محصول دیگر». After a
@@ -1041,12 +1328,25 @@ async def extract_product(
             ev.merge(evidence, "description", ev.AI, quote="نوشتهٔ هوش مصنوعی", overwrite=True)
         # Stock and the sale price: the deterministic reading of the text wins, exactly
         # like the price does — a model that sees «۲۰ عدد» is free to invent it too.
-        stock_sale = _merge_stock_and_sale(fallback, obj, evidence=evidence, notes=notes)
+        stock_obj = dict(obj)
+        if matrix.found:
+            # Do not let a model collapse a variation matrix back to one global
+            # quantity/status. A seller-written scalar beside the table is still
+            # retained by the deterministic parser and validation will flag it.
+            stock_obj.pop("stock", None)
+            stock_obj.pop("stock_status", None)
+        stock_sale = _merge_stock_and_sale(fallback, stock_obj, evidence=evidence, notes=notes)
         result = ProductData(
             title=final_title.strip(),
             price=final_price,
             prices=prices,
+            model_prices=model_prices,
+            wholesale_price=wholesale_price,
+            wholesale_model_prices=wholesale_model_prices,
+            pricing_errors=pricing_errors,
             stock=stock_sale["stock"],
+            stock_matrix={design: dict(values) for design, values in matrix.quantities.items()},
+            stock_matrix_errors=list(matrix.errors),
             stock_status=stock_sale["stock_status"],
             sale_price=stock_sale["sale_price"],
             sku_prefix=final_sku_prefix,

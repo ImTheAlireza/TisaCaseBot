@@ -13,9 +13,9 @@ from collections.abc import Sequence
 import httpx
 
 from bot.config import settings
-from bot.services import metrics, publish_batch
+from bot.services import metrics, pricing, publish_batch
 from bot.services.color_matrix import build_combinations, color_key
-from bot.services.plan import plan_from_dict
+from bot.services.plan import VariationPlan, plan_from_dict
 from bot.services.sku import (
     MAX_GHOST_SPAN,
     MAX_SKU_RETRIES,
@@ -82,12 +82,18 @@ def product_description(data: dict[str, Any]) -> str:
     return ""
 
 
-def _price_for_model(model: str, common: int, prices: dict[str, int]) -> int:
-    if prices.get("iphone") and re.search(r"\biphone\b", model, re.I):
-        return prices["iphone"]
-    if prices.get("android"):
-        return prices["android"]
-    return common
+def _price_for_model(
+    model: str,
+    common: int,
+    prices: dict[str, int],
+    model_prices: dict[str, int] | None = None,
+) -> int:
+    """Backwards-compatible wrapper around the shared resolver.
+
+    ``bot.services.pricing`` is also what the preview and validation read, so the
+    number on the card is the number in the payload.
+    """
+    return pricing.price_for_model(model, common, prices, model_prices)
 
 
 def _clean_options(values: Sequence[Any]) -> list[str]:
@@ -510,6 +516,8 @@ async def _create_variations(
     stock: int | None = None,
     stock_status: str = "",
     images_by_color: dict[str, int] | None = None,
+    variation_plan: VariationPlan | None = None,
+    model_prices: dict[str, int] | None = None,
 ) -> None:
     """Create every variation in bulk via the batch endpoint, with a fallback.
 
@@ -549,7 +557,7 @@ async def _create_variations(
     for index, combo in enumerate(combos):
         model = combo.get("مدل", "")
         variation: dict[str, Any] = {
-            "regular_price": str(_price_for_model(model, common_price, prices)),
+            "regular_price": str(_price_for_model(model, common_price, prices, model_prices)),
             "status": "publish",
             # visible + menu_order are what the seller actually judges: a variation that is
             # created but hidden, or listed in hash order instead of the order the message
@@ -560,11 +568,22 @@ async def _create_variations(
         }
         if sale_price:
             variation["sale_price"] = str(sale_price)
-        if stock is not None:
+        if variation_plan is not None and variation_plan.stock_matrix:
+            matrix_quantity = variation_plan.matrix_stock_for(combo)
+            if matrix_quantity is None:
+                raise ValueError(
+                    "برای این ترکیب مقدار ماتریس موجودی پیدا نشد: "
+                    + " × ".join(combo.values())
+                )
             variation["manage_stock"] = True
-            variation["stock_quantity"] = stock
-        if stock is not None or stock_status:
-            variation["stock_status"] = stock_status or "instock"
+            variation["stock_quantity"] = matrix_quantity
+            variation["stock_status"] = "instock" if matrix_quantity > 0 else "outofstock"
+        else:
+            if stock is not None:
+                variation["manage_stock"] = True
+                variation["stock_quantity"] = stock
+            if stock is not None or stock_status:
+                variation["stock_status"] = stock_status or "instock"
         image_id = images_by_color.get(str(combo.get("رنگ") or ""))
         if image_id:
             variation["image"] = {"id": image_id}
@@ -729,7 +748,20 @@ async def create_draft(
 
     base = products_base()
     prices = {str(k): int(v) for k, v in (data.get("prices") or {}).items() if v}
+    model_prices = {
+        str(k): int(v) for k, v in (data.get("model_prices") or {}).items() if int(v or 0) > 0
+    }
+    pricing_errors = [str(item) for item in (data.get("pricing_errors") or []) if str(item).strip()]
+    if pricing_errors:
+        # An unmapped series/model price table would otherwise put one amount on
+        # every variation. Refuse before the first request, like the stock matrix.
+        raise ValueError("قیمت‌ها قابل‌اعمال نیستند: " + "؛ ".join(pricing_errors[:3]))
     common_price = int(data.get("price") or (next(iter(prices.values())) if prices else 0))
+    raw_stock_matrix = data.get("stock_matrix") or {}
+    if not isinstance(raw_stock_matrix, dict) or any(
+        not isinstance(row, dict) for row in raw_stock_matrix.values()
+    ):
+        raise ValueError("ساختار ماتریس موجودی معتبر نیست.")
     plan = plan_from_dict(data)
     attrs = plan.woo_attributes()
     restrictions = plan.restrictions
@@ -745,6 +777,21 @@ async def create_draft(
     stock = None if raw_stock in (None, "") else int(raw_stock)
     stock_status = str(data.get("stock_status") or "").strip()
     sale_price = int(data.get("sale_price") or 0)
+    stock_matrix_errors = [
+        str(item) for item in (data.get("stock_matrix_errors") or []) if str(item).strip()
+    ]
+    if stock_matrix_errors:
+        raise ValueError("ماتریس موجودی نامعتبر است: " + "؛ ".join(stock_matrix_errors[:3]))
+    if plan.stock_matrix:
+        if plan.matrix_axis_errors or plan.matrix_missing:
+            detail = "; ".join(plan.matrix_axis_errors[:2])
+            if plan.matrix_missing:
+                detail += ("؛ " if detail else "") + f"{len(plan.matrix_missing)} خانه خالی است"
+            raise ValueError("ماتریس موجودی ناقص/ناسازگار است: " + detail)
+        if stock is not None or stock_status:
+            raise ValueError("ماتریس موجودی با موجودی یا وضعیت کلی هم‌زمان مجاز نیست.")
+        if not plan.combos:
+            raise ValueError("ماتریس موجودی هیچ ترکیب قابل‌ساختی ندارد.")
 
     audit = Audit()
     if audit_note:
@@ -753,6 +800,11 @@ async def create_draft(
     audit.log(f"[config] WooCommerce: {settings.woocommerce_url or '(تنظیم نشده)'} (نسخه API: {settings.woocommerce_version})")
     audit.log(f"[config] WordPress media: {settings.wordpress_url or '(تنظیم نشده)'}")
     audit.log(f"[config] عنوان: {data.get('title', '(خالی)')} | پیشوند SKU: {prefix or '(خالی)'} | قیمت پایه: {common_price} | قیمت‌های گروهی: {prices or '(هیچ)'}")
+    if model_prices:
+        audit.log(
+            f"[price:model] {len(model_prices)} قیمت مدل‌محور روی واریژن همان مدل می‌نشیند: "
+            f"{model_prices}"
+        )
     audit.log(
         "[config] موجودی: "
         + (f"{stock} عدد" if stock is not None else "ارسال نمی‌شود")
@@ -760,6 +812,13 @@ async def create_draft(
         + (f" | قیمت ویژه: {sale_price}" if sale_price else "")
     )
     audit.log(f"[config] ویژگی‌ها: {[a['name'] for a in attrs] or '(هیچ)'} | تعداد تصاویر: {len(image_paths)}")
+    if plan.stock_matrix:
+        matrix_quantities = [plan.matrix_stock_for(combo) for combo in plan.combos]
+        known_quantities = [value for value in matrix_quantities if value is not None]
+        audit.log(
+            f"[stock:matrix] {len(known_quantities)} ترکیب؛ "
+            f"جمع موجودی {sum(known_quantities):,}؛ هر تعداد روی واریژن متناظر ثبت می‌شود"
+        )
     if restrictions:
         audit.log(
             f"[config] ماتریس رنگ هر مدل: {len(restrictions)} مدل محدود شد "
@@ -832,7 +891,13 @@ async def create_draft(
                     # Never replaces regular_price: the strikethrough price has to survive
                     # the day the sale is removed, and it does if we only add a sale.
                     payload["sale_price"] = str(sale_price)
-                if stock is not None or stock_status:
+                if plan.stock_matrix and not attrs:
+                    matrix_quantity = plan.matrix_stock_for({})
+                    if matrix_quantity is not None:
+                        payload["manage_stock"] = True
+                        payload["stock_quantity"] = matrix_quantity
+                        payload["stock_status"] = "instock" if matrix_quantity > 0 else "outofstock"
+                elif stock is not None or stock_status:
                     if attrs:
                         # A variable product owns no stock of its own — WooCommerce computes
                         # the parent from its variations — so only the status goes here and
@@ -884,6 +949,8 @@ async def create_draft(
                         restrictions, plan.combos, existing_combos=existing,
                         sale_price=sale_price, stock=stock, stock_status=stock_status,
                         images_by_color=images_by_color,
+                        variation_plan=plan,
+                        model_prices=model_prices,
                     )
             except Exception as exc:
                 # Half-built is worse than not built: a product with a missing
