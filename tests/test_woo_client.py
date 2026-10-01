@@ -16,7 +16,9 @@ try:
 
     from bot import __version__
     from bot.services import woo_client
-    from bot.services.woo_client import USER_AGENT, WooClient, WooCommerceAPIError, body_snippet, check
+    from bot.services.woo_client import (
+        USER_AGENT, WooClient, WooCommerceAPIError, body_snippet, check, describe_exception,
+    )
     from bot.services.woocommerce import ping_woocommerce
     # نام‌گذاری مجدد، وگرنه pytest این دو تابعِ async را به‌اشتباه «تست» جمع می‌کند
     from bot.services.woocommerce_product_test import test_product_with_image as probe_product
@@ -52,9 +54,13 @@ class TestInjectedPolicy(unittest.IsolatedAsyncioTestCase):
 
     async def test_query_auth_and_agent_are_added_by_the_client(self) -> None:
         script = TransportScript(respond(200, []))
+        audit = woo_client.Audit()
         with patched_settings(settings_with(**SHARED)):
-            async with _client(script) as client:
+            async with WooClient(audit=audit, transport=script.transport()) as client:
                 await client.get("https://shop.example/wp-json/wc/v3/products", params={"per_page": 3})
+        self.assertIn("[http:start] #1 GET /wp-json/wc/v3/products", audit.text())
+        self.assertIn("[http:done] #1 GET /wp-json/wc/v3/products → HTTP 200", audit.text())
+        self.assertNotIn("consumer_secret", audit.text())
         request = script.requests[0]
         self.assertEqual("3", request.url.params["per_page"], "پارامترهای caller گم نشوند")
         self.assertEqual("ck_test", request.url.params["consumer_key"])
@@ -110,13 +116,31 @@ class TestRetryPolicy(unittest.IsolatedAsyncioTestCase):
 
     async def test_timeout_on_a_write_is_not_retried(self) -> None:
         """۵۰۲/تایم‌اوت روی POST یعنی «شاید اعمال شد»؛ تکرارش یعنی محصول دومی.\""""
-        script = TransportScript(httpx.ReadTimeout("slow"))
+        script = TransportScript(httpx.ReadTimeout(""))
+        audit = woo_client.Audit()
         with patched_settings(settings_with(**SHARED)), no_sleep() as delays:
-            async with _client(script) as client:
+            async with WooClient(audit=audit, transport=script.transport(), attempts=3) as client:
                 with self.assertRaises(httpx.ReadTimeout):
                     await client.post("https://shop.example/wp-json/wc/v3/products", json={})
         self.assertEqual(1, script.sends, "نفرست دوباره")
         self.assertEqual([], delays)
+        self.assertIn("[http:error] #1 POST /wp-json/wc/v3/products", audit.text())
+        self.assertIn("ReadTimeout:", audit.text())
+        self.assertIn("پس از ", audit.text())
+        self.assertIn("تلاش 1/3", audit.text())
+        self.assertIn("مهلت هر فاز=45s", audit.text())
+        self.assertIn("ممکن است درخواست اعمال شده باشد", audit.text())
+        self.assertNotIn("cs_topsecret", audit.text())
+
+    async def test_transport_error_summary_fills_empty_timeout_message(self) -> None:
+        self.assertEqual(
+            "ReadTimeout: پاسخ فروشگاه نرسید؛ ممکن است درخواست اعمال شده باشد",
+            describe_exception(httpx.ReadTimeout("")),
+        )
+        self.assertEqual(
+            "ConnectTimeout: مهلت اتصال به فروشگاه تمام شد",
+            describe_exception(httpx.ConnectTimeout("")),
+        )
 
     async def test_rate_limit_is_retried_on_a_write(self) -> None:
         """۴۲۹ یعنی «نپذیرفتم» — هیچ چیزی اعمال نشده، پس ارسال دوباره بی‌خطر است.\""""
@@ -210,6 +234,14 @@ class TestToolsUseTheSameClient(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(result.ok)
                 self.assertIn(needle, result.message)
 
+    async def test_ping_reports_timeout_kind_even_when_httpx_message_is_empty(self) -> None:
+        self._inject(TransportScript(httpx.ReadTimeout("")))
+        result = await ping_woocommerce("https://shop.example", "ck", "cs")
+        self.assertFalse(result.ok)
+        self.assertIsNone(result.status_code)
+        self.assertIn("ReadTimeout", result.message)
+        self.assertIn("پاسخ فروشگاه نرسید", result.message)
+
     async def test_media_tool_uploads_and_cleans_up(self) -> None:
         script = TransportScript(respond(201, {"id": 55}), respond(200, {}))
         self._inject(script)
@@ -297,13 +329,12 @@ class TestNoSecondImplementation(unittest.TestCase):
                                        "ساخته‌ای یا client را دور زده‌ای")
 
     def test_the_client_is_the_only_socket(self) -> None:
-        """فهرستِ صریح، نه «هیچ‌کس»: AI یک سرویس دیگر است و client خودش حقش است."""
+        """Only the Woo policy and shared AI session factory construct clients."""
         from pathlib import Path
 
         allowed = {
             "bot/services/woo_client.py",          # فروشگاه
-            "bot/services/ai_normalizer.py",        # ارائه‌دهندهٔ AI
-            "bot/services/product_extractor.py",    # ارائه‌دهندهٔ AI
+            "bot/services/ai_normalizer.py",        # AI session factory shared by both stages
         }
         root = Path(__file__).resolve().parents[1]
         users = {path.relative_to(root).as_posix() for path in (root / "bot").rglob("*.py")

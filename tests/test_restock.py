@@ -532,7 +532,7 @@ class FlowTest(unittest.TestCase):
         card = products_ledger.record(user_id=USER, status="restocked", product_id=1201,
                                       mode="restock", title="قاب", variations=3)
         text = cards.result_card(card)
-        self.assertIn("شارژ", text)
+        self.assertIn("شارژ موجودی به‌روز شد", text)
         self.assertNotIn("پیش‌نویس ساخته شد", text, "این کارت محصول تازه نساخته است")
         self.assertIn("🔄", products_ledger.summary(card))
 

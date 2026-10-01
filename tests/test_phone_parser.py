@@ -134,6 +134,66 @@ class TestRealModelLinesStillWork(unittest.TestCase):
         self.assertEqual(_labels("Apple\n15 مینی"), ["iPhone 15 Mini"])
 
 
+class TestGroupedXiaomiListing(unittest.TestCase):
+    POST = """🖤 IPHONE:
+12/12PRO
+13/14
+13PROMAX
+14PROMAX
+16
+16PROMAX
+17
+17PROMAX
+
+🖤 SAMSUNG:
+A06
+A07
+A12
+A13
+A14
+A15
+A16/A26
+A17
+A32
+A52
+A53
+A54
+A55
+A56
+S23FE
+S24FE
+S25FE
+S24ULTRA
+
+🖤 XIAOMI / POCO:
+NOTE9PRO/9S
+NOTE11/11S/12S
+NOTE11PRO/12PRO 4G
+NOTE13 4G
+NOTE13PRO/M6PRO
+NOTE14
+NOTE14PRO
+NOTE14S
+POCO X3
+A5/C71
+15C"""
+
+    def test_shorthand_slash_models_and_section_ownership_are_preserved(self):
+        labels = [model.label for model in extract_phone_models(self.POST)]
+        expected = {
+            "Redmi Note 9 Pro", "Redmi Note 9S",
+            "Redmi Note 11", "Redmi Note 11S", "Redmi Note 12S",
+            "Redmi Note 11 Pro", "Redmi Note 12 Pro 4G",
+            "Redmi Note 13 4G", "Redmi Note 13 Pro", "POCO M6 Pro",
+            "Redmi Note 14", "Redmi Note 14 Pro", "Redmi Note 14S",
+            "POCO X3", "Redmi A5", "POCO C71", "Redmi 15C",
+            "A06", "A26", "S24 Ultra", "iPhone 17 Pro Max",
+        }
+        self.assertTrue(expected.issubset(set(labels)), expected - set(labels))
+        self.assertNotIn("A5", labels, "A5/C71 must not be misclassified as Samsung A5")
+        self.assertEqual(len(labels), len(set(labels)), "the slash expansion must not duplicate a model")
+
+
 class TestPersianBrandWords(unittest.TestCase):
     """«آیفون 13 پرو مکس» alone must be enough — no Latin word required.
 

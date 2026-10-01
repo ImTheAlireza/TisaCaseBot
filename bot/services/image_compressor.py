@@ -64,7 +64,10 @@ def compress_image(src: Path, dest_dir: Path) -> Path:
                 out,
                 format="JPEG",
                 quality=_quality(),
-                optimize=True,
+                # Huffman optimization makes Pillow scan the pixels again. For
+                # shop photos that are already Telegram-sized it saves very few
+                # bytes while noticeably delaying a multi-image batch.
+                optimize=False,
                 progressive=True,
                 subsampling="4:2:0",
             )

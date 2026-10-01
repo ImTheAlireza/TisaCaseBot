@@ -428,8 +428,44 @@ class TestWorkspaceKeepsTheName(unittest.TestCase):
 
 
 @needs_flow
-class TestPreviewSaysTheScope(unittest.TestCase):
-    """پیش‌نمایش باید بگوید این عدد روی چند واریژن نوشته می‌شود."""
+class TestCategoryLookupReuse(unittest.TestCase):
+    def test_shared_parent_category_is_looked_up_once_per_publish(self) -> None:
+        import asyncio
+        import httpx
+
+        from bot.services.woocommerce_direct import _resolve_categories
+        from bot.services.woo_client import Audit
+
+        parent = "قاب و کاور گوشی و تبلت"
+        catalog = {
+            parent: [{"id": 1, "name": parent, "parent": 0}],
+            "آیفون iphone": [{"id": 2, "name": "آیفون iphone", "parent": 1}],
+            "سامسونگ samsung": [{"id": 3, "name": "سامسونگ samsung", "parent": 1}],
+        }
+
+        class Client:
+            def __init__(self) -> None:
+                self.searched: list[str] = []
+
+            async def get(self, _url, *, params):
+                name = str(params["search"])
+                self.searched.append(name)
+                return httpx.Response(200, json=catalog.get(name, []))
+
+        client = Client()
+        result = asyncio.run(_resolve_categories(
+            client,
+            "https://shop.example/wp-json/wc/v3/products",
+            [f"{parent} > آیفون iphone", f"{parent} > سامسونگ samsung"],
+            Audit(),
+        ))
+        self.assertEqual([parent, "آیفون iphone", "سامسونگ samsung"], client.searched)
+        self.assertEqual([{"id": 1}, {"id": 2}, {"id": 3}], result)
+
+
+@needs_flow
+class TestProductPreview(unittest.TestCase):
+    """پیش‌نمایش فقط فیلدهای اصلی را با مدل کامل و دسته‌بندی درختی نشان می‌دهد."""
 
     def _preview(self, data: ProductData) -> str:
         from bot.modules import product_flow as PF
@@ -437,31 +473,58 @@ class TestPreviewSaysTheScope(unittest.TestCase):
         session = PF.ProductSession(data=data, chat_id=9)
         return PF._preview(session)
 
-    def test_variable_scope_is_stated(self) -> None:
+    def test_preview_uses_the_requested_essential_fields(self) -> None:
         text = self._preview(_draft())
-        self.assertIn("موجودی:</b> 20 عدد", text)
-        self.assertIn("روی هر 4 واریژن", text)
-        self.assertIn("قیمت ویژه:", text)
+        self.assertIn("<b>عنوان:</b> قاب گوشی اپل", text)
+        self.assertIn("<b>قیمت:</b> 100,000 تومان", text)
+        self.assertIn("<b>شناسه:</b> IP15", text)
+        self.assertIn("<b>مدل:</b> iPhone 15 | S24 Ultra", text)
+        self.assertIn("<b>رنگ:</b> مشکی | سفید", text)
+        self.assertIn("<b>نوع محصول:</b> متغیر", text)
+        self.assertIn("<b>موجودی:</b> 20 عدد", text)
+        self.assertIn("<b>قیمت ویژه:</b> 49,000 تومان", text)
+        self.assertNotIn("واریژن", text)
 
-    def test_simple_product_says_it_lands_on_the_product(self) -> None:
+    def test_empty_stock_and_sale_are_omitted(self) -> None:
+        text = self._preview(_draft(stock=None, sale_price=0, stock_status=""))
+        self.assertNotIn("موجودی:", text)
+        self.assertNotIn("قیمت ویژه:", text)
+
+    def test_out_of_stock_status_is_kept(self) -> None:
+        text = self._preview(_draft(stock=None, stock_status="outofstock", sale_price=0))
+        self.assertIn("<b>موجودی:</b> ناموجود", text)
+
+    def test_simple_product_says_simple(self) -> None:
         text = self._preview(_draft(models=[], attributes={}))
-        self.assertIn("روی خود محصول", text)
+        self.assertIn("<b>نوع محصول:</b> ساده", text)
 
-    def test_out_of_stock_without_a_number_is_still_shown(self) -> None:
-        text = self._preview(_draft(stock=None, stock_status="outofstock"))
-        self.assertIn("ناموجود", text)
+    def test_model_list_is_not_truncated(self) -> None:
+        models = [f"iPhone {index}" for index in range(36)]
+        text = self._preview(_draft(models=models, attributes={"رنگ": ["مشکی", "سفید"]}))
+        self.assertIn("iPhone 35", text)
+        self.assertNotIn("… +", text)
 
-    def test_silence_shows_nothing(self) -> None:
-        text = self._preview(_draft(stock=None, sale_price=0))
-        self.assertNotIn("موجودی", text)
-        self.assertNotIn("قیمت ویژه", text)
+    def test_categories_are_nested_and_parent_is_not_repeated(self) -> None:
+        parent = "قاب و کاور گوشی و تبلت"
+        text = self._preview(_draft(categories=[
+            f"{parent} > آیفون iphone",
+            f"{parent} > سامسونگ samsung",
+            "چاپی",
+        ]))
+        self.assertEqual(1, text.count(parent))
+        self.assertIn(f"- {parent}", text)
+        self.assertIn("  - آیفون iphone", text)
+        self.assertIn("  - سامسونگ samsung", text)
+        self.assertIn("  - چاپی", text)
 
-    def test_preview_does_not_repeat_models_in_attributes(self) -> None:
-        """لیست مدل‌ها فقط یک‌بار می‌آید و زیر ویژگی‌ها تکرار نمی‌شود."""
-        text = self._preview(_draft(models=["iPhone 13", "iPhone 14"], attributes={"رنگ": ["مشکی", "سفید"]}))
-        self.assertIn("<b>مدل‌ها (2):</b> iPhone 13 | iPhone 14", text)
-        self.assertNotIn("<b>ویژگی‌ها:</b>\n<b>مدل:</b>", text)
-        self.assertIn("<b>ویژگی‌ها:</b>\n<b>رنگ:</b> مشکی | سفید", text)
+    def test_nonessential_parser_notes_do_not_clutter_preview(self) -> None:
+        data = _draft(
+            models=["iPhone 13"],
+            notes=["برند «PROMAX» در کاتالوگ ربات نیست؛ ممکن است مدلی از جا بماند"],
+        )
+        text = self._preview(data)
+        self.assertNotIn("PROMAX", text)
+        self.assertNotIn("حدسی", text)
 
 
 @needs_flow

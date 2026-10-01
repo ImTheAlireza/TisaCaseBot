@@ -110,6 +110,15 @@ class TestLedger(LedgerTestCase):
     def test_find_unknown_key_is_none(self):
         self.assertIsNone(products_ledger.find("no-such-key"))
 
+    def test_queued_summary_shows_only_the_short_error_type(self):
+        entry = products_ledger.record(
+            user_id=7, status="queued", title="قاب",
+            error="ReadTimeout: پاسخ فروشگاه نرسید؛ ممکن است درخواست اعمال شده باشد",
+        )
+        text = products_ledger.summary(entry)
+        self.assertIn("ReadTimeout", text)
+        self.assertNotIn("پاسخ فروشگاه", text)
+
 
 @needs_flow
 class TestResultCard(LedgerTestCase):
@@ -123,7 +132,7 @@ class TestResultCard(LedgerTestCase):
         text = result_card(entry)
         for needle in ("4321", "https://shop/wp-admin", "79 واریژن", "698,000", "BO147"):
             self.assertIn(needle, text, needle)
-        self.assertIn("انتشار نهایی", text)
+        self.assertIn("پیش‌نویس ساخته شد", text)
 
     def test_failed_card_shows_the_error_not_a_green_tick(self):
         entry = self._entry(status="failed", error="HTTP 401: unauthorized")
@@ -131,6 +140,14 @@ class TestResultCard(LedgerTestCase):
         self.assertIn("ساخت ناموفق", text)
         self.assertIn("HTTP 401", text)
         self.assertNotIn("4321", text)
+
+    def test_queued_card_is_short_but_keeps_the_error_type(self):
+        entry = self._entry(status="queued", error="ReadTimeout: server did not answer")
+        text = result_card(entry)
+        self.assertIn("تلاش مجدد خودکار", text)
+        self.assertIn("ReadTimeout", text)
+        self.assertNotIn("server did not answer", text)
+        self.assertNotIn("24 ساعت", text)
 
     def test_zip_card_offers_the_next_product(self):
         entry = self._entry(status="zip")
@@ -195,14 +212,26 @@ class TestProductTools(LedgerTestCase):
         asyncio.run(PT.cb_recent(update, SimpleNamespace()))
         self.assertIn("ساخته نشده", sent[0][1])
 
-    def test_open_replays_the_stored_preview(self):
+    def test_open_shows_a_short_summary_and_keeps_preview_optional(self):
         products_ledger.record(user_id=7, title="قاب", product_id=11,
                                report="<b>پیش‌نمایش</b> قیمت: 698,000")
         entry = products_ledger.recent(1)[0]
         update, sent = self._query(f"products:open:{entry['key']}")
         asyncio.run(PT.cb_open(update, SimpleNamespace()))
-        self.assertIn("پیش‌نمایش", sent[0][1])
+        self.assertNotIn("پیش‌نمایش</b>", sent[0][1], "detail is hidden unless requested")
         self.assertEqual(sent[0][0], "reply", "the history list must stay on screen")
+        buttons = [b.callback_data for row in sent[0][2]["reply_markup"].inline_keyboard for b in row]
+        self.assertIn(f"products:report:{entry['key']}", buttons)
+
+    def test_approved_preview_is_available_on_demand(self):
+        products_ledger.record(user_id=7, title="قاب", report="<b>پیش‌نمایش</b> قیمت: 698,000")
+        entry = products_ledger.recent(1)[0]
+        update, sent = self._query(f"products:report:{entry['key']}")
+        asyncio.run(PT.cb_report(update, SimpleNamespace()))
+        self.assertIn("پیش‌نمایش", sent[0][1])
+        self.assertIn(f"products:summary:{entry['key']}", [
+            b.callback_data for row in sent[0][2]["reply_markup"].inline_keyboard for b in row
+        ])
 
     def test_open_with_a_lost_key_is_polite(self):
         update, sent = self._query("products:open:999999")
@@ -275,8 +304,8 @@ class TestProductTools(LedgerTestCase):
     def test_long_history_report_degrades_to_plain_text(self):
         products_ledger.record(user_id=7, title="قاب", product_id=1, report="<b>" + "ب" * 9000 + "</b>")
         entry = products_ledger.recent(1)[0]
-        update, sent = self._query(f"products:open:{entry['key']}")
-        asyncio.run(PT.cb_open(update, SimpleNamespace()))
+        update, sent = self._query(f"products:report:{entry['key']}")
+        asyncio.run(PT.cb_report(update, SimpleNamespace()))
         _kind, text, kwargs = sent[0]
         self.assertNotIn("parse_mode", kwargs)
         self.assertNotIn("<", text[-200:], "no dangling tag may reach Telegram")
@@ -374,6 +403,26 @@ class TestLedgerRecordsPublishes(LedgerTestCase):
                                  error="HTTP 500: boom")
         self.assertEqual(entry["status"], "failed")
         self.assertIn("boom", products_ledger.summary(entry))
+
+
+@needs_flow
+class TestPublishAuditSummary(unittest.TestCase):
+    def test_failed_http_request_and_media_context_survive_condensing(self):
+        from bot.modules.product_flow import _audit_for_chat
+
+        lines = [
+            "[config] تعداد تصاویر: 7",
+            "[media:start] آپلود 03_آبی.jpg؛ حجم 123,456 بایت",
+            "[http:start] #4 POST /wp-json/wp/v2/media (تلاش 1/1؛ مهلت هر فاز=45s)",
+            "[media:error] آپلود 03_آبی.jpg (123,456 بایت): ReadTimeout: timeout",
+            "[http:error] #4 POST /wp-json/wp/v2/media پس از 45,000 ms: ReadTimeout: timeout",
+            "[attempt 1] POST محصول پاسخ داد HTTP 400",
+        ]
+        summary = _audit_for_chat(lines)
+        self.assertIn("03_آبی.jpg", summary)
+        self.assertIn("123,456 بایت", summary)
+        self.assertIn("#4 POST /wp-json/wp/v2/media", summary)
+        self.assertIn("45,000 ms", summary)
 
 
 if __name__ == "__main__":

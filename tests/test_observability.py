@@ -64,6 +64,22 @@ class TestMetrics(unittest.TestCase):
             m.incr("products_created", by=2)
             self.assertEqual(m.snapshot()["products_created"][0], 3)
 
+    def test_schema_and_wal_are_initialized_once_per_database_file(self):
+        from unittest import mock
+
+        with h.temp_metrics() as m, mock.patch.object(m, "_initialize", wraps=m._initialize) as initialize:
+            m.incr("products_created")
+            m.incr("products_created")
+            m.snapshot()
+            self.assertEqual(1, initialize.call_count)
+
+    def test_schema_is_recreated_if_the_database_file_is_removed(self):
+        with h.temp_metrics() as m:
+            m.incr("products_created")
+            m.DB_PATH.unlink()
+            m.incr("products_created")
+            self.assertEqual(1, m.snapshot()["products_created"][0])
+
     def test_a_key_nobody_declared_is_dropped_not_written(self):
         with h.temp_metrics() as m:
             m.incr("typo_in_a_caller")
@@ -206,6 +222,25 @@ class TestProductJournal(unittest.TestCase):
         self.assertIn("⚠️ 1 هشدار", card)
         self.assertIn("قیمت از سقف رد شد", card)
 
+    def test_every_product_card_contains_compact_http_and_ai_diagnostics(self):
+        journal = Journal()
+        journal.line(
+            "[http:done] #1 GET /wp-json/wc/v3/products → HTTP 200 در 120 ms"
+        )
+        journal.line(
+            "[http:done] #2 POST /wp-json/wc/v3/products → HTTP 201 در 80 ms"
+        )
+        journal.line("[retry] #3 درخواست پس از 1s تکرار شد")
+        journal.line("[ai:summary] استخراج محصول: 2 درخواست، 900 ms")
+        journal.line("[ai:diagnostic] نرمال‌سازی مدل: خطای ReadTimeout؛ پارسر قطعی حفظ شد")
+        journal.line("[http:error] #4 GET /wp-json/wc/v3/categories پس از 500 ms: ConnectError")
+        card = journal.card("created")
+        self.assertIn("HTTP: 2 درخواست؛ جمع پاسخ‌ها 200 ms", card)
+        self.assertIn("تلاش مجدد شبکه: 1", card)
+        self.assertIn("استخراج محصول: 2 درخواست، 900 ms", card)
+        self.assertIn("خطای ReadTimeout", card)
+        self.assertIn("[http:error] #4", card)
+
     def test_a_fact_the_flow_never_reached_reads_as_a_dash_not_zero(self):
         journal = Journal()
         journal.line("یک خط trace")
@@ -256,13 +291,16 @@ class TestProductJournal(unittest.TestCase):
         self.assertIn("❌ منتشر نشد", context.bot.messages[0]["text"])
         self.assertIn("جزئیات ۱", context.bot.messages[1]["text"])
 
-    def test_without_a_log_chat_the_flow_keeps_recording_without_complaining(self):
+    def test_without_a_log_chat_the_flow_keeps_recording_and_warns(self):
         context = h.context()
-        with h.patched_settings(h.settings_with(log_chat_id=None)):
+        with h.patched_settings(h.settings_with(log_chat_id=None)), self.assertLogs(
+            "bot.services.product_journal", level="WARNING"
+        ) as logs:
             journal = product_journal.journal_for(context)
             journal.line("چیزی که فقط در logs/bot.log می‌ماند")
             self.assertIsNotNone(run(product_journal.flush(context, status="dry")))
         self.assertEqual(context.bot.messages, [])
+        self.assertIn("LOG_CHAT_ID is empty", " ".join(logs.output))
 
     def test_a_context_without_chat_data_is_not_an_error(self):
         # جریان‌هایی که chat_data ندارند (هندلرِ تنها، تستِ جدا) نباید بترکند.

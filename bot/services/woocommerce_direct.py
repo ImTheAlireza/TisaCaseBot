@@ -30,6 +30,7 @@ from bot.services.woo_client import (
     WooCommerceAPIError,
     body_snippet,
     check,
+    describe_exception,
     error_message,
     media_base,
     products_base,
@@ -130,18 +131,24 @@ async def _upload_media(client: WooClient, path: Path, audit: Sink) -> int:
     # Sending the raw name used to raise UnicodeEncodeError inside publish — for a document
     # called «قاب‌مشکی.jpg» that meant a red card with nothing wrong in the product.
     ascii_name = path.name.encode("ascii", "ignore").decode().strip() or "image.jpg"
-    response = await client.post(
-        media_base(),
-        content=path.read_bytes(),
-        basic=True,
-        headers={
-            "Content-Type": "image/jpeg",
-            "Content-Disposition": (
-                f'attachment; filename="{ascii_name}"; '
-                f"filename*=UTF-8''{quote(path.name)}"
-            ),
-        },
-    )
+    image_bytes = path.read_bytes()
+    audit.log(f"[media:start] آپلود {path.name}؛ حجم {len(image_bytes):,} بایت")
+    try:
+        response = await client.post(
+            media_base(),
+            content=image_bytes,
+            basic=True,
+            headers={
+                "Content-Type": "image/jpeg",
+                "Content-Disposition": (
+                    f'attachment; filename="{ascii_name}"; '
+                    f"filename*=UTF-8''{quote(path.name)}"
+                ),
+            },
+        )
+    except httpx.TransportError as exc:
+        audit.log(f"[media:error] آپلود {path.name} ({len(image_bytes):,} بایت): {describe_exception(exc)}")
+        raise
     if not response.is_success:
         audit.log(f"[media] آپلود {path.name} ناموفق: HTTP {response.status_code}: {error_message(response)} | body={body_snippet(response)}")
     check(response)
@@ -361,10 +368,20 @@ async def _create_variations_individually(
 
     async def one(payload: dict[str, Any]) -> None:
         async with semaphore:
-            response = await client.post(
-                f"{base}/{product_id}/variations",
-                json=payload
-            )
+            combination = " / ".join(
+                f"{item.get('name')}={item.get('option')}"
+                for item in payload.get("attributes", [])
+                if isinstance(item, dict)
+            ) or "ترکیب نامشخص"
+            audit.log(f"[variation:start] محصول {product_id}؛ {combination}")
+            try:
+                response = await client.post(
+                    f"{base}/{product_id}/variations",
+                    json=payload
+                )
+            except httpx.TransportError as exc:
+                audit.log(f"[variation:error] محصول {product_id}؛ {combination}: {describe_exception(exc)}")
+                raise
             if not response.is_success:
                 audit.log(
                     f"[variation] ساخت variation ناموفق: HTTP {response.status_code}: "
@@ -546,8 +563,13 @@ async def _create_variations(
     endpoint = f"{base}/{product_id}/variations/batch"
     created = 0
     failed = 0
+    total_chunks = (len(payloads) + 99) // 100
     for start in range(0, len(payloads), 100):
         chunk = payloads[start:start + 100]
+        audit.log(
+            f"[variation:batch] محصول {product_id}؛ بسته {start // 100 + 1}/{total_chunks}؛ "
+            f"{len(chunk)} واریژن (از ردیف {start + 1} تا {start + len(chunk)})"
+        )
         response = await client.post(
             endpoint,
             json={"create": chunk}
@@ -593,14 +615,27 @@ async def _rollback(
 async def _resolve_categories(client: WooClient, base: str, categories: list[str], audit: Sink) -> list[dict[str, int]]:
     endpoint = f"{base}/categories"
     category_ids: list[dict[str, int]] = []
+    seen_ids: set[int] = set()
+    # Multiple selected branches usually share their root (e.g. phone-brand
+    # children). Cache by parent + case-folded name within this publish so each
+    # common ancestor costs one WooCommerce round trip, without stale cross-run IDs.
+    resolved: dict[tuple[int, str], int | None] = {}
     for raw_path in categories:
         parts = [part.strip() for part in str(raw_path).replace("&gt;", ">").split(">") if part.strip()]
         parent_id = 0
         for part in parts:
-            response = await client.get(
-                endpoint,
-                params={"search": part, "per_page": 100}
-            )
+            cache_key = (parent_id, part.casefold())
+            if cache_key in resolved:
+                category_id = resolved[cache_key]
+                if category_id is None:
+                    continue
+                if category_id not in seen_ids:
+                    category_ids.append({"id": category_id})
+                    seen_ids.add(category_id)
+                parent_id = category_id
+                continue
+
+            response = await client.get(endpoint, params={"search": part, "per_page": 100})
             if not response.is_success:
                 audit.log(f"[cat] جستجوی دستهٔ «{part}» ناموفق: HTTP {response.status_code}")
                 continue
@@ -609,10 +644,13 @@ async def _resolve_categories(client: WooClient, base: str, categories: list[str
             exact = exact or (matches[0] if matches else None)
             if exact:
                 category_id = int(exact["id"])
-                if not any(item["id"] == category_id for item in category_ids):
+                resolved[cache_key] = category_id
+                if category_id not in seen_ids:
                     category_ids.append({"id": category_id})
+                    seen_ids.add(category_id)
                 parent_id = category_id
             else:
+                resolved[cache_key] = None
                 audit.log(f"[cat] دستهٔ «{part}» در فروشگاه پیدا نشد؛ نادیده گرفته شد.")
     audit.log(f"[cat] دسته‌های نهایی: {[c['id'] for c in category_ids] if category_ids else '(هیچ)'}")
     return category_ids
@@ -807,7 +845,7 @@ async def create_draft(
                         "پیش‌نویسِ نیمه‌کاره در وردپرس باقی می‌ماند."
                     )
                     raise
-                audit.log(f"[rollback] ساخت واریژن ناموفق بود ({type(exc).__name__}: {exc})؛ محصول در حال حذف است.")
+                audit.log(f"[rollback] ساخت واریژن ناموفق بود ({describe_exception(exc)})؛ محصول در حال حذف است.")
                 await _rollback(client, base, product_id, media_ids, audit)
                 raise
             if plan.dropped:
@@ -835,6 +873,12 @@ async def create_draft(
         if not exc.diagnostics:
             exc.diagnostics = audit.lines
         raise
-    except Exception:
+    except Exception as exc:
+        # Preserve the successful steps and the final HTTP path on transport failures too.
+        # Otherwise the user sees an empty ``ReadTimeout:`` despite a useful audit trail.
+        try:
+            exc.diagnostics = audit.lines  # type: ignore[attr-defined]
+        except Exception:
+            pass
         logger.exception("create_draft failed unexpectedly")
         raise

@@ -7,12 +7,13 @@ import re
 import time
 from dataclasses import asdict, dataclass, field
 from typing import Any
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 import httpx
 
 from bot.config import settings
 from bot.services import learning, metrics, model_catalog, money, phone_parser
+from bot.services.ai_normalizer import ai_client_session
 from bot.services.postmodel import (
     Block,
     classify_line,
@@ -20,6 +21,7 @@ from bot.services.postmodel import (
     parse_sources,
 )
 from bot.services import postmodel as ev
+from bot.services.category_taxonomy import apply_sku_category_policy
 from bot.services.color_matrix import (
     color_key,
     confirmed_colors,
@@ -87,7 +89,7 @@ The phone models are supplied separately and must not be put in attributes.
 attributes must be an object whose keys are Persian attribute names such as رنگ, طرح, جنس and whose values are arrays of distinct strings. Only create an attribute when it has at least TWO selectable values. A single value such as «زرد» is part of the product title/name, not an attribute. Words that describe the product name (for example «قاب پلومریا زرد») must stay in title and must not become attributes.
 When the text lists colors per phone model (for example «17promax: سفید/مشکی/نارنجی» or «S25ultra (فقط سفید)» or a section scope such as «xiaomi (فقط سفید)»), the رنگ attribute must still contain EVERY color mentioned anywhere in the text — never only the colors of one model. The per-model limits belong in model_colors instead.
 model_colors is an optional object mapping each phone model (use the exact label from PHONE MODELS) to the array of colors available for THAT model only. Fill it only for models whose colors the text states explicitly, and never invent a color that is not written in the text. Omit any model without an explicit color list.
-Do not put product descriptions in the result. Do not guess categories from the product type or appearance: only return categories explicitly supported by the messages, plus the unavoidable phone-brand path inferred from detected models. Never choose چاپی unless the text explicitly says چاپ/چاپی/پرینت. categories must contain only exact paths from the supplied taxonomy, and never choose فروش ویژه, 💥 بلک فرایدی, or محصولات عمده.
+Do not put product descriptions in the result. Do not guess categories from product appearance: only return categories supported by the messages, plus the unavoidable phone-brand path inferred from detected models. The «چاپی» category is controlled ONLY by the product SKU prefix: include it if and only if sku_prefix is CH or SB (case-insensitive; a generated numeric suffix is allowed). Never include «چاپی» for other SKU prefixes, even when the caption says چاپ، چاپی، پرینت, or «چاپ IMD»; those words may describe the design and are not category evidence. For CH/SB, include «چاپی» even if the caption only describes the print indirectly. categories must contain only exact paths from the supplied taxonomy, and never choose فروش ویژه, 💥 بلک فرایدی, or محصولات عمده.
 The input has two labeled sources. PRODUCT INFO is the authoritative source for title, SKU, price and explicit attributes. Use CAPTION for those fields only when PRODUCT INFO does not contain them. Models may be merged from both sources. Never let a model number override an explicit price from either source.
 """
 
@@ -693,6 +695,9 @@ async def extract_product(
     caption: str = "",
     info_text: str = "",
     color_suppressed: set[str] | None = None,
+    *,
+    client: httpx.AsyncClient | None = None,
+    diagnostic: Callable[[str], None] | None = None,
 ) -> ProductData:
     # Keep one AI request, but preserve provenance. The deterministic parser
     # receives PRODUCT INFO first so its title/SKU/price precedence is stable.
@@ -715,6 +720,7 @@ async def extract_product(
     # shop with no AI configured still honors what the owner taught the bot.
     _apply_learned_terms(fallback, source_for_fallback)
     if not (settings.ai_base_url and settings.ai_token and settings.ai_model):
+        fallback.categories = apply_sku_category_policy(fallback.categories, fallback.sku_prefix)
         _add_catalog_warnings(fallback, source_for_fallback)
         _attach_suggestions(fallback, source_for_fallback)
         return fallback
@@ -752,11 +758,22 @@ async def extract_product(
     metrics.incr("ai_calls")
     started = time.perf_counter()
     try:
-        async with httpx.AsyncClient(timeout=settings.ai_timeout_seconds) as client:
-            response = await client.post(_endpoint(), headers={"Authorization": f"Bearer {settings.ai_token}"}, json=payload)
-            response.raise_for_status()
-            metrics.observe("ai_latency_ms", metrics.elapsed(started))
-            content = response.json()["choices"][0]["message"]["content"]
+        if client is None:
+            async with ai_client_session(timeout=settings.ai_timeout_seconds) as owned_client:
+                response = await owned_client.post(
+                    _endpoint(),
+                    headers={"Authorization": f"Bearer {settings.ai_token}"},
+                    json=payload,
+                )
+        else:
+            response = await client.post(
+                _endpoint(),
+                headers={"Authorization": f"Bearer {settings.ai_token}"},
+                json=payload,
+            )
+        response.raise_for_status()
+        metrics.observe("ai_latency_ms", metrics.elapsed(started))
+        content = response.json()["choices"][0]["message"]["content"]
         obj = _json_object(content)
         attrs = _dict_field(obj, "attributes")
         clean_attrs = {
@@ -786,7 +803,11 @@ async def extract_product(
                 prices[group] = parsed
         if not prices:
             prices = fallback.prices
-        categories = _list_field(obj, "categories")
+        ai_categories = [str(category) for category in _list_field(obj, "categories")]
+        final_sku_prefix = re.sub(
+            r"[^A-Za-z0-9]", "", str(fallback.sku_prefix or obj.get("sku_prefix") or "")
+        ).upper()
+        categories = apply_sku_category_policy(ai_categories, final_sku_prefix)
         ai_price = int(_digits(str(obj.get("price") or 0)).replace(",", "") or 0)
         # A bare amount such as `768t` is deterministic and must win over an
         # AI hallucination based on a model number (for example iPhone 17).
@@ -827,8 +848,8 @@ async def extract_product(
             for name, values in clean_attrs.items():
                 ev.merge(evidence, name if name in ev.PREVIEW_FIELDS else "colors",
                          ev.AI, quote="، ".join(values[:4]), overwrite=True)
-        if [str(x) for x in categories] and not fallback.categories:
-            ev.merge(evidence, "category", ev.AI, quote="، ".join(str(x) for x in categories)[:60], overwrite=True)
+        if ai_categories and not fallback.categories:
+            ev.merge(evidence, "category", ev.AI, quote="، ".join(ai_categories)[:60], overwrite=True)
         if str(obj.get("description") or "").strip():
             ev.merge(evidence, "description", ev.AI, quote="نوشتهٔ هوش مصنوعی", overwrite=True)
         # Stock and the sale price: the deterministic reading of the text wins, exactly
@@ -841,10 +862,10 @@ async def extract_product(
             stock=stock_sale["stock"],
             stock_status=stock_sale["stock_status"],
             sale_price=stock_sale["sale_price"],
-            sku_prefix=re.sub(r"[^A-Za-z0-9]", "", str(obj.get("sku_prefix") or fallback.sku_prefix)).upper(),
+            sku_prefix=final_sku_prefix,
             models=models,
             attributes=clean_attrs,
-            categories=[str(x) for x in categories],
+            categories=categories,
             model_colors=model_colors,
             evidence=evidence,
             notes=notes,
@@ -855,8 +876,14 @@ async def extract_product(
         # catalog) is a note for the owner, not a silent correction.
         result.warnings = [str(x).strip() for x in _list_field(obj, "warnings") if str(x).strip()]
         result.notes.extend(f"هوش مصنوعی گزارش داد: {text}" for text in result.warnings)
+        if diagnostic is not None:
+            diagnostic("استخراج جزئیات: پاسخ AI پردازش شد")
         return _apply_learned_terms(result, source_for_fallback)
     except Exception as exc:
+        if diagnostic is not None:
+            diagnostic(
+                f"استخراج جزئیات: خطای {type(exc).__name__}؛ از متن و پارسر قطعی استفاده شد"
+            )
         # Silent failure used to look like «the bot misread me»; say what
         # happened in the log and in the preview so the user knows the text was
         # read without the model's help.

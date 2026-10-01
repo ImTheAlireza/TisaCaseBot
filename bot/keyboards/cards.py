@@ -9,18 +9,11 @@ facts and the history view works after a restart.
 from __future__ import annotations
 
 import html
+import re
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from bot.constants import CB
-
-
-def _queue_limits() -> tuple[int, int]:
-    """The retry promise, read from the queue itself, never retyped (a card that overstates
-    its own promise is worse than one that says nothing)."""
-    from bot.services import outbox
-
-    return outbox.REMAINING_TRIES_AFTER_FIRST, round(outbox.MAX_AGE_SECONDS / 3600)
 
 
 def price_line(entry: dict[str, object]) -> str:
@@ -35,31 +28,29 @@ def result_card(entry: dict[str, object]) -> str:
     title = html.escape(str(entry.get("title") or "—"), quote=False)
     lines: list[str] = []
     if status == "dry":
-        lines.append("🧪 <b>پیش‌نمایش انتشار (dry-run)</b>")
-        lines.append("✅ همه‌مسیر اجرا شد و هیچ خطایی نگرفت؛ ولی <b>هیچ چیزی در سایت ساخته نشد</b>.")
+        lines.append("🧪 تست موفق؛ هیچ محصولی در سایت ساخته نشد.")
     elif status == "failed":
-        lines.append("🎯 <b>ساخت ناموفق بود</b>")
-        lines.append(f"⚠️ {html.escape(str(entry.get('error') or ''), quote=False)}")
-    elif status == "queued":
-        lines.append("🐇 <b>در صف تلاش مجدد</b>")
-        tries, hours = _queue_limits()
-        lines.append("✅ داده‌ها ذخیره شد؛ سایت جواب نمی‌داد، پس ربات خودش دوباره تلاش می‌کند "
-                     f"({tries} بار دیگر، تا {hours} ساعت) و نتیجه را همین‌جا می‌گوید.")
-        error = str(entry.get("error") or "")
+        lines.append("❌ <b>ساخت ناموفق بود</b>")
+        error = re.sub(r"\s+", " ", str(entry.get("error") or "").strip())
+        if len(error) > 160:
+            error = error[:159] + "…"
         if error:
             lines.append(f"⚠️ {html.escape(error, quote=False)}")
+    elif status == "queued":
+        lines.append("🐇 <b>در صف تلاش مجدد</b>")
+        lines.append("✅ ذخیره شد؛ تلاش مجدد خودکار.")
+        error = str(entry.get("error") or "").strip()
+        if error:
+            lines.append(f"⚠️ {html.escape(error.partition(':')[0], quote=False)}")
     elif status == "restocked":
-        lines.append("🔄 <b>شارژ محصول موجود</b>")
-        lines.append("✅ مقدارها در فروشگاه نوشته شد و فروشگاه همان را برگرداند.")
+        lines.append("🔄 <b>شارژ موجودی به‌روز شد.</b>")
     elif status == "zip":
-        lines.append("🎯 <b>فایل ZIP آماده شد</b>")
-        lines.append("📤 این فایل را در افزونه وردپرس آپلود کن؛ محصول پس از آپلود ساخته می‌شود.")
+        lines.append("📦 <b>فایل آمادهٔ آپلود است.</b>")
     else:
-        lines.append("🎯 <b>پیش‌نویس ساخته شد</b>")
-        lines.append(f"🆔 id: <code>{html.escape(str(entry.get('product_id')), quote=False)}</code> · پیش‌نویس")
+        lines.append("✅ <b>پیش‌نویس ساخته شد</b>")
+        lines.append(f"🆔 #{html.escape(str(entry.get('product_id')), quote=False)}")
         if entry.get("edit_url"):
             lines.append(f"🔗 {html.escape(str(entry.get('edit_url')), quote=False)}")
-        lines.append("🌐 انتشار نهایی فقط از داخل سایت انجام می‌شود.")
     lines.append("")
     lines.append(f"عنوان: {title}")
     lines.append(

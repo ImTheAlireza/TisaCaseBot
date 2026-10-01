@@ -18,6 +18,7 @@ import logging
 import sqlite3
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -31,6 +32,8 @@ DB_PATH = data_dir() / "metrics.sqlite3"
 #: هشدارِ مشابه می‌افزاید و لاگِ مفید زیر سر‌وصدا گم می‌شود.
 _warned = False
 _lock = threading.Lock()
+_schema_lock = threading.Lock()
+_initialized: dict[Path, tuple[int, int]] = {}
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS counters (
@@ -78,6 +81,11 @@ COUNTERS: dict[str, Counter] = {
         Counter("buttons_denied", "دکمه بدون دسترسی", hint="کسی دکمه‌ای را زده که حقش نبوده (یا منوی کهنه داشته)."),
         Counter("tracking_converted", "فایل ردیابی تبدیل‌شده"),
         Counter("tracking_review_rows", "ردیفِ نیازمندِ بازبینی (فایل‌های ردیابی)"),
+        Counter("compress_batches", "دستهٔ عکس‌های فشرده‌شده"),
+        Counter("compress_images", "عکس فشرده و ارسال‌شده"),
+        Counter("compress_download_ms", "دریافت عکس", kind="ms"),
+        Counter("compress_cpu_ms", "فشرده‌سازی عکس", kind="ms"),
+        Counter("compress_upload_ms", "ارسال عکس", kind="ms"),
     )
 }
 
@@ -88,12 +96,45 @@ RATIOS: dict[str, tuple[str, str, str]] = {
 }
 
 
-def _connect() -> sqlite3.Connection:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(DB_PATH, timeout=5.0)
+def _initialize(connection: sqlite3.Connection) -> None:
+    """Configure a newly created/replaced database file once."""
     connection.execute("PRAGMA journal_mode=WAL")
-    connection.execute(_SCHEMA)
+    connection.executescript(_SCHEMA)
+
+
+def _connect() -> sqlite3.Connection:
+    path = Path(DB_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path, timeout=5.0)
+    try:
+        stat = path.stat()
+        identity = (stat.st_dev, stat.st_ino)
+        # WAL mode and the schema are properties of this database file, not each
+        # individual counter write. Running both on every metric introduced disk
+        # work and lock contention into otherwise tiny event-loop callbacks.
+        with _schema_lock:
+            if _initialized.get(path) != identity or stat.st_size == 0:
+                _initialize(connection)
+                stat = path.stat()
+                _initialized[path] = (stat.st_dev, stat.st_ino)
+    except Exception:
+        connection.close()
+        raise
     return connection
+
+
+@contextmanager
+def _db():
+    """Close the short-lived connection; sqlite3's native context only commits."""
+    connection = _connect()
+    try:
+        yield connection
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
 
 
 def _fail_once(exc: Exception) -> None:
@@ -109,7 +150,7 @@ def _write(key: str, *, by: int, value: float) -> None:
         logger.debug("metrics: unknown counter %r ignored", key)
         return
     try:
-        with _lock, _connect() as db:
+        with _lock, _db() as db:
             db.execute(
                 """
                 INSERT INTO counters(key, n, total, peak, updated) VALUES (?, ?, ?, ?, ?)
@@ -188,7 +229,7 @@ def snapshot() -> dict[str, tuple[int, float, float, float]]:
     if not DB_PATH.exists():
         return {}
     try:
-        with _connect() as db:
+        with _db() as db:
             rows = db.execute("SELECT key, n, total, peak, updated FROM counters").fetchall()
     except (sqlite3.Error, OSError) as exc:
         _fail_once(exc)
@@ -250,7 +291,7 @@ def probe() -> tuple[int, str]:
     if not DB_PATH.exists():
         return 0, ""
     try:
-        with _connect() as db:
+        with _db() as db:
             rows = db.execute("SELECT COUNT(*) FROM counters").fetchone()[0]
     except (sqlite3.Error, OSError) as exc:
         return 0, f"دیتابیس متریک‌ها باز نشد: {type(exc).__name__}: {exc}"

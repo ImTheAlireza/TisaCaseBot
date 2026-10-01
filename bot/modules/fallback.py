@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 
 from telegram import Update
+from telegram.error import NetworkError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -15,6 +16,9 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+
+from bot.services import product_journal
+from bot.utils.logging import redact
 
 logger = logging.getLogger(__name__)
 
@@ -43,13 +47,47 @@ async def doc_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Global error handler: log the exception, tell the user something broke."""
-    logger.exception("Unhandled exception while processing update: %s", update, exc_info=context.error)
-    if isinstance(update, Update) and update.effective_message:
+    """Log an unhandled error locally and to the configured audit chat."""
+    error = context.error
+    if update is None and context.job is None and isinstance(error, NetworkError):
+        # PTB reports transient getUpdates socket failures with no Update object.
+        # Polling reconnects automatically; sending each ReadError to the admin
+        # group turns an ordinary network blip into a stream of false alarms.
+        logger.warning("Transient Telegram polling network error; PTB will reconnect: %s", error)
+        return
+    exc_info = (type(error), error, error.__traceback__) if error is not None else None
+    logger.error("Unhandled exception while processing update", exc_info=exc_info)
+
+    callback = getattr(update, "callback_query", None)
+    user = getattr(update, "effective_user", None)
+    update_id = getattr(update, "update_id", "—")
+    details = [
+        "⚠️ خطای مدیریت‌نشدهٔ بات",
+        f"update_id={update_id}",
+        f"user_id={user.id if user else '—'}",
+    ]
+    if callback is not None:
+        details.append(f"callback={str(callback.data or '')[:120]}")
+    if error is not None:
+        message = redact(str(error).strip())[:500] or "(بدون پیام خطا)"
+        details.append(f"{type(error).__name__}: {message}")
+    reported = False
+    try:
+        reported = await product_journal.send_log_message(context.bot, "\n".join(details))
+    except Exception:
+        # Diagnostics must never stop the user-facing fallback.
+        logger.exception("Could not report an unhandled error to the log chat")
+
+    effective_message = getattr(update, "effective_message", None)
+    if effective_message:
+        notice = (
+            "⚠️ خطایی رخ داد و جزئیات برای بررسی ثبت شد. با /start دوباره تلاش کن."
+            if reported else "⚠️ خطایی رخ داد. با /start دوباره تلاش کن."
+        )
         try:
-            await update.effective_message.reply_text("⚠️ خطایی رخ داد. با /start دوباره تلاش کن.")
+            await effective_message.reply_text(notice)
         except Exception:
-            pass
+            logger.debug("Could not send the fallback error message", exc_info=True)
 
 
 def register(app: Application) -> None:

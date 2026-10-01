@@ -108,8 +108,15 @@ def main() -> None:
     app = build_application()
     # `drop_pending_updates=True` used to throw away everything the owner sent
     # while the bot was restarting (photos, order files) — with a restart button
-    # in the menu, that was data loss on a schedule.
-    app.run_polling(drop_pending_updates=False)
+    # in the menu, that was data loss on a schedule. Keep long polling's per-call
+    # timeouts aligned with the dedicated, longer-lived HTTPX request client.
+    app.run_polling(
+        drop_pending_updates=False,
+        connect_timeout=10.0,
+        read_timeout=40.0,
+        write_timeout=15.0,
+        pool_timeout=10.0,
+    )
 
 
 if __name__ == "__main__":

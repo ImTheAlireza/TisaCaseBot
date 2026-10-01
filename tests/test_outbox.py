@@ -94,6 +94,20 @@ class QueueTestCase(unittest.IsolatedAsyncioTestCase):
 
 @needs_flow
 class TestQueueStorage(QueueTestCase):
+    async def test_database_schema_is_not_reapplied_for_each_queue_operation(self) -> None:
+        from unittest.mock import patch
+
+        previous = outbox.DB_PATH
+        outbox.DB_PATH = self.tmp / "initialized-once.sqlite3"
+        try:
+            with patch.object(outbox, "_initialize", wraps=outbox._initialize) as initialize:
+                self.enqueue(batch="schema123schema")
+                outbox.due()
+                outbox.stats()
+            self.assertEqual(1, initialize.call_count)
+        finally:
+            outbox.DB_PATH = previous
+
     async def test_an_item_waits_for_its_backoff(self) -> None:
         moment = time.time()
         self.assertTrue(self.enqueue(delay=120, now=moment))
@@ -303,9 +317,8 @@ class TestQueueIsCreatedFromTheFlow(QueueTestCase):
         _result, seen, _context = await self._confirm()
         text = " ".join(str(item[1]) for item in seen)
         self.assertIn("🐇", text)
-        self.assertIn(f"{outbox.REMAINING_TRIES_AFTER_FIRST} بار دیگر", text,
-                      "قولِ تعداد تلاش باید از ثابتِ خودِ صف بیاید؛ و «بار دیگر»، چون "
-                      "تلاشی که همین حالا شکست خورد شمارده شده")
+        self.assertIn("تلاش مجدد", text)
+        self.assertNotIn(f"{outbox.REMAINING_TRIES_AFTER_FIRST} بار دیگر", text)
         self.assertNotIn("رها شد", text, "در لحظهٔ صف‌گذاری هنوز رها نشده")
 
 

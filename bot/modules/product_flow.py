@@ -16,6 +16,7 @@ import shutil
 import time
 import traceback
 import zipfile
+from contextlib import AsyncExitStack
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -45,8 +46,8 @@ from bot.services import (
     workspace,
 )
 from bot.services import postmodel as ev, product_journal
-from bot.services.ai_normalizer import ai_normalize
-from bot.services.category_taxonomy import FORBIDDEN, TAXONOMY
+from bot.services.ai_normalizer import ai_client_session, ai_normalize
+from bot.services.category_taxonomy import FORBIDDEN, TAXONOMY, apply_sku_category_policy
 from bot.services.color_matrix import (
     is_color_attribute,
     is_model_attribute,
@@ -64,6 +65,7 @@ from bot.services.product_extractor import (
     extract_accessory_models,
     extract_product,
 )
+from bot.services.woo_client import describe_exception
 from bot.services.woocommerce_direct import WooCommerceAPIError, create_draft, product_description
 
 # The flow is a small state machine (§4.2 of docs/CODE-REVIEW-AND-UPGRADE-PLAN.md):
@@ -105,6 +107,9 @@ class ProductSession:
     submitting: bool = False
     # Text fingerprint of the last extraction, to avoid a pointless AI rerun.
     last_extract_hash: str = ""
+    # During media intake, the captions are for models; expensive product-detail
+    # extraction can wait until PRODUCT INFO arrives.
+    defer_details: bool = False
     # Where the flow was started (chat + forum thread). Every proactive message
     # has to go back there; ``user.id`` was a private-chat assumption that breaks
     # in a topic chat.
@@ -133,6 +138,8 @@ class ProductSession:
     #: purpose. One-shot — it is cleared as soon as the gate is passed, so the next
     #: tap has to be asked again.
     force_publish: bool = False
+    # Sanitized AI outcomes collected during one extraction and drained to its log card.
+    ai_diagnostics: list[str] = field(default_factory=list)
 
 
 sessions: dict[int, ProductSession] = {}
@@ -217,6 +224,31 @@ def _audit_for_chat(lines: list[str]) -> str:
     parts.append(attempts[0])
     if len(attempts) > 2:
         parts.append(attempts[-1])
+
+    # Keep the HTTP timeline concise but never drop the exact failed request. This is
+    # especially useful when several image uploads or variations were in flight together.
+    stage_lines = [
+        line for line in lines
+        if line.startswith(("[media:start]", "[media:error]", "[variation:start]", "[variation:error]", "[variation:batch]"))
+    ]
+    if stage_lines:
+        parts.append("جزئیات رسانه/واریژن:")
+        recent_stages = stage_lines[-5:]
+        parts.extend(recent_stages)
+        parts.extend(
+            line for line in stage_lines
+            if line.startswith(("[media:error]", "[variation:error]")) and line not in recent_stages
+        )
+
+    http_lines = [line for line in lines if line.startswith(("[http:start]", "[http:done]", "[http:error]", "[retry]"))]
+    if http_lines:
+        parts.append("گزارش HTTP (آخرین درخواست‌ها):")
+        recent = http_lines[-6:]
+        parts.extend(recent)
+        parts.extend(
+            line for line in http_lines
+            if line.startswith("[http:error]") and line not in recent
+        )
 
     plugin = [line for line in sku_lines if "next-sku" in line]
     free = [line for line in sku_lines if "آزاد است" in line]
@@ -322,7 +354,7 @@ def _keyboard(session: ProductSession | None = None) -> InlineKeyboardMarkup:
             ])
         if _open_questions(session):
             rows.append([InlineKeyboardButton(
-                "✅ بله، این‌ها درست است", callback_data=CB.PRODUCT_CONFIRM_GUESSED
+                "✅ تأیید حدس‌ها", callback_data=CB.PRODUCT_CONFIRM_GUESSED
             )])
         rows.append([InlineKeyboardButton("✏️ اصلاح فیلد خاص", callback_data="product:edit"),
                      InlineKeyboardButton("➕ افزودن عکس یا متن", callback_data="product:addmore")])
@@ -355,8 +387,13 @@ def _fields_keyboard(session: ProductSession) -> InlineKeyboardMarkup:
         label, _, current = next(
             (row for row in draft_edits.editable_fields(session.data) if row[0] == key), (key, key, "")
         )
-        rows.append([InlineKeyboardButton(f"{label}: {_short(current)}", callback_data=f"product:field:{index}")])
-    rows.append([InlineKeyboardButton("📝 نوشتن متن آزاد (روش قبلی)", callback_data="product:edit:free")])
+        edit_button = InlineKeyboardButton(
+            f"✏️ {label}: {_short(current, 24)}", callback_data=f"product:field:{index}"
+        )
+        if (key == "colors" and current != "—") or key.startswith("attr:"):
+            rows.append([edit_button, InlineKeyboardButton("🗑 حذف", callback_data=f"product:field:delete:{index}")])
+        else:
+            rows.append([edit_button])
     rows.append([InlineKeyboardButton("↩️ بازگشت", callback_data="product:fields:back")])
     return InlineKeyboardMarkup(rows)
 
@@ -507,101 +544,92 @@ def _caption(messages: list[Message]) -> str:
     return "\n".join((m.caption or m.text or "") for m in sorted(messages, key=lambda x: x.message_id) if (m.caption or m.text))
 
 
-def _category_outline(categories: list[str]) -> list[str]:
-    """Render taxonomy paths as a nested Telegram-friendly bullet list."""
+def _append_model_caption(existing: str, incoming: str) -> str:
+    """Keep model text from earlier photo batches when another batch arrives."""
+    old = (existing or "").strip()
+    new = (incoming or "").strip()
+    if not new:
+        return old
+    if not old:
+        return new
+    if any(block.strip().casefold() == new.casefold() for block in old.split("\n\n")):
+        return old
+    return f"{old}\n\n{new}"
+
+
+def _category_tree_lines(categories: Sequence[str]) -> list[str]:
+    """Render category paths once as a compact parent/child tree."""
     tree: dict[str, dict] = {}
-    for raw_path in categories:
-        parts = [part.strip() for part in re.split(r"\s*(?:>|&gt;)\s*", html.unescape(raw_path)) if part.strip()]
+    visible = [str(category) for category in categories if str(category).strip() not in FORBIDDEN]
+    for raw_path in _canonical_category_paths(visible):
+        parts = [
+            html.unescape(part).strip()
+            for part in str(raw_path).replace("&gt;", ">").split(">")
+            if html.unescape(part).strip()
+        ]
         branch = tree
         for part in parts:
             branch = branch.setdefault(part, {})
 
     lines: list[str] = []
-    def walk(branch: dict[str, dict], depth: int = 0) -> None:
+
+    def append_branch(branch: dict[str, dict], depth: int = 0) -> None:
         for name, children in branch.items():
-            # Telegram HTML does not support the nbsp entity reliably and
-            # renders it as literal text. Use visible Unicode indentation.
-            indent = "　" * (depth * 2)
-            marker = "•" if depth == 0 else "◦"
-            lines.append(f"{indent}{marker} {html.escape(name)}")
-            walk(children, depth + 1)
-    walk(tree)
+            lines.append(f"{'  ' * depth}- {html.escape(name)}")
+            append_branch(children, depth + 1)
+
+    append_branch(tree)
     return lines
 
 
 def _preview(session: ProductSession) -> str:
-    """The review screen: what will be created, and everything we are unsure of.
-
-    The variation number comes from the very same
-    :class:`bot.services.plan.VariationPlan` the WooCommerce writer and the ZIP
-    manifest read, so «پیش‌نمایش = واقعیت» is structural instead of a coincidence
-    (it used to be a second, independent count that did not dedupe values).
-    """
+    """Show only the product's essential publish fields in a clean hierarchy."""
     data = session.data
     if data is None:
-        return "❌ هنوز چیزی برای استخراج نیست؛ عکس‌ها و متن اطلاعات محصول را بفرست."
+        return "❌ هنوز اطلاعات محصولی ندارم."
     plan = plan_from_dict(data.to_dict())
     data.variation_count = plan.count
 
-    lines = ["📦 <b>پیش‌نمایش محصول</b>", ""]
+    lines = ["📦 <b>پیش‌نمایش</b>"]
     if settings.woo_dry_run:
-        lines.append("🧪 <b>حالت آزمایشی (TISA_DRY_RUN) روشن است</b> — «تأیید و ساخت» هیچ محصولی در سایت نمی‌سازد.")
-    lines.append(f"<b>عنوان:</b> {html.escape(data.title) if data.title else '⚠️ <b>تشخیص داده نشد</b>'}")
+        lines.append("🧪 حالت آزمایشی")
+    title = html.escape(data.title) if data.title else "—"
+    lines.append(f"<b>عنوان:</b> {title}")
 
     if data.prices:
-        price_text = " | ".join(f"{group}: {value:,} تومان" for group, value in data.prices.items())
+        price_parts = [f"{html.escape(str(group))}: {value:,} تومان" for group, value in data.prices.items()]
         if data.price:
-            price_text += f" <i>(پایه: {data.price:,})</i>"
-    elif data.price:
-        price_text = f"{data.price:,} تومان"
+            price_parts.append(f"پایه: {data.price:,} تومان")
+        price_text = " | ".join(price_parts)
     else:
-        price_text = "تغییری ندارد / دریافت نشده"
+        price_text = f"{data.price:,} تومان" if data.price else "—"
     lines.append(f"<b>قیمت:</b> {price_text}")
-
-    # The scope has to be on the card: «موجودی ۲۰» read as «۲۰ تا کلاً» while the shop will
-    # store 20 on each of four variations is exactly the surprise this preview exists to kill.
-    scope = f"روی هر {plan.count} واریژن" if plan.is_variable else "روی خود محصول"
     if data.sale_price:
-        lines.append(f"<b>قیمت ویژه:</b> {data.sale_price:,} تومان ({scope})")
+        lines.append(f"<b>قیمت ویژه:</b> {data.sale_price:,} تومان")
     if data.stock is not None:
-        status = {"outofstock": "، ناموجود", "onbackorder": "، سفارش پس‌ازموجودی"}.get(data.stock_status, "")
-        lines.append(f"<b>موجودی:</b> {data.stock:,} عدد ({scope}{status})")
+        lines.append(f"<b>موجودی:</b> {data.stock:,} عدد")
     elif data.stock_status == "outofstock":
         lines.append("<b>موجودی:</b> ناموجود")
-    lines.append(
-        f"<b>پیشوند SKU:</b> {html.escape(data.sku_prefix) if data.sku_prefix else '⚠️ <b>تشخیص داده نشد</b>'}"
-    )
-    lines.append(
-        "<b>مدل‌ها (" + str(len(data.models)) + "):</b> "
-        + (" | ".join(html.escape(model) for model in data.models) or "⚠️ هیچ مدلی پیدا نشد")
-    )
+    elif data.stock_status == "onbackorder":
+        lines.append("<b>موجودی:</b> پیش‌فروش")
+    sku = html.escape(data.sku_prefix) if data.sku_prefix else "—"
+    lines.append(f"<b>شناسه:</b> {sku}")
 
-    other_axes = [(name, values) for name, values in plan.axes if name != "مدل"]
-    if other_axes:
-        lines += ["", "<b>ویژگی‌ها:</b>"]
-        for name, values in other_axes:
-            lines.append(f"<b>{html.escape(name)}:</b> " + " | ".join(html.escape(value) for value in values))
+    lines.append("")
+    lines.append("<b>ویژگی‌ها:</b>")
+    models = plan.models or list(data.models or [])
+    model_text = " | ".join(html.escape(model) for model in models) if models else "—"
+    lines.append(f"<b>مدل:</b> {model_text}")
+    for name, values in plan.axes:
+        if name == "مدل":
+            continue
+        lines.append(f"<b>{html.escape(name)}:</b> " + " | ".join(html.escape(value) for value in values))
+    lines.append(f"<b>نوع محصول:</b> {'متغیر' if plan.is_variable else 'ساده'}")
 
-    if plan.axes:
-        lines.append("")
-        lines.append(f"<b>تعداد variation:</b> {plan.count}")
-        if plan.restricted:
-            lines.append(
-                f"🎨 <b>رنگ هر مدل:</b> {len(plan.restrictions)} مدل فقط رنگ‌های موجود خودش را می‌گیرد "
-                f"({plan.naive_count} ترکیب کامل ← {plan.count} ترکیب معتبر)"
-            )
-    else:
-        lines += ["", "<b>ویژگی‌ها:</b>"]
-        lines.append("⚠️ هیچ ویژگی‌ای با دو یا چند مقدار نمانده؛ محصول <b>simple</b> ساخته می‌شود.")
-    for name, had, left in plan.dropped:
-        lines.append(
-            f"⚠️ ویژگی «{html.escape(name)}» از {had} مقدار به {left} رسید (تکراری حذف شد)؛ "
-            "اعمال نمی‌شود."
-        )
-
-    categories = [x for x in data.categories if x not in FORBIDDEN]
-    lines += ["", "<b>دسته‌بندی‌ها:</b>"]
-    lines.extend(_category_outline(categories) or ["- تشخیص داده نشد"])
+    lines.append("")
+    lines.append("<b>دسته‌بندی:</b>")
+    category_lines = _category_tree_lines(data.categories)
+    lines.extend(category_lines or ["—"])
 
     issues = validate_draft(
         data.to_dict(),
@@ -614,18 +642,8 @@ def _preview(session: ProductSession) -> str:
             unmatched_model_words("\n".join((session.model_text, session.info_text)))
         ),
     )
-    provenance = ev.preview_html(data.evidence, data.notes)
-    if provenance:
-        lines.append(provenance)
-    questions = _open_questions(session)
-    if questions:
-        lines += ["", *questions]
-    if issues.issues:
-        lines += ["", "<b>نکته‌ها و هشدارها:</b>", issues.as_html()]
-        if issues.blocking:
-            lines.append("")
-            lines.append("⛔ تا حل نشدن این موارد، ساخت انجام نمی‌شود.")
-    lines += ["", "اطلاعات را بررسی کن؛ در صورت نیاز «✏️ اصلاح اطلاعات» و سپس تأیید بزن."]
+    if issues.blocking:
+        lines.extend(f"⛔ {html.escape(issue.message)}" for issue in issues.errors[:3])
     return "\n".join(lines)
 
 
@@ -645,15 +663,7 @@ def _pending_hint(rules: list[learning.Rule]) -> str:
 
 
 def _open_questions(session: ProductSession) -> list[str]:
-    """Fields the bot only *inferred*, phrased as a question.
-
-    Trust lives in :mod:`bot.services.postmodel`; what it does not have is a way to
-    ask. A value whose best evidence is the AI, an OCR line or a file name is a
-    guess, and a seller skimming twenty lines does not read a footnote about it —
-    they tap. So the preview turns each guess into a question with a one-tap
-    answer, and «درست است» moves the field to «ویرایش شما» instead of storing a
-    second "was checked" flag nobody else would honor.
-    """
+    """A short heads-up for inferred fields; their actual values are already above."""
     data = session.data
     if data is None:
         return []
@@ -661,14 +671,12 @@ def _open_questions(session: ProductSession) -> list[str]:
     guessed = [name for name in ev.inferred_fields(evidence) if name not in set(session.verified_fields)]
     if not guessed:
         return []
-    labels = {key: (label, value) for key, label, value in draft_edits.editable_fields(data)}
-    lines = [f"<b>❓ {len(guessed)} مقدار را من حدس زده‌ام، نه اینکه نوشته باشی:</b>"]
-    for name in guessed:
-        label, current = labels.get(name, (name, ""))
-        shown = _short(str(current), 48) or "—"
-        lines.append(f"• {label}: «{html.escape(shown, quote=False)}»")
-    lines.append("اگر درست است «✅ بله، این‌ها درست است» را بزن؛ اگر نه، «✏️ اصلاح فیلد خاص».")
-    return lines
+    editable = {key: label for key, label, _value in draft_edits.editable_fields(data)}
+    aliases = {"category": "categories", "colors": "colors", "model": "models"}
+    labels = list(dict.fromkeys(
+        editable.get(aliases.get(name, name), name) for name in guessed
+    ))
+    return ["⚠️ حدسی: " + "، ".join(labels)]
 
 
 def _learn_from_diff(
@@ -803,7 +811,95 @@ async def analyze(text: str, *, apply_rules: bool = True) -> ProductData:
         return await _extract(probe, learn=False)
 
 
+def _canonical_category_paths(categories: Sequence[str]) -> list[str]:
+    """Expand an unambiguous taxonomy leaf (e.g. «چاپی») to its full path."""
+    paths = draft_edits.taxonomy_paths()
+    by_leaf: dict[str, list[str]] = {}
+    for path in paths:
+        by_leaf.setdefault(path.split(" > ")[-1].casefold(), []).append(path)
+    roots = {
+        line.strip().casefold()
+        for line in TAXONOMY.splitlines()
+        if line.strip() and not line.startswith(" ")
+    }
+    result: list[str] = []
+    seen: set[str] = set()
+    for raw in categories:
+        category = html.unescape(str(raw)).replace(" ← ", " > ").strip()
+        category = re.sub(r"\s*>\s*", " > ", category)
+        key = category.casefold()
+        exact = next((path for path in paths if path.casefold() == key), None)
+        if not exact and "/" in category:
+            # A slash can be part of a category label («Airpods 1/2»); treat it
+            # as a hierarchy separator only if that produces a real taxonomy path.
+            candidate = re.sub(r"\s*/\s*", " > ", category).strip()
+            exact = next((path for path in paths if path.casefold() == candidate.casefold()), None)
+        if exact:
+            category = exact
+        elif key not in roots:
+            matches = by_leaf.get(category.split(">")[-1].strip().casefold(), [])
+            if len(matches) == 1:
+                category = matches[0]
+        folded = category.casefold()
+        if category and folded not in seen:
+            seen.add(folded)
+            result.append(category)
+    # Keep only the deepest selected paths; a child already carries its parent.
+    return [
+        category
+        for category in result
+        if not any(other.casefold().startswith(category.casefold() + " > ") for other in result)
+    ]
+
+
+def _extract_fingerprint(session: ProductSession) -> str:
+    """Stable cache key for parser inputs and learned rules."""
+    return hashlib.sha1(
+        f"{session.model_text}|{session.info_text}|{learning.revision()}".encode()
+    ).hexdigest()
+
+
+def _expected_ai_requests(session: ProductSession, *, defer_details: bool = False) -> int:
+    """Network calls the configured extraction path will attempt for these inputs."""
+    if not (settings.ai_base_url and settings.ai_token and settings.ai_model):
+        return 0
+    has_source = bool(session.model_text.strip() or session.info_text.strip())
+    if not has_source:
+        return 0
+    return 1 + int(has_source and not defer_details)
+
+
+class _AIFlowLogSink:
+    """Keep only useful, secret-free AI outcomes for the eventual group card."""
+
+    def __init__(self, destination: list[str]) -> None:
+        self.destination = destination
+
+    def add(self, level: int, message: str, *args: object) -> None:
+        if "AI normalization failed" in message:
+            detail = f"نرمال‌سازی مدل: خطای {args[0] if args else 'AI'}؛ پارسر قطعی حفظ شد"
+        elif "AI omitted" in message:
+            detail = f"نرمال‌سازی مدل: {args[0] if args else 0} نامزد قطعی حفظ شد"
+        elif "AI returned" in message:
+            detail = f"نرمال‌سازی مدل: پاسخ AI شامل {args[0] if args else '؟'} مدل بود"
+        elif "AI is not configured" in message and level >= logging.WARNING:
+            detail = "AI تنظیم نیست و نامزد قطعی برای بازبینی مشکوک تشخیص داده شد"
+        else:
+            return
+        if detail not in self.destination:
+            self.destination.append(detail)
+
+
+async def _log_ai_diagnostics(
+    context: ContextTypes.DEFAULT_TYPE, session: ProductSession
+) -> None:
+    for detail in session.ai_diagnostics:
+        await _telegram_log(context, f"[ai:diagnostic] {detail}")
+    session.ai_diagnostics.clear()
+
+
 async def _extract(session: ProductSession, *, learn: bool = True) -> ProductData:
+    session.ai_diagnostics.clear()
     # ``learn=False`` is the parser-test sandbox: reading a sample must not add it
     # to the replay corpus of real products (see bot/services/learning_corpus.py).
     # The first message is the media caption and is used only for model
@@ -821,30 +917,66 @@ async def _extract(session: ProductSession, *, learn: bool = True) -> ProductDat
     deterministic = normalize_caption(model_source)
     # The old OPTION bot's AI normalizer is now the primary phone detector.
     # Accessory families such as AirPods are handled separately because the
-    # phone normalizer deliberately rejects them.
-    ai_models = await ai_normalize(model_source, deterministic)
-    models = [x.strip() for x in (ai_models or deterministic).split(" | ") if x.strip()]
-    for accessory in extract_accessory_models(model_source):
-        if accessory.casefold() not in {item.casefold() for item in models}:
-            models.append(accessory)
-    session.models = models
-    # Do not make an unnecessary second AI request while only the photos are
-    # being processed. It runs as soon as the information message arrives.
+    # phone normalizer deliberately rejects them. An empty caption/info block
+    # has nothing for AI to normalize, so do not spend a network round trip.
     # Product details may be split between the media caption and later
     # Telegram messages. The extractor must receive both texts in one request
     # so title, SKU, price, colors and models can complement each other.
     combined_text = "\n".join(part for part in (caption_text, info_text) if part.strip())
-    # Locks survive a re-extraction on purpose: the owner typed them by hand,
-    # and the parser does not get to "re-decide" a deliberate edit.
-    carried_edits = dict(session.data.user_edits) if session.data else {}
-    session.data = (await extract_product(
-        combined_text,
-        models,
-        TAXONOMY,
-        caption=caption_text,
-        info_text=info_text,
-        color_suppressed=set(session.suppressed_colors),
-    ) if combined_text.strip() else ProductData(models=models))
+    defer_details = session.defer_details and not info_text.strip()
+    # Reuse one HTTPX pool for the model-normalization and details requests. They
+    # are sequential and normally hit the same AI host, so separate clients paid
+    # a second DNS/TCP/TLS setup for one product. Keep standalone service calls
+    # self-contained; the shared client exists only for this extraction.
+    share_client = bool(
+        model_source
+        and combined_text.strip()
+        and not defer_details
+        and settings.ai_base_url
+        and settings.ai_token
+        and settings.ai_model
+    )
+    async with AsyncExitStack() as stack:
+        ai_client = None
+        if share_client:
+            ai_client = await stack.enter_async_context(ai_client_session())
+        normalize_kwargs = {"client": ai_client} if ai_client is not None else {}
+        ai_models = (
+            await ai_normalize(
+                model_source,
+                deterministic,
+                job_log=_AIFlowLogSink(session.ai_diagnostics),
+                **normalize_kwargs,
+            )
+            if model_source
+            else deterministic
+        )
+        models = [x.strip() for x in (ai_models or deterministic).split(" | ") if x.strip()]
+        for accessory in extract_accessory_models(model_source):
+            if accessory.casefold() not in {item.casefold() for item in models}:
+                models.append(accessory)
+        session.models = models
+        # Locks survive a re-extraction on purpose: the owner typed them by hand,
+        # and the parser does not get to "re-decide" a deliberate edit.
+        carried_edits = dict(session.data.user_edits) if session.data else {}
+        if not combined_text.strip() or defer_details:
+            # In the collection screen captions identify phone models; users are
+            # explicitly asked to send price/title/features afterwards. Calling the
+            # full extractor here used to make a second network AI round trip whose
+            # result was never shown, then repeat it when PRODUCT INFO arrived.
+            session.data = ProductData(models=models)
+        else:
+            extract_kwargs = {"client": ai_client} if ai_client is not None else {}
+            session.data = await extract_product(
+                combined_text,
+                models,
+                TAXONOMY,
+                caption=caption_text,
+                info_text=info_text,
+                color_suppressed=set(session.suppressed_colors),
+                diagnostic=session.ai_diagnostics.append,
+                **extract_kwargs,
+            )
     session.data.user_edits = carried_edits
     draft_edits.apply_locks(session.data)
     # A value the owner already confirmed stays confirmed after a re-extraction:
@@ -898,9 +1030,7 @@ async def _extract(session: ProductSession, *, learn: bool = True) -> ProductDat
     }
     normalized_categories = []
     for category in categories:
-        category = category.replace("&gt;", ">")
-        # AI sometimes uses slash instead of the hierarchy separator.
-        category = re.sub(r"\s*/\s*", " > ", category).strip()
+        category = html.unescape(category).replace(" ← ", " > ").strip()
         leaf = category.split(">")[-1].strip()
         if leaf in explicit_category_words and not re.search(explicit_category_words[leaf], source):
             continue
@@ -927,12 +1057,29 @@ async def _extract(session: ProductSession, *, learn: bool = True) -> ProductDat
                     path = airpods_root + " > " + leaf
                     if path not in normalized_categories:
                         normalized_categories.append(path)
-    session.data.categories = normalized_categories
+    normalized_categories = apply_sku_category_policy(
+        normalized_categories, session.data.sku_prefix
+    )
+    session.data.categories = _canonical_category_paths(normalized_categories)
     session.data.attributes = {k: v for k, v in session.data.attributes.items() if not is_model_attribute(k)}
     _apply_color_matrix(session, model_source)
     if learn:
         learning_corpus.record(model_source, session.data)
     return session.data
+
+
+async def extract_product_metadata(
+    model_text: str,
+    info_text: str,
+    *,
+    diagnostics: list[str] | None = None,
+) -> tuple[list[str], dict[str, list[str]]]:
+    """Use the product parser without recording a product; optionally return its warnings."""
+    session = ProductSession(model_text=model_text or "", info_text=info_text or "")
+    data = await _extract(session, learn=False)
+    if diagnostics is not None:
+        diagnostics.extend(session.ai_diagnostics)
+    return session.models, data.attributes if data is not None else {}
 
 
 def _apply_color_matrix(session: ProductSession, source_text: str) -> None:
@@ -1008,11 +1155,22 @@ async def _download_with_retry(
             if tg_file.file_size and tg_file.file_size > settings.max_download_mb * 1024 * 1024:
                 raise ValueError(f"فایل بزرگ‌تر از سقف مجاز ({settings.max_download_mb:g} MB) است.")
             await tg_file.download_to_drive(custom_path=target)
-            return tg_file.file_size or 0
+            actual_size = target.stat().st_size if target.exists() else 0
+            maximum = int(settings.max_download_mb * 1024 * 1024)
+            if actual_size > maximum:
+                target.unlink(missing_ok=True)
+                raise ValueError(f"فایل بزرگ‌تر از سقف مجاز ({settings.max_download_mb:g} MB) است.")
+            return actual_size or tg_file.file_size or 0
         except (TimedOut, NetworkError, TimeoutError) as exc:
             last_error = exc
+            target.unlink(missing_ok=True)
             if attempt == attempts:
                 raise
+            await _telegram_log(
+                context,
+                f"[telegram:retry] دانلود عکس تلاش {attempt}/{attempts} شکست خورد "
+                f"({type(exc).__name__}); تلاش مجدد با تأخیر.",
+            )
             await asyncio.sleep(attempt * 1.5)
     raise last_error if last_error else RuntimeError("download failed")
 
@@ -1069,9 +1227,30 @@ async def _prepare_files(user_id: int, messages: list[Message], context: Context
     # A second batch (or a late album photo) must ADD images, never silently
     # replace the ones already collected for this product.
     session.files = previous_files + new_files
-    await _status(context, user_id, session, "🤖 مرحله ۳ از ۴: تشخیص مدل‌ها و اطلاعات با AI...")
-    session.model_text = _caption(messages)
-    await _extract(session)
+    session.model_text = _append_model_caption(session.model_text, _caption(messages))
+    fingerprint = _extract_fingerprint(session)
+    extraction_ms = 0.0
+    expected_ai_requests = 0
+    if fingerprint == session.last_extract_hash and session.data is not None:
+        await _telegram_log(context, f"[product:{user_id}] استخراج تکراری رد شد؛ متن کپشن/اطلاعات تغییری نکرده است.")
+    else:
+        await _status(context, user_id, session, "🤖 مرحله ۳ از ۴: تشخیص مدل‌ها و اطلاعات با AI...")
+        session.defer_details = not bool(session.info_text.strip())
+        expected_ai_requests = _expected_ai_requests(
+            session, defer_details=session.defer_details
+        )
+        started = time.perf_counter()
+        try:
+            await _extract(session)
+        finally:
+            extraction_ms = (time.perf_counter() - started) * 1000
+            session.defer_details = False
+        await _log_ai_diagnostics(context, session)
+        session.last_extract_hash = fingerprint
+    await _telegram_log(
+        context,
+        f"[ai:summary] استخراج محصول: {expected_ai_requests} درخواست، {extraction_ms:.0f} ms",
+    )
     session.processing_media = False
     await _telegram_log(context, f"[product:{user_id}] مدل‌های نهایی تشخیص‌داده‌شده:\n{chr(10).join(session.models) or '<هیچ مدلی تشخیص داده نشد>'}")
     if session.color_summary:
@@ -1201,17 +1380,16 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     # in the session and let _prepare_files render the final preview later.
     if not session.files or session.processing_media:
         await message.reply_text(
-            "✅ متن دریافت شد؛ پردازش عکس‌ها و تشخیص مدل‌ها ادامه دارد. بعد از پایان، اطلاعات کامل به‌روزرسانی می‌شود."
-            + "\n\nاگر عکس‌هایت را تمام کردی، «✅ تصاویر تمام شد» را بزن تا معطل تایمر نشوی.",
+            "✅ متن دریافت شد؛ عکس‌ها هنوز در حال پردازش‌اند."
+            "\n\nاگر عکس دیگری نمی‌فرستی، «✅ عکس‌ها تمام شد؛ ادامه» را بزن تا عکس‌های دریافت‌شده پردازش شوند و به مرحلهٔ بعد بروی."
+            " اگر هنوز عکس می‌فرستی، دکمه را نزن و عکس را بفرست.",
             reply_markup=_collect_keyboard(),
         )
         return COLLECT
     # Extraction costs up to two AI requests. If nothing changed since the last
     # extraction there is nothing to redo — and re-asking the model was also how
     # it could quietly "change its mind" about a value the owner had accepted.
-    fingerprint = hashlib.sha1(
-        f"{session.model_text}|{session.info_text}|{learning.revision()}".encode()
-    ).hexdigest()
+    fingerprint = _extract_fingerprint(session)
     if fingerprint == session.last_extract_hash and session.data is not None:
         await message.reply_text(
             "ℹ️ چیز تازه‌ای نسبت به آخرین استخراج ندیدم؛ همان مقادیر معتبرند. "
@@ -1219,8 +1397,18 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         )
         return WAITING
     previous = session.data
+    expected_ai_requests = _expected_ai_requests(
+        session, defer_details=session.defer_details
+    )
+    extraction_started = time.perf_counter()
     data = await _extract(session)
+    extraction_ms = (time.perf_counter() - extraction_started) * 1000
+    await _log_ai_diagnostics(context, session)
     session.last_extract_hash = fingerprint
+    await _telegram_log(
+        context,
+        f"[ai:summary] استخراج محصول: {expected_ai_requests} درخواست، {extraction_ms:.0f} ms",
+    )
     # Persistent self-learning is sudo-only: a rule rewrites how EVERY later
     # product is parsed, so it should not be creatable by a shared admin account.
     # The correction still applies to this session for everyone — that part is
@@ -1315,14 +1503,7 @@ def _queue_for_retry(
 
 
 def _queued_note(queued: bool) -> str:
-    if not queued:
-        return ""
-    hours = round(outbox.MAX_AGE_SECONDS / 3600)
-    return (
-        f"\n\n🐇 این خطا موقتی است؛ در صفِ تلاش مجدد گذاشتمش "
-        f"({outbox.REMAINING_TRIES_AFTER_FIRST} بار دیگر، تا {hours} ساعت، بدون اینکه کاری کنی) "
-        "و نتیجه را همین‌جا می‌گویم."
-    )
+    return "\n🐇 در صفِ تلاش مجدد است؛ نتیجه را همین‌جا می‌فرستم." if queued else ""
 
 
 async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1333,6 +1514,9 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await query.answer("اول عکس و اطلاعات محصول را بفرست.", show_alert=True)
         return REVIEW
     data = session.data
+    data.categories = _canonical_category_paths(
+        apply_sku_category_policy(data.categories, data.sku_prefix)
+    )
     # ONE shared gate for both output paths. It used to be two different checks,
     # so the REST path happily published a product with no models while the ZIP
     # importer rejected exactly that.
@@ -1382,6 +1566,67 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await query.answer("در حال ساخت پیش‌نویس مستقیم..." if session.mode == "new" else "در حال ساخت فایل ZIP...")
     await _telegram_log(context, f"[product:{user.id}] تأیید نهایی دریافت شد؛ داده نهایی:\n{json.dumps(data.to_dict(), ensure_ascii=False, indent=2)}")
     intent_key: str | None = None
+    publish_returned = False
+    product_id: int | str | None = None
+    edit_url = ""
+
+    async def keep_success_if_reply_failed(exc: BaseException) -> int:
+        """Never turn a completed WooCommerce write into a failed/retryable product.
+
+        The API call can succeed and the following Telegram card send can fail.
+        Treating that as a publish failure made a repeated tap capable of creating
+        a duplicate product, even though WooCommerce had already confirmed it.
+        """
+        status = "dry" if settings.woo_dry_run else "created"
+        ledger_saved = False
+        try:
+            _record_result(
+                user.id, session, data,
+                status=status,
+                product_id=None if settings.woo_dry_run else product_id,
+                edit_url=edit_url,
+                key=intent_key,
+                batch_id=batch,
+            )
+            ledger_saved = True
+        except Exception:
+            logger.exception("Could not preserve the successful product ledger entry")
+        reason = describe_exception(exc)
+        ledger_note = "دفتر محصولات به‌روز شد" if ledger_saved else "ثبت در دفتر محصولات هم شکست خورد"
+        if settings.woo_dry_run:
+            log_line = f"🧪 اجرای آزمایشی کامل شد؛ {ledger_note}؛ ارسال کارت نتیجه ناموفق بود: {reason}"
+            notice = "🧪 اجرای آزمایشی تمام شد؛ چیزی در سایت ساخته نشد. ارسال کارت نتیجه ناموفق بود."
+        else:
+            log_line = f"✅ پیش‌نویس محصول {product_id} ساخته شد؛ {ledger_note}؛ ارسال کارت نتیجه ناموفق بود: {reason}"
+            history_note = (
+                "از تاریخچهٔ محصولات می‌توانی جزئیات را ببینی."
+                if ledger_saved else "شناسهٔ محصول را برای پیگیری نگه دار."
+            )
+            notice = (
+                f"✅ پیش‌نویس ساخته شد (شناسهٔ محصول: {product_id}). "
+                f"ارسال کارت نتیجه ناموفق بود؛ {history_note}"
+            )
+        try:
+            await product_journal.send_log_message(context.bot, log_line)
+        except Exception:
+            logger.exception("Could not log post-publish notification failure")
+        try:
+            await query.edit_message_text(notice)
+        except Exception as notify_exc:
+            logger.warning(
+                "Product %s was created, but its result could not be shown to user %s (%s): %s",
+                product_id, user.id, type(notify_exc).__name__, str(notify_exc)[:240],
+            )
+            try:
+                await context.bot.send_message(text=notice, **_target(session, user.id))
+            except Exception:
+                logger.exception("Could not send post-publish recovery notice")
+        try:
+            _cleanup(user.id)
+        except Exception:
+            logger.exception("Product %s was created, but flow cleanup failed", product_id)
+        return ConversationHandler.END
+
     if session.mode == "new":
         try:
             await _status(context, user.id, session, "📤 در حال آپلود عکس‌ها و ساخت پیش‌نویس مستقیم در ووکامرس...")
@@ -1401,6 +1646,7 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                     bot_version=_BOT_VERSION,
                 ),
             )
+            publish_returned = True
             resumed = any(line.startswith("[resume] جمع‌بندی") for line in report)
             await _telegram_log(
                 context,
@@ -1451,6 +1697,8 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             _cleanup(user.id)
             return ConversationHandler.END
         except WooCommerceAPIError as exc:
+            if publish_returned:
+                return await keep_success_if_reply_failed(exc)
             audit_lines = exc.diagnostics or []
             await _telegram_log(
                 context,
@@ -1469,9 +1717,17 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             session.submitting = False
             return REVIEW
         except Exception as exc:
+            if publish_returned:
+                return await keep_success_if_reply_failed(exc)
             details = traceback.format_exc()
-            await _telegram_log(context, f"[product:{user.id}] ساخت مستقیم ناموفق بود: {type(exc).__name__}: {exc}\n{details}")
-            reason = f"{type(exc).__name__}: {exc}"
+            audit_lines = list(getattr(exc, "diagnostics", []) or [])
+            reason = describe_exception(exc)
+            await _telegram_log(
+                context,
+                f"[product:{user.id}] ساخت مستقیم ناموفق بود: {reason}"
+                + ("\n\n--- لاگ گام‌به‌گام ---\n" + "\n".join(audit_lines) if audit_lines else "")
+                + f"\n\n{details}",
+            )
             queued = _queue_for_retry(exc, user_id=user.id, session=session, data=data,
                                       batch=batch, error=reason, ledger_key=intent_key)
             _record_result(user.id, session, data, status="queued" if queued else "failed",
@@ -1479,7 +1735,9 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             await _flush_journal(context, status="queued" if queued else "failed", data=data,
                                  session=session, batch=batch, errors=[reason])
             await query.edit_message_text(
-                f"❌ ساخت مستقیم محصول ناموفق بود:\n{type(exc).__name__}: {exc}" + _queued_note(queued)
+                _attach_audit(
+                    f"❌ ساخت مستقیم محصول ناموفق بود:\n{reason}" + _queued_note(queued), audit_lines
+                )
             )
             session.submitting = False
             return REVIEW
@@ -1634,10 +1892,7 @@ async def edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         # the information we are waiting for instead of a "proposal".
         return COLLECT
     session.field_keys = [key for key, _label, _current in draft_edits.editable_fields(session.data)]
-    await query.message.reply_text(
-        "✏️ کدام فیلد را عوض کنم؟ (هرچه دستی بنویسی، در استخراج‌های بعدی هم حفظ می‌شود)",
-        reply_markup=_fields_keyboard(session),
-    )
+    await query.message.reply_text("✏️ فیلد را انتخاب کن:", reply_markup=_fields_keyboard(session))
     return REVIEW
 
 
@@ -1768,13 +2023,42 @@ async def pick_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     session.editing_field = key
     # An edit step must be escapable with a button, not only by remembering the
     # word «انصراف» — that is how a person ends up stuck typing into a field.
-    await query.message.reply_html(
+    await query.message.edit_text(
         draft_edits.prompt_for(key, session.data),
+        parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("↩️ انصراف و بازگشت", callback_data="product:field:cancel")
+            InlineKeyboardButton("↩️ انصراف", callback_data="product:field:cancel")
         ]]),
     )
     return EDITING_FIELD
+
+
+async def delete_attribute_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Remove a variation attribute directly from its picker row."""
+    query = update.callback_query
+    session = _session_of(query.from_user.id if query.from_user else 0, context)
+    if session is None or session.data is None:
+        await query.answer("پیش‌نمایش منقضی شده است.", show_alert=True)
+        return REVIEW
+    try:
+        index = int(query.data.rsplit(":", 1)[1])
+        key = session.field_keys[index]
+    except (ValueError, IndexError):
+        await query.answer("این گزینه منقضی شده است.", show_alert=True)
+        return REVIEW
+    if key != "colors" and not key.startswith("attr:"):
+        await query.answer("این فیلد قابل حذف نیست.", show_alert=True)
+        return REVIEW
+
+    error = draft_edits.apply_edit(session.data, key, "حذف")
+    if error:
+        await query.answer(error, show_alert=True)
+        return REVIEW
+    session.editing_field = ""
+    session.data.variation_count = plan_from_dict(session.data.to_dict()).count
+    await query.answer("ویژگی حذف شد")
+    await query.message.edit_text(_preview(session), parse_mode="HTML", reply_markup=_keyboard(session))
+    return REVIEW
 
 
 async def cancel_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1827,7 +2111,7 @@ def _collect_keyboard() -> InlineKeyboardMarkup:
     anything. A person who knows they sent the last photo should not have to
     hope that timer was long enough — one tap flushes it.
     """
-    rows = [[InlineKeyboardButton("✅ تصاویر تمام شد", callback_data="product:mediaend")],
+    rows = [[InlineKeyboardButton("✅ عکس‌ها تمام شد؛ ادامه", callback_data="product:mediaend")],
             [InlineKeyboardButton("❌ لغو", callback_data="product:cancel")]]
     return InlineKeyboardMarkup(rows)
 
@@ -1870,7 +2154,7 @@ async def add_more(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return ConversationHandler.END
     session.pending_text = ""
     await query.message.reply_text(
-        "📦 عکس یا متن جدید را بفرست؛ بعد از هر پیام پیش‌نمایش تازه می‌شود. وقتی تمام کردی «✅ تصاویر تمام شد» را بزن.",
+        "📦 عکس یا متن جدید را بفرست؛ بعد از هر پیام پیش‌نمایش تازه می‌شود. وقتی عکس دیگری نداری، «✅ عکس‌ها تمام شد؛ ادامه» را بزن.",
         reply_markup=_collect_keyboard(),
     )
     return COLLECT
@@ -1920,7 +2204,17 @@ async def accept_proposal(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     incoming, session.pending_text = session.pending_text, ""
     session.info_text = (session.info_text + "\n" + incoming).strip()
     await _telegram_log(context, f"[product:{user_id}] متن پیشنهادی تأیید و اعمال شد:\n{incoming}")
+    expected_ai_requests = _expected_ai_requests(
+        session, defer_details=session.defer_details
+    )
+    extraction_started = time.perf_counter()
     data = await _extract(session)
+    extraction_ms = (time.perf_counter() - extraction_started) * 1000
+    await _log_ai_diagnostics(context, session)
+    await _telegram_log(
+        context,
+        f"[ai:summary] استخراج محصول: {expected_ai_requests} درخواست، {extraction_ms:.0f} ms",
+    )
     session.data = data
     flow_state.record(user_id, chat_id=session.chat_id or user_id, mode=session.mode,
                       images=len(session.files), step="متن تأییدشده اعمال شد")
@@ -2024,6 +2318,7 @@ def register(app: Application) -> None:
         CallbackQueryHandler(accept_suggestion, pattern=r"^product:sug:\d+$"),
         CallbackQueryHandler(dismiss_suggestion, pattern=r"^product:sug:no:\d+$"),
         CallbackQueryHandler(confirm_guessed, pattern=f"^{CB.PRODUCT_CONFIRM_GUESSED}$"),
+        CallbackQueryHandler(delete_attribute_field, pattern=r"^product:field:delete:\d+$"),
         CallbackQueryHandler(pick_field, pattern=r"^product:field:\d+$"),
         CallbackQueryHandler(back_from_picker, pattern=r"^product:fields:back$"),
         CallbackQueryHandler(show_preview, pattern=r"^product:preview$"),

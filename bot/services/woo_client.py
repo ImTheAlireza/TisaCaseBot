@@ -36,6 +36,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 from typing import Any, Protocol
 from collections.abc import Mapping, Sequence
 
@@ -174,6 +175,34 @@ def error_message(response: httpx.Response) -> str:
     return text if text and len(text) <= 400 else f"HTTP {response.status_code}"
 
 
+def describe_exception(exc: BaseException) -> str:
+    """Render transport errors usefully; httpx timeout exceptions often have empty strings.
+
+    Do not include the raw transport message for network errors: it may contain a request URL,
+    and WooCommerce credentials are query parameters. The request method/path are logged
+    separately by :class:`WooClient` without query parameters.
+    """
+    if isinstance(exc, httpx.ReadTimeout):
+        detail = "پاسخ فروشگاه نرسید؛ ممکن است درخواست اعمال شده باشد"
+    elif isinstance(exc, httpx.ConnectTimeout):
+        detail = "مهلت اتصال به فروشگاه تمام شد"
+    elif isinstance(exc, httpx.WriteTimeout):
+        detail = "ارسال درخواست کامل نشد"
+    elif isinstance(exc, httpx.PoolTimeout):
+        detail = "اتصال آزاد در دسترس نبود"
+    elif isinstance(exc, httpx.TimeoutException):
+        detail = "مهلت درخواست تمام شد"
+    elif isinstance(exc, httpx.ConnectError):
+        detail = "اتصال به فروشگاه برقرار نشد"
+    elif isinstance(exc, httpx.RemoteProtocolError):
+        detail = "ارتباط پیش از پاسخ قطع شد"
+    elif isinstance(exc, httpx.TransportError):
+        detail = "خطای شبکه"
+    else:
+        detail = redact(str(exc).strip()) or "جزئیات خطا در دسترس نیست"
+    return f"{type(exc).__name__}: {detail}"
+
+
 def body_snippet(response: httpx.Response, limit: int = 400) -> str:
     """A compact, single-line snippet of the raw response body for the audit."""
     text = (response.text or "").replace("\n", " ").replace("\r", " ").strip()
@@ -230,7 +259,9 @@ class WooClient:
         self.audit: Sink = audit if audit is not None else _NullSink()
         self._key, self._secret = key, secret
         self.dry_run = dry_run
+        self.timeout_seconds = timeout
         self.attempts = max(1, attempts)
+        self._request_number = 0
         kwargs: dict[str, Any] = {
             "timeout": timeout,
             "follow_redirects": True,
@@ -281,25 +312,50 @@ class WooClient:
             merged["params"] = query
         merged["headers"] = {"User-Agent": USER_AGENT, **dict(headers or {})}
 
+        method = method.upper()
+        self._request_number += 1
+        request_id = self._request_number
+        try:
+            path = httpx.URL(str(url)).path
+        except Exception:  # malformed configuration: never echo a URL or query string
+            path = "<مسیر نامعتبر>"
+
         response: httpx.Response | None = None
         for attempt in range(self.attempts):
             last_try = attempt == self.attempts - 1
+            started = time.perf_counter()
+            self.audit.log(
+                f"[http:start] #{request_id} {method} {path} "
+                f"(تلاش {attempt + 1}/{self.attempts}؛ مهلت هر فاز={self.timeout_seconds:g}s)"
+            )
             try:
-                response = await self._client.request(method.upper(), str(url), **merged)
+                response = await self._client.request(method, str(url), **merged)
             except httpx.TransportError as exc:
-                if last_try or not self._retry_network(exc):
+                elapsed_ms = (time.perf_counter() - started) * 1000
+                retry = not last_try and self._retry_network(exc)
+                self.audit.log(
+                    f"[http:error] #{request_id} {method} {path} "
+                    f"پس از {elapsed_ms:.0f} ms: {describe_exception(exc)} "
+                    f"(تلاش {attempt + 1}/{self.attempts}؛ "
+                    f"{'تلاش مجدد می‌شود' if retry else 'تلاش مجدد در همین درخواست انجام نمی‌شود'})"
+                )
+                if not retry:
                     raise
                 delay = 2**attempt
-                self.audit.log(
-                    f"[retry] خطای شبکه هنگام {method.upper()} ({exc.__class__.__name__})؛ "
-                    f"تلاش مجدد پس از {delay}s"
-                )
+                self.audit.log(f"[retry] #{request_id} خطای اتصال؛ تلاش مجدد پس از {delay}s")
                 await _sleep(delay)
                 continue
+
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            self.audit.log(
+                f"[http:done] #{request_id} {method} {path} → HTTP {response.status_code} "
+                f"در {elapsed_ms:.0f} ms (تلاش {attempt + 1}/{self.attempts})"
+            )
             if not last_try and self._retry_status(method, response):
                 delay = 2**attempt
                 self.audit.log(
-                    f"[retry] HTTP {response.status_code} موقت است؛ تلاش مجدد پس از {delay}s"
+                    f"[retry] #{request_id} HTTP {response.status_code} موقت است؛ "
+                    f"تلاش مجدد پس از {delay}s"
                 )
                 await _sleep(delay)
                 continue

@@ -280,7 +280,7 @@ class TestDryRunCard(LedgerTestCase):
     def test_card_says_nothing_was_created(self) -> None:
         card = result_card(self._entry())
         self.assertIn("🧪", card)
-        self.assertIn("هیچ چیزی در سایت ساخته نشد", card)
+        self.assertIn("هیچ محصولی در سایت ساخته نشد", card)
         self.assertNotIn("ویرایش در سایت", card, "دکمهٔ ویرایش به محصولی می‌رود که نیست")
         self.assertNotIn("#None", card, "شناسهٔ ساختگی نباید روی کارت بیاید")
 
@@ -379,6 +379,39 @@ class TestFlowDryRun(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, len(trace), "ردپای dry-run باید برای خود کاربر هم برود، نه فقط لاگ")
         self.assertIn("POST /wp-json/wc/v3/products", trace[0])
 
+    async def test_result_card_delivery_failure_does_not_downgrade_a_created_product(self) -> None:
+        async def fake_create_draft(data, files, *, dry_run=False, report=None, batch_id="", meta=()):
+            return 810_001, "https://shop.example/wp-admin/post.php?post=810001&action=edit"
+
+        real = PF.create_draft
+        PF.create_draft = fake_create_draft
+        self.addCleanup(setattr, PF, "create_draft", real)
+        bot_state = SimpleNamespace(messages=[])
+
+        class Bot:
+            async def send_message(self, *args, text="", **kwargs):
+                if kwargs.get("chat_id") == 9 and "پیش‌نویس ساخته شد" in text:
+                    raise RuntimeError("simulated result-card delivery failure")
+                bot_state.messages.append({"text": text, **kwargs})
+                return SimpleNamespace(message_id=101)
+
+            async def edit_message_text(self, *args, **kwargs):
+                return None
+
+        update, seen = query_update("product:confirm", user_id=7, chat_id=9)
+        context = make_context(Bot())  # type: ignore[arg-type]
+        live_settings = settings_with(woo_dry_run=False, log_chat_id=-1001234567890)
+        with patched_settings(live_settings):
+            result = await PF.confirm(update, context)
+
+        self.assertEqual(PF.ConversationHandler.END, result)
+        entry = products_ledger.recent(1)[0]
+        self.assertEqual("created", entry["status"], "a Telegram notification failure cannot undo a Woo write")
+        self.assertEqual(810_001, entry["product_id"])
+        group_messages = [m for m in bot_state.messages if m.get("chat_id") == -1001234567890]
+        self.assertTrue(any("کارت نتیجه ناموفق بود" in str(m["text"]) for m in group_messages))
+        self.assertTrue(any("پیش‌نویس ساخته شد" in str(action[1]) for action in seen if action[0] == "edit"))
+
     async def test_dry_publish_does_not_send_trace_to_non_sudo_admin(self) -> None:
         calls: list[dict[str, object]] = []
 
@@ -412,12 +445,12 @@ class TestFlowDryRun(unittest.IsolatedAsyncioTestCase):
         trace = [text for text in cards if "درخواست‌هایی که ساخته شدند" in text]
         self.assertEqual(0, len(trace), "ردپای فنی نباید برای ادمین عادی ارسال شود")
 
-    async def test_preview_warns_before_approval(self) -> None:
+    async def test_preview_marks_dry_mode_concisely(self) -> None:
         with patched_settings(_dry_settings()):
             text = PF._preview(PF.sessions[7])
-        self.assertIn("TISA_DRY_RUN", text)
-        self.assertIn("روشن است", text)
-        self.assertNotIn("TISA_DRY_RUN", PF._preview(PF.sessions[7]), "با حالت خاموش نباید اخطاری بماند")
+        self.assertIn("🧪 حالت آزمایشی", text)
+        self.assertNotIn("TISA_DRY_RUN", text, "متن پیش‌نمایش باید برای کاربر باشد، نه نام تنظیم")
+        self.assertNotIn("حالت آزمایشی", PF._preview(PF.sessions[7]), "با حالت خاموش نباید نشان داده شود")
 
 
 @needs_flow

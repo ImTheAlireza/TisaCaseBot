@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -114,6 +115,9 @@ class Journal:
 
         if self.stages:
             lines += ["", *self._stage_lines()]
+        diagnostics = self._diagnostic_lines()
+        if diagnostics:
+            lines += ["", "🔎 پایش عملیات:", *[f"   · {line}" for line in diagnostics]]
         if self.warnings:
             shown = self.warnings[:_MAX_LIST_ITEMS]
             lines += ["", f"⚠️ {len(self.warnings)} هشدار:"] + [f"   · {w}" for w in shown]
@@ -122,6 +126,39 @@ class Journal:
         if self.errors:
             lines += ["", "❌ خطاها:"] + [f"   · {e}" for e in self.errors[:_MAX_LIST_ITEMS]]
         return clip("\n".join(lines), note="\n… (کارت بلند بود؛ ادامه در logs/bot.log)")
+
+    def _diagnostic_lines(self) -> list[str]:
+        """Include one compact network/AI digest on every group card.
+
+        Full traces stay opt-in, but the outcome, request count/latency and every
+        transport failure are always visible in LOG_CHAT_ID without a message flood.
+        """
+        raw_lines = "\n".join(self.trace).splitlines()
+        http_done = [line for line in raw_lines if line.startswith("[http:done]")]
+        elapsed = [
+            int(match.group(1))
+            for line in http_done
+            if (match := re.search(r"در (\d+) ms", line))
+        ]
+        http_retries = [line for line in raw_lines if line.startswith("[retry]")]
+        ai_lines = [line for line in raw_lines if line.startswith("[ai:summary]")]
+        ai_diagnostics = [
+            line for line in raw_lines if line.startswith("[ai:diagnostic]")
+        ]
+        failures = [
+            line for line in raw_lines
+            if line.startswith(("[http:error]", "[media:error]", "[variation:error]", "[sku:error]"))
+        ]
+        result: list[str] = []
+        if http_done:
+            timing = f"؛ جمع پاسخ‌ها {sum(elapsed)} ms" if elapsed else ""
+            result.append(f"HTTP: {len(http_done)} درخواست{timing}")
+        if http_retries:
+            result.append(f"تلاش مجدد شبکه: {len(http_retries)}")
+        result.extend(ai_lines[-2:])
+        result.extend(ai_diagnostics[-4:])
+        result.extend(failures[-5:])
+        return result
 
     def _stage_lines(self) -> list[str]:
         """The road this product took. Long runs are folded — a card is not a scroll."""
@@ -138,6 +175,32 @@ class Journal:
         if len(body) > _TRACE_CHARS:
             body = body[:_TRACE_CHARS] + "\n… ادامه در `logs/bot.log`"
         return body
+
+
+async def send_log_message(bot: Any, text: str, *, parse_mode: str | None = None) -> bool:
+    """Send one diagnostic to ``LOG_CHAT_ID`` without breaking the user flow.
+
+    Returns whether Telegram accepted the message; configuration/permission failures
+    are reported to the local log so a missing group message is diagnosable.
+    """
+    target = settings.log_chat_id
+    if not target:
+        logger.warning("log chat message skipped: LOG_CHAT_ID is empty")
+        return False
+    kwargs: dict[str, Any] = {"chat_id": target, "text": text}
+    if parse_mode:
+        kwargs["parse_mode"] = parse_mode
+    try:
+        await bot.send_message(**kwargs)
+        return True
+    except Exception as exc:
+        logger.warning(
+            "log chat send failed (LOG_CHAT_ID=%s, %s): %s",
+            target,
+            type(exc).__name__,
+            str(exc)[:240],
+        )
+        return False
 
 
 def journal_for(context: Any) -> Journal | None:
@@ -190,18 +253,25 @@ async def _send(context: Any, card: str, journal: Journal, *, chat_id: object) -
         logger.info("product trace:\n%s", journal.trace_text())
     target = settings.log_chat_id
     if not target:
+        logger.warning("product log card skipped: LOG_CHAT_ID is empty")
         return
     try:
         await context.bot.send_message(chat_id=target, text=card)
         if settings.verbose_log and journal.trace:
-            for start in range(0, len(journal.trace_text()), MESSAGE_LIMIT):
+            trace = journal.trace_text()
+            for start in range(0, len(trace), MESSAGE_LIMIT):
                 await context.bot.send_message(
-                    chat_id=target, text=journal.trace_text()[start : start + MESSAGE_LIMIT]
+                    chat_id=target, text=trace[start : start + MESSAGE_LIMIT]
                 )
     except Exception as exc:
-        # Once per card, and never fatal: a wrong LOG_CHAT_ID used to make the whole
-        # audit trail vanish without a trace anywhere else.
-        logger.debug("log chat unavailable (%s): %s", type(exc).__name__, exc)
+        # Never break publishing, but do not hide an invalid chat id, missing
+        # membership, or missing send permission at INFO log level.
+        logger.warning(
+            "product log delivery failed (LOG_CHAT_ID=%s, %s): %s",
+            target,
+            type(exc).__name__,
+            str(exc)[:240],
+        )
 
 
-__all__ = ["Journal", "flush", "journal_for", "reset"]
+__all__ = ["Journal", "flush", "journal_for", "reset", "send_log_message"]

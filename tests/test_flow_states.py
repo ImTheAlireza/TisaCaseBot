@@ -139,9 +139,12 @@ class TestCollectVersusReview(FlowStateTestCase):
         update, sent = _update("قیمت 698000")
         result = asyncio.run(PF.on_text(update, SimpleNamespace()))
         self.assertEqual(result, PF.COLLECT)
-        self.assertIn("تصاویر تمام شد", sent[0][1])
-        buttons = [b.callback_data for row in sent[0][2]["reply_markup"].inline_keyboard for b in row]
+        self.assertIn("عکس‌های دریافت‌شده پردازش شوند و به مرحلهٔ بعد بروی", sent[0][1])
+        rows = sent[0][2]["reply_markup"].inline_keyboard
+        buttons = [b.callback_data for row in rows for b in row]
+        labels = [b.text for row in rows for b in row]
         self.assertIn("product:mediaend", buttons)
+        self.assertIn("✅ عکس‌ها تمام شد؛ ادامه", labels)
 
     def test_typed_text_on_the_review_screen_is_only_a_proposal(self):
         session = PF.ProductSession(mode="new", info_text="قیمت 698000")
@@ -205,9 +208,12 @@ class TestCollectVersusReview(FlowStateTestCase):
         result = asyncio.run(PF.add_more(update, SimpleNamespace()))
         self.assertEqual(result, PF.COLLECT)
         # the toast comes first, then the message with the collect keyboard
-        self.assertTrue(any("تصاویر تمام شد" in str(item) for item in sent), sent)
-        buttons = [b.callback_data for row in sent[-1][2]["reply_markup"].inline_keyboard for b in row]
+        self.assertIn("عکس‌ها تمام شد؛ ادامه", sent[-1][1])
+        markup = sent[-1][2]["reply_markup"]
+        buttons = [b.callback_data for row in markup.inline_keyboard for b in row]
+        labels = [b.text for row in markup.inline_keyboard for b in row]
         self.assertIn("product:mediaend", buttons)
+        self.assertIn("✅ عکس‌ها تمام شد؛ ادامه", labels)
 
 
 @needs_flow
@@ -253,6 +259,192 @@ class TestFinishMedia(FlowStateTestCase):
         result = asyncio.run(PF.finish_media(update, SimpleNamespace()))
         self.assertEqual(result, PF.COLLECT)
         self.assertTrue(any("هنوز" in str(item) for item in sent), sent)
+
+
+@needs_flow
+class TestModelCaptionsFromBatches(FlowStateTestCase):
+    def test_models_from_later_photo_batches_do_not_replace_earlier_captions(self):
+        import tempfile
+        from unittest.mock import AsyncMock, patch
+
+        from bot.services.phone_parser import normalize_caption
+        from bot.services.product_extractor import ProductData
+
+        first_caption = """Samsung:
+A06
+A07"""
+        second_caption = """XIAOMI / POCO:
+NOTE11/11S/12S"""
+        root = Path(tempfile.mkdtemp()) / "session"
+        root.mkdir(parents=True)
+        self.addCleanup(__import__("shutil").rmtree, root.parent, True)
+        session = PF.ProductSession(mode="new", workspace=root, chat_id=9)
+        PF.sessions[7] = session
+
+        async def download(_context, _file_id, target):
+            target.write_bytes(b"original-image")
+            return len(b"original-image")
+
+        def compress(source, directory):
+            directory.mkdir(parents=True, exist_ok=True)
+            output = directory / f"{source.stem}_compressed.jpg"
+            output.write_bytes(b"compressed")
+            return output
+
+        parse_calls = 0
+
+        async def parse(session):
+            nonlocal parse_calls
+            parse_calls += 1
+            session.models = normalize_caption(session.model_text).split(" | ")
+            session.data = ProductData(title="قاب", models=session.models)
+            session.color_summary = ""
+            return session.data
+
+        class Bot:
+            async def send_message(self, *args, **kwargs):
+                return SimpleNamespace(message_id=1)
+
+        def photo(message_id, caption):
+            return SimpleNamespace(
+                message_id=message_id,
+                caption=caption,
+                text=None,
+                photo=[SimpleNamespace(file_id=f"file-{message_id}")],
+                document=None,
+            )
+
+        context = SimpleNamespace(bot=Bot())
+
+        async def run_batches():
+            with (
+                patch.object(PF, "_download_with_retry", new=download),
+                patch.object(PF, "compress_image", new=compress),
+                patch.object(PF, "_telegram_log", new=AsyncMock()),
+                patch.object(PF, "_status", new=AsyncMock()),
+                patch.object(PF, "_extract", new=parse),
+                patch.object(PF.flow_state, "record"),
+            ):
+                await PF._prepare_files(7, [photo(1, first_caption)], context)
+                await PF._prepare_files(7, [photo(2, second_caption)], context)
+                await PF._prepare_files(7, [photo(3, second_caption)], context)
+
+        asyncio.run(run_batches())
+        self.assertEqual(2, parse_calls, "an exact repeated caption must not trigger another AI parse")
+        self.assertEqual(3, len(session.files), "all media should still be kept")
+        self.assertEqual(first_caption + "\n\n" + second_caption, session.model_text)
+        self.assertTrue(
+            {"A06", "A07", "Redmi Note 11", "Redmi Note 11S", "Redmi Note 12S"}.issubset(
+                set(session.models)
+            ),
+            session.models,
+        )
+
+
+@needs_flow
+class TestExtractionFastPaths(FlowStateTestCase):
+    def test_empty_media_intake_does_not_call_ai(self):
+        from unittest.mock import AsyncMock, patch
+
+        async def run():
+            session = PF.ProductSession(mode="new")
+            with (
+                patch.object(PF, "ai_normalize", new=AsyncMock()) as normalize,
+                patch.object(PF, "extract_product", new=AsyncMock()) as extract,
+            ):
+                await PF._extract(session, learn=False)
+            normalize.assert_not_awaited()
+            extract.assert_not_awaited()
+            self.assertEqual([], session.models)
+            self.assertIsNotNone(session.data)
+
+        asyncio.run(run())
+
+    def test_model_caption_intake_defers_the_product_details_ai_call(self):
+        from unittest.mock import AsyncMock, patch
+
+        from bot.services.product_extractor import ProductData
+
+        async def run():
+            session = PF.ProductSession(mode="new", model_text="Samsung A06", defer_details=True)
+            with (
+                patch.object(PF, "ai_normalize", new=AsyncMock(return_value="A06")) as normalize,
+                patch.object(PF, "extract_product", new=AsyncMock(return_value=ProductData())) as extract,
+            ):
+                await PF._extract(session, learn=False)
+            normalize.assert_awaited_once()
+            extract.assert_not_awaited()
+            self.assertEqual(["A06"], session.models)
+            self.assertEqual(["A06"], session.data.models)
+
+        asyncio.run(run())
+
+    def test_model_and_detail_ai_calls_share_one_http_client(self):
+        from unittest.mock import AsyncMock, patch
+
+        from _flow_harness import patched_settings, settings_with
+        from bot.services.product_extractor import ProductData
+
+        class Client:
+            closed = False
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                self.closed = True
+
+        async def run():
+            client = Client()
+            session = PF.ProductSession(
+                mode="new", model_text="iPhone 15", info_text="قیمت 698000"
+            )
+            with (
+                patched_settings(settings_with(
+                    ai_base_url="https://ai.example/v1", ai_token="test-token", ai_model="test-model"
+                )),
+                patch("httpx.AsyncClient", return_value=client) as make_client,
+                patch.object(PF, "ai_normalize", new=AsyncMock(return_value="iPhone 15")) as normalize,
+                patch.object(PF, "extract_product", new=AsyncMock(return_value=ProductData())) as extract,
+            ):
+                await PF._extract(session, learn=False)
+            make_client.assert_called_once()
+            normalize.assert_awaited_once()
+            extract.assert_awaited_once()
+            self.assertIs(normalize.await_args.kwargs["client"], client)
+            self.assertIs(extract.await_args.kwargs["client"], client)
+            self.assertTrue(client.closed)
+
+        asyncio.run(run())
+
+
+@needs_flow
+class TestMediaDownloadSafety(FlowStateTestCase):
+    def test_partial_telegram_download_is_removed_before_retry(self):
+        from tempfile import TemporaryDirectory
+        from unittest.mock import AsyncMock, patch
+
+        from telegram.error import TimedOut
+
+        calls = 0
+
+        async def download_to_drive(*, custom_path):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                Path(custom_path).write_bytes(b"partial")
+                raise TimedOut("read timed out")
+            Path(custom_path).write_bytes(b"complete")
+
+        telegram_file = SimpleNamespace(file_size=8, download_to_drive=download_to_drive)
+        context = SimpleNamespace(bot=SimpleNamespace(get_file=AsyncMock(return_value=telegram_file)))
+        with TemporaryDirectory() as directory, patch.object(PF.asyncio, "sleep", new=AsyncMock()):
+            target = Path(directory) / "image.jpg"
+            size = asyncio.run(PF._download_with_retry(context, "opaque-file-id", target))
+            self.assertEqual(8, size)
+            self.assertEqual(b"complete", target.read_bytes())
+        self.assertEqual(2, calls)
+        self.assertEqual(2, context.bot.get_file.await_count)
 
 
 @needs_flow

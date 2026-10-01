@@ -313,23 +313,47 @@ def _samsung_suffix(raw: str) -> tuple[str, int]:
     return "", 0
 
 
+_SAMSUNG_HEADER_RE = re.compile(
+    r"(?i)^\s*(?:samsung|galaxy(?:\s+samsung)?|سامسونگ|گلکسی)\s*:?\s*$"
+)
+_XIAOMI_HEADER_RE = re.compile(
+    r"(?i)^\s*(?:xiaomi(?:\s*/\s*poco)?|poco|شیائومی(?:\s*/\s*پوکو)?|پوکو)"
+    r"(?:\s*\([^)]*\))?\s*:?\s*$"
+)
+
+
 def extract_samsung_models(text: str) -> list[PhoneModel]:
     cleaned = _clean(text)
     found: dict[str, PhoneModel] = {}
     samsung_context = False
+    xiaomi_context = False
 
     for raw_line in cleaned.splitlines():
         line = raw_line.strip()
         if not line:
             continue
-        low = line.lower()
-        if re.fullmatch(r"(?:samsung|galaxy\s+samsung)?\s*", low):
+        if _SAMSUNG_HEADER_RE.fullmatch(line):
             samsung_context = True
+            xiaomi_context = False
             continue
-        if re.match(rf"(?i)^\s*(?:{_IPHONE_BRAND}|xiaomi|redmi|poco)\b", line):
+        if _XIAOMI_HEADER_RE.fullmatch(line):
+            samsung_context = False
+            xiaomi_context = True
+            continue
+        if re.match(rf"(?i)^\s*(?:{_IPHONE_BRAND}|apple)\b", line):
+            samsung_context = False
+            xiaomi_context = False
+            continue
+        if re.match(r"(?i)^\s*(?:xiaomi|redmi|poco|شیائومی|ردمی|پوکو)\b", line):
+            # A POCO model line inside a Xiaomi/POCO section is an entry, not a
+            # new section; keep that context for the following shorthand rows.
             samsung_context = False
             continue
 
+        # Under an explicit Xiaomi/POCO heading, A5/C71 is a product family,
+        # not Samsung A5 followed by noise. Leave that row to the Xiaomi parser.
+        if xiaomi_context and re.fullmatch(r"(?i)A\s*\d{1,3}\s*/\s*C\s*\d{1,3}", line):
+            continue
         if not samsung_context and not re.search(r"(?i)(?<![A-Za-z0-9])[SA]\d{1,3}", line):
             continue
 
@@ -388,56 +412,112 @@ def _xiaomi_variant(raw: str) -> tuple[str, int]:
     return "", 0
 
 
+def _parse_note_component(raw: str) -> PhoneModel | None:
+    """Read full or shortened Redmi Note tokens (``Note13Pro`` / ``12S``)."""
+    token = _clean(raw).strip().strip("|,;:.- ")
+    token = re.sub(r"(?i)^(?:(?:xiaomi|redmi)\s+)?note\s*", "", token)
+    compact = re.sub(r"\s+", "", token)
+    match = re.fullmatch(r"(?i)(\d{1,3})(s)?(proplus|pro\+|pro|plus)?(4g|5g)?", compact)
+    if not match:
+        return None
+    number = int(match.group(1))
+    if not 1 <= number <= 100:
+        return None
+    variant_raw = "s" if match.group(2) else (match.group(3) or "")
+    variant, rank = _xiaomi_variant(variant_raw)
+    label = f"Redmi Note {number}"
+    if variant == "S":
+        label += "S"
+    elif variant:
+        label += f" {variant}"
+    network = (match.group(4) or "").upper()
+    if network:
+        label += f" {network}"
+    return PhoneModel("Xiaomi", (number, rank, 0, 0), label)
+
+
+def _parse_poco_component(raw: str, *, allow_short: bool = False) -> PhoneModel | None:
+    """Read a POCO token, with bare M/C/X shorthand allowed in its own section."""
+    token = _clean(raw).strip().strip("|,;:.- ")
+    explicit = bool(re.match(r"(?i)^poco\b", token))
+    if explicit:
+        token = re.sub(r"(?i)^poco\s*", "", token, count=1)
+    elif not allow_short:
+        return None
+    match = re.fullmatch(r"(?i)([xmc])\s*(\d{1,3})(?:\s*(pro\s*plus|pro\+|pro|plus))?", token)
+    if not match:
+        return None
+    family, number_text, raw_variant = match.groups()
+    family = family.upper()
+    number = int(number_text)
+    variant, rank = _xiaomi_variant(raw_variant or "")
+    label = f"POCO {family}{number}" + (f" {variant}" if variant else "")
+    return PhoneModel("Xiaomi", (1000 + number, rank, 0, 0), label)
+
+
+def _parse_xiaomi_shorthand(raw: str) -> PhoneModel | None:
+    """Read Redmi A/number-C and bare POCO families inside a Xiaomi/POCO list."""
+    token = _clean(raw).strip().strip("|,;:.- ")
+    match = re.fullmatch(r"(?i)A\s*(\d{1,3})", token)
+    if match:
+        number = int(match.group(1))
+        return PhoneModel("Xiaomi", (number, 0, 0, 0), f"Redmi A{number}")
+    match = re.fullmatch(r"(?i)(\d{1,3})\s*C", token)
+    if match:
+        number = int(match.group(1))
+        return PhoneModel("Xiaomi", (1000 + number, 0, 1, 0), f"Redmi {number}C")
+    return _parse_poco_component(token, allow_short=True)
+
+
 def extract_xiaomi_models(text: str) -> list[PhoneModel]:
     cleaned = _clean(text)
     found: dict[str, PhoneModel] = {}
     xiaomi_context = False
 
+    def keep(model: PhoneModel | None) -> None:
+        if model is not None:
+            found[model.label.casefold()] = model
+
     for raw_line in cleaned.splitlines():
         line = raw_line.strip()
         if not line:
             continue
-        low = line.lower()
-
-        if re.match(r"^\s*xiaomi\s*$", low):
+        if _XIAOMI_HEADER_RE.fullmatch(line):
             xiaomi_context = True
             continue
-        if re.match(rf"(?i)^\s*(?:{_IPHONE_BRAND}|samsung)\b", low):
+        if _SAMSUNG_HEADER_RE.fullmatch(line) or re.match(
+            rf"(?i)^\s*(?:{_IPHONE_BRAND}|apple|samsung|سامسونگ)\b", line
+        ):
             xiaomi_context = False
             continue
 
-        # Accept Note models in Xiaomi context, and also explicit Xiaomi/Redmi/POCO forms.
-        if not xiaomi_context and not re.search(r"(?i)\b(?:xiaomi\s+)?(?:redmi\s+)?note\s*\d", line):
-            continue
+        # Explicit POCO/Redmi families are useful even without a section title.
+        for poco in re.finditer(r"(?i)\bpoco\s*[xmc]\s*\d{1,3}(?:\s*(?:pro|plus))?", line):
+            keep(_parse_poco_component(poco.group(0)))
+        for redmi in re.finditer(r"(?i)\bredmi\s+(A\s*\d{1,3}|\d{1,3}\s*C)\b", line):
+            keep(_parse_xiaomi_shorthand(redmi.group(1)))
 
-        rx = re.compile(
-            r"(?i)\b(?:(xiaomi)\s+)?(?:(redmi)\s+)?"
-            r"note\s*(\d{1,3})"
-            r"\s*(s)?"
-            r"\s*(pro\s*plus|pro\+|pro|plus)?"
-            r"\s*(4\s*G|5\s*G)?"
-        )
-        for m in rx.finditer(line):
-            redmi = bool(m.group(2))
-            number = int(m.group(3))
-            if not 1 <= number <= 100:
+        # Slashes abbreviate the repeated family name in supplier posts:
+        # NOTE9PRO/9S -> Note 9 Pro + Note 9S, and M6PRO after Note13PRO
+        # is a separate POCO model, not another Redmi Note variant.
+        groups = re.split(r"\s*[|,;]\s*", line)
+        for group in groups:
+            parts = [part.strip() for part in re.split(r"\s*/\s*", group) if part.strip()]
+            has_note = any(re.search(r"(?i)(?:redmi\s+)?note\s*\d", part) for part in parts)
+            if has_note:
+                for part in parts:
+                    note = _parse_note_component(part)
+                    if note is not None:
+                        keep(note)
+                    else:
+                        keep(_parse_xiaomi_shorthand(part))
                 continue
 
-            variant_raw = m.group(5) or (m.group(4) or "")
-            variant, rank = _xiaomi_variant(variant_raw)
-            network = re.sub(r"\s+", "", m.group(6) or "").upper()
-
-            # Generic Xiaomi is removed from output. Redmi is meaningful and preserved.
-            # In Xiaomi/Redmi Note listings, the product family is Redmi Note.
-            # Keep Redmi in the canonical name even when the source shortens it to only Note.
-            label = "Redmi Note " + str(number)
-            if variant:
-                label += f" {variant}"
-            if network:
-                label += f" {network}"
-
-            key = (number, rank, 0 if not redmi else 1, 0)
-            found[label.casefold()] = PhoneModel("Xiaomi", key, label)
+            if xiaomi_context:
+                for part in parts:
+                    keep(_parse_xiaomi_shorthand(part))
+            elif not parts and not re.search(r"(?i)\b(?:redmi\s+)?note\s*\d", line):
+                continue
 
     return list(found.values())
 
