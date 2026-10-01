@@ -4,11 +4,13 @@
 هر صحنه یک گفتگوی کامل است: دکمه ← جست‌وجو ← انتخاب محصول ← فرستادن عکس/متن ← کارتِ
 مقایسه ← «✅ اعمال تغییرات»؛ و در پایانِ هر صحنه، آنچه فروشگاه *واقعاً* نگه داشته چاپ می‌شود.
 
-* صحنهٔ ۱ مسیر اصلی: عکس + مدل‌های تازه + قیمت + موجودی.
+* صحنهٔ ۱ مسیر اصلی: عکس + مدل‌های تازه + قیمت + موجودی ← همهٔ واریژن‌ها پاک و از نو ساخته می‌شوند.
 * صحنهٔ ۲ «ننوشتن یعنی دست‌نخوردن»: فقط موجودی، قیمت همان قبلی می‌ماند.
 * صحنهٔ ۳ خطِ تصادفی («سلام») عنوان محصول را عوض نمی‌کند.
 * صحنهٔ ۴ فروشگاه وسط کار عوض شده: کارت دوباره نشان داده می‌شود و چیزی نوشته نمی‌شود.
-* صحنهٔ ۵ نوشتن نیمه‌کاره می‌شکند؛ دوباره زدنِ همان دکمه فقط باقی‌مانده را می‌فرستد.
+* صحنهٔ ۵ ساختنِ واریژن‌ها وسط کار می‌شکند؛ دوباره زدنِ همان دکمه شبکه را کامل می‌کند، بی‌تکرار.
+* صحنهٔ ۶ فهرستِ مدل بدون قیمت و موجودی: واریژن‌ها از نو ساخته می‌شوند، قیمت/موجودی قبلی می‌ماند.
+* صحنهٔ ۷ فهرستی که همان فهرستِ فروشگاه است: هیچ بازسازی‌ای نیست، فقط قیمت درجا عوض می‌شود.
 
 اجرا:
 
@@ -199,7 +201,9 @@ class Scene:
         for row in rows:
             values = " × ".join(item["option"] for item in row["attributes"])
             stock = row.get("stock_quantity")
-            print(f"   • {values:<34} قیمت {int(row['regular_price'] or 0):>9,}   موجودی {stock if stock is not None else '—'}")
+            picture = f"  🖼{row['image']['id']}" if row.get("image") else ""
+            print(f"   • #{row['id']}  {values:<30} قیمت {int(row['regular_price'] or 0):>9,}   "
+                  f"موجودی {stock if stock is not None else '—'}{picture}")
 
     def writes(self) -> int:
         return len([call for call in self.shop.requests if call[0] != "GET"])
@@ -211,13 +215,16 @@ _REAL = (product_match.find, product_match.read, update_apply.apply)
 def scene_main_path() -> None:
     scene = Scene("صحنهٔ ۱ — مسیر اصلی: عکس + مدل‌های تازه + قیمت + موجودی")
     scene.shop_table("قبل")
+    old_ids = set(scene.shop.variations)
     scene.open_product()
     scene.photos(2)
     scene.type("iPhone 13 Pro Max\niPhone 15\niPhone 15 Pro\nقیمت 720000 تومان\nموجودی 12", message_id=41)
     print(f"\n   (تا اینجا درخواستِ نوشتن به فروشگاه: {scene.writes()})")
     scene.confirm()
     scene.shop_table("بعد")
-    print(f"\n   درخواست‌های نوشتن: {scene.writes()} · پیام‌هایی که به «گروه لاگ» رفت: {len(scene.chat.sent_to_log)}")
+    print(f"\n   شناسهٔ واریژن‌های قبلی که هنوز مانده: {sorted(old_ids & set(scene.shop.variations)) or 'هیچ‌کدام'}"
+          f" · واریژن‌های فعلی: {len(scene.shop.variations)}")
+    print(f"   درخواست‌های نوشتن: {scene.writes()} · پیام‌هایی که به «گروه لاگ» رفت: {len(scene.chat.sent_to_log)}")
 
 
 def scene_silence() -> None:
@@ -251,21 +258,43 @@ def scene_shop_moved() -> None:
 
 
 def scene_half_failed() -> None:
-    scene = Scene("صحنهٔ ۵ — نوشتن نیمه‌کاره می‌شکند؛ دوباره زدن فقط باقی‌مانده را می‌فرستد")
+    scene = Scene("صحنهٔ ۵ — ساختنِ واریژن‌ها وسط کار می‌شکند؛ دوباره زدن شبکه را کامل می‌کند")
     scene.open_product()
     scene.type("iPhone 13 Pro Max\niPhone 15\nقیمت 720000 تومان\nموجودی 12")
-    print("\n🏬 (فروشگاه ساختنِ واریژن تازه را رد می‌کند)")
-    scene.shop.reject_creates = True
+    print("\n🏬 (batch وسط کار قطع می‌شود: فروشگاه فقط ۳ ردیف اول را ساخت و بقیه را نپذیرفت)")
+    scene.shop.create_limit = 3
     scene.confirm()
-    scene.shop_table("بعد از شکست (مدل قدیمی هنوز هست؛ محصول بی‌مدل نماند)")
+    scene.shop_table("بعد از شکست (قدیمی‌ها هنوز هستند؛ محصول بی‌واریژن نماند)")
     print("\n🏬 (فروشگاه خوب شد)")
-    scene.shop.reject_creates = False
+    scene.shop.create_limit = None
     scene.shop.requests.clear()
     scene.confirm()
     scene.shop_table("بعد از دوباره زدن")
-    sent = scene.shop.body("POST", "/variations/batch")
-    print(f"\n   در تلاش دوم: ساخت {len(sent.get('create', []))} · به‌روزرسانی {len(sent.get('update', []))}"
-          " ← قیمت/موجودیِ نشسته دوباره فرستاده نشد")
+    print(f"\n   واریژن‌ها: {len(scene.shop.variations)} · ترکیب‌های متفاوت: {len(scene.shop.grid())}"
+          " ← هیچ ترکیبی دوبار نیست و iPhone 15 هر سه رنگ را دارد")
+
+
+def scene_rebuild_keeps_what_was_not_written() -> None:
+    scene = Scene("صحنهٔ ۶ — فهرست مدل بدون قیمت و موجودی: واریژن‌ها از نو، قیمت/موجودی قبلی می‌ماند")
+    scene.shop_table("قبل")
+    scene.open_product()
+    scene.type("iPhone 13 Pro Max\nS24 Ultra\nS25 Ultra")
+    scene.confirm()
+    scene.shop_table("بعد (شناسه‌ها تازه‌اند؛ ۶۹۸٬۰۰۰/۵۹۸٬۰۰۰ و موجودی ۰/۷ همان قبلی است)")
+
+
+def scene_same_list_is_no_rebuild() -> None:
+    scene = Scene("صحنهٔ ۷ — فهرستی که همان فهرستِ فروشگاه است: هیچ بازسازی‌ای نیست")
+    scene.shop_table("قبل")
+    old_ids = set(scene.shop.variations)
+    scene.open_product()
+    scene.type("iPhone 13 Pro Max\nS24 Ultra\nقیمت 720000 تومان")
+    scene.confirm()
+    scene.shop_table("بعد")
+    deletes = [call for call in scene.shop.requests
+               if call[0] == "DELETE" or '"delete"' in call[3]]
+    same = "بله" if old_ids == set(scene.shop.variations) else "نه"
+    print(f"\n   همان شناسه‌ها؟ {same} · درخواستِ حذف: {len(deletes)}")
 
 
 def main() -> None:
@@ -274,7 +303,8 @@ def main() -> None:
     PF.feature_allowed = lambda user_id, key: True
     try:
         with patched_settings(settings_with(log_chat_id=LOG_CHAT)), no_sleep(), temp_ledger():
-            for scene in (scene_main_path, scene_silence, scene_stray_line, scene_shop_moved, scene_half_failed):
+            for scene in (scene_main_path, scene_silence, scene_stray_line, scene_shop_moved, scene_half_failed,
+                          scene_rebuild_keeps_what_was_not_written, scene_same_list_is_no_rebuild):
                 scene()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

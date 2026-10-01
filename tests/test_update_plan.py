@@ -4,8 +4,9 @@ These are the seller's own rules, one test each:
 
 * a field the draft says nothing about is never touched (no price ⇒ the old price stays);
 * a value the shop already has is not a change (and is not sent);
-* a model list is the whole list — models the shop has and the list lacks are deleted, models the
-  list has and the shop lacks are created, models in both stay the *same variation*;
+* a model list is the whole list, and a list that comes out different rebuilds the variations:
+  every variation the shop has is deleted and the whole grid is generated again — a combination
+  that existed keeps the price, stock and picture the seller did not rewrite;
 * new photos replace the gallery;
 * the plan is computed from what the shop returned, and a product it could not read completely is
   never planned on.
@@ -16,6 +17,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from dataclasses import replace
 
 os.environ.setdefault("BOT_TOKEN", "123456:TEST")
 os.environ.setdefault("SUDO_IDS", "1234567")
@@ -30,9 +32,30 @@ def shop(*, extra: list[dict] | None = None, **product_over: object) -> product_
     return shop_product(extra=extra, **product_over)
 
 
-def plan_for(data: dict, *, images: int = 0, product: product_match.ShopProduct | None = None
-             ) -> update_plan.UpdatePlan:
-    return update_plan.build(product or shop(), data, image_count=images)
+def plan_for(data: dict, *, images: int = 0, product: product_match.ShopProduct | None = None,
+             baseline: product_match.ShopProduct | None = None) -> update_plan.UpdatePlan:
+    return update_plan.build(product or shop(), data, image_count=images, baseline=baseline)
+
+
+def grid_after(product: product_match.ShopProduct, plan: update_plan.UpdatePlan) -> set[tuple[str, str]]:
+    """(model, colour) of every variation the shop would hold once ``plan`` is applied."""
+    gone = {variation.variation_id for variation in plan.deletes}
+    stays = {(variation.model, variation.color) for variation in product.variations
+             if variation.variation_id not in gone}
+    made = {(dict(row.combo)["مدل"], dict(row.combo)["رنگ"]) for row in plan.creates}
+    return stays | made
+
+
+def made(plan: update_plan.UpdatePlan) -> list[tuple[str, ...]]:
+    """The combinations ``plan`` creates, as sorted value tuples."""
+    return sorted(tuple(dict(row.combo).values()) for row in plan.creates)
+
+
+def creating(plan: update_plan.UpdatePlan, *values: str) -> update_plan.VariationCreate:
+    for row in plan.creates:
+        if tuple(dict(row.combo).values()) == values:
+            return row
+    raise AssertionError(f"{values} is not created: {made(plan)}")
 
 
 class SilenceIsNotAnInstruction(unittest.TestCase):
@@ -175,22 +198,27 @@ class PricesAndStock(unittest.TestCase):
 class ModelsAreTheWholeList(unittest.TestCase):
     NEW_LIST = ["iPhone 13 Pro Max", "iPhone 15", "iPhone 15 Pro"]
 
-    def test_new_models_are_added_old_ones_removed_and_shared_ones_stay(self) -> None:
+    def test_a_new_model_list_deletes_every_variation_and_generates_the_grid_again(self) -> None:
         plan = plan_for({"models": self.NEW_LIST})
-        self.assertEqual(sorted(variation.variation_id for variation in plan.deletes), [9003])
-        created = [dict(row.combo)["مدل"] for row in plan.creates]
-        self.assertEqual(sorted(set(created)), ["iPhone 15", "iPhone 15 Pro"])
-        self.assertEqual(plan.kept, 2, "iPhone 13 Pro Max همان واریژن‌های قبلی است")
-        self.assertEqual(plan.updates, [], "چیزی به‌جز ساختار گفته نشد")
+        self.assertTrue(plan.regenerate)
+        self.assertEqual(sorted(variation.variation_id for variation in plan.deletes), [9001, 9002, 9003],
+                         "همهٔ واریژن‌ها پاک می‌شوند؛ حتی مدلی که در فهرست می‌ماند")
+        self.assertEqual((plan.kept, plan.updates), (0, []), "هیچ واریژنی درجا نگه داشته نمی‌شود")
+        self.assertEqual(made(plan), [
+            ("iPhone 13 Pro Max", "سفید"), ("iPhone 13 Pro Max", "مشکی"),
+            ("iPhone 15", "سبز"), ("iPhone 15", "سفید"), ("iPhone 15", "مشکی"),
+            ("iPhone 15 Pro", "سبز"), ("iPhone 15 Pro", "سفید"), ("iPhone 15 Pro", "مشکی")])
+        self.assertEqual(plan.variations_after, 8)
         change = plan.axis_changes[0]
         self.assertEqual((change.added, change.removed, change.kept),
                          (("iPhone 15", "iPhone 15 Pro"), ("S24 Ultra",), 1))
 
     def test_every_new_model_gets_every_colour_the_product_has(self) -> None:
         plan = plan_for({"models": self.NEW_LIST})
-        colours = sorted({dict(row.combo)["رنگ"] for row in plan.creates})
+        colours = sorted({dict(row.combo)["رنگ"] for row in plan.creates
+                          if dict(row.combo)["مدل"] != "iPhone 13 Pro Max"})
         self.assertEqual(colours, ["سبز", "سفید", "مشکی"])
-        self.assertEqual(len(plan.creates), 6)
+        self.assertEqual(len(plan.creates), 8, "کل شبکه ساخته می‌شود: ۲ مدل تازه × ۳ رنگ + iPhone 13 × ۲")
 
     def test_the_attribute_lists_are_rewritten_whole_and_in_the_sellers_order(self) -> None:
         plan = plan_for({"models": self.NEW_LIST})
@@ -216,8 +244,9 @@ class ModelsAreTheWholeList(unittest.TestCase):
 
     def test_the_list_replaces_even_when_nothing_is_added(self) -> None:
         plan = plan_for({"models": ["iPhone 13 Pro Max"]})
-        self.assertEqual([variation.variation_id for variation in plan.deletes], [9003])
-        self.assertEqual(plan.creates, [])
+        self.assertEqual(sorted(variation.variation_id for variation in plan.deletes), [9001, 9002, 9003])
+        self.assertEqual(made(plan), [("iPhone 13 Pro Max", "سفید"), ("iPhone 13 Pro Max", "مشکی")],
+                         "مدلِ مانده همان رنگ‌هایی را که داشت دوباره می‌گیرد")
         assert plan.attributes is not None
         model = next(item for item in plan.attributes if item["name"] == "مدل")
         self.assertEqual(model["options"], ["iPhone 13 Pro Max"],
@@ -227,28 +256,31 @@ class ModelsAreTheWholeList(unittest.TestCase):
         # S24 Ultra only ever came in سبز; iPhone 13 Pro Max in مشکی/سفید. A new list that says
         # nothing about colours must not invent S24 × مشکی.
         plan = plan_for({"models": ["iPhone 13 Pro Max", "S24 Ultra", "S25 Ultra"]})
-        made = {tuple(dict(row.combo).values()) for row in plan.creates}
-        self.assertNotIn(("S24 Ultra", "مشکی"), made)
-        self.assertNotIn(("S24 Ultra", "سفید"), made)
-        self.assertEqual({model for model, _ in made}, {"S25 Ultra"})
-        self.assertEqual(plan.deletes, [])
+        combos = made(plan)
+        self.assertNotIn(("S24 Ultra", "مشکی"), combos)
+        self.assertNotIn(("S24 Ultra", "سفید"), combos)
+        self.assertEqual(sorted(set(combos) - {("S25 Ultra", color) for color in ("سبز", "سفید", "مشکی")}),
+                         [("S24 Ultra", "سبز"), ("iPhone 13 Pro Max", "سفید"), ("iPhone 13 Pro Max", "مشکی")],
+                         "مدل‌های مانده با همان رنگ‌هایشان دوباره ساخته می‌شوند، مدل تازه با همهٔ رنگ‌ها")
+        self.assertEqual(len(plan.deletes), 3, "همهٔ واریژن‌های قبلی پاک می‌شوند")
 
     def test_a_colour_list_replaces_the_colours(self) -> None:
         plan = plan_for({"attributes": {"رنگ": ["مشکی", "آبی"]}})
         change = next(item for item in plan.axis_changes if item.kind == update_plan.COLOR)
         self.assertEqual((change.added, sorted(change.removed)), (("آبی",), ["سبز", "سفید"]))
-        self.assertEqual(sorted(variation.variation_id for variation in plan.deletes), [9002, 9003])
-        # A colour list with no per-model limits is the full grid: both models × both colours,
-        # minus the iPhone × مشکی that already exists.
-        self.assertEqual(sorted(tuple(dict(row.combo).values()) for row in plan.creates),
-                         [("S24 Ultra", "آبی"), ("S24 Ultra", "مشکی"), ("iPhone 13 Pro Max", "آبی")])
+        self.assertEqual(sorted(variation.variation_id for variation in plan.deletes), [9001, 9002, 9003])
+        # A colour list with no per-model limits is the full grid: both models × both colours —
+        # all four generated again, the iPhone × مشکی that already existed included.
+        self.assertEqual(made(plan), [("S24 Ultra", "آبی"), ("S24 Ultra", "مشکی"),
+                                      ("iPhone 13 Pro Max", "آبی"), ("iPhone 13 Pro Max", "مشکی")])
 
     def test_an_explicit_colour_list_per_model_narrows_the_grid(self) -> None:
         plan = plan_for({"models": ["iPhone 13 Pro Max", "S24 Ultra"],
                          "model_colors": {"iPhone 13 Pro Max": ["مشکی"],
                                           "S24 Ultra": ["سبز"]}})
-        self.assertEqual([variation.variation_id for variation in plan.deletes], [9002],
-                         "سفید برای آیفون گفته نشد؛ همان یک واریژن حذف می‌شود")
+        self.assertEqual(sorted(variation.variation_id for variation in plan.deletes), [9001, 9002, 9003])
+        self.assertEqual(made(plan), [("S24 Ultra", "سبز"), ("iPhone 13 Pro Max", "مشکی")],
+                         "سفید برای آیفون گفته نشد؛ در شبکهٔ تازه نیست")
 
     def test_models_given_to_a_product_without_a_model_axis_add_the_axis(self) -> None:
         product = product_match.ShopProduct.from_row(product_row(attributes=[
@@ -305,11 +337,12 @@ class AskingAgainFinishesWhatStoppedHalfWay(unittest.TestCase):
         self.assertIsNone(plan.attributes, "فهرست‌ها از قبل نشسته‌اند؛ دوباره PUT نمی‌شوند")
         self.assertEqual(plan.kept, 2)
 
-    def test_it_rebuilds_the_grid_the_original_update_would_have(self) -> None:
-        retry = plan_for({"models": ["iPhone 13 Pro Max", "iPhone 15"]}, product=self.half_done())
+    def test_it_ends_on_the_grid_the_original_update_would_have_made(self) -> None:
+        interrupted = self.half_done()
+        retry = plan_for({"models": ["iPhone 13 Pro Max", "iPhone 15"]}, product=interrupted)
         first = plan_for({"models": ["iPhone 13 Pro Max", "iPhone 15"]})
-        self.assertEqual(sorted(tuple(dict(row.combo).values()) for row in retry.creates),
-                         sorted(tuple(dict(row.combo).values()) for row in first.creates))
+        self.assertFalse(retry.regenerate, "فهرست‌ها از قبل نشسته‌اند؛ کار نیمه‌مانده کامل می‌شود، نه از نو")
+        self.assertEqual(grid_after(interrupted, retry), grid_after(shop(), first))
 
     def test_a_consistent_shop_with_a_restricted_grid_is_left_alone(self) -> None:
         plan = plan_for({"models": ["iPhone 13 Pro Max", "S24 Ultra"]})
@@ -354,20 +387,23 @@ class NewVariations(unittest.TestCase):
 
     def test_stock_given_goes_onto_the_new_variations_too(self) -> None:
         plan = plan_for({"models": ["iPhone 13 Pro Max", "iPhone 15"], "stock": 10})
-        row = plan.creates[0].payload()
+        row = creating(plan, "iPhone 15", "مشکی").payload()
         self.assertEqual((row["manage_stock"], row["stock_quantity"], row["stock_status"]),
                          (True, 10, "instock"))
-        self.assertTrue(all(change.stock for change in plan.updates), "واریژن‌های مانده هم ۱۰ می‌شوند")
+        for create in plan.creates:
+            self.assertEqual(create.stock, 10, "واریژن‌های مانده هم ۱۰ می‌شوند: " + create.label)
 
     def test_without_stock_new_variations_are_unmanaged_and_the_seller_is_told(self) -> None:
         plan = plan_for({"models": ["iPhone 13 Pro Max", "iPhone 15"], "price": 698_000})
-        row = plan.creates[0].payload()
-        self.assertNotIn("manage_stock", row)
+        self.assertNotIn("manage_stock", creating(plan, "iPhone 15", "مشکی").payload())
         self.assertTrue(any("موجودی" in warning and "ننوشتی" in warning for warning in plan.warnings))
+        old = creating(plan, "iPhone 13 Pro Max", "مشکی").payload()
+        self.assertEqual((old["manage_stock"], old["stock_quantity"]), (True, 0),
+                         "ترکیبی که از قبل بود شمارش موجودی‌اش را از دست نمی‌دهد")
 
     def test_new_variations_are_visible_published_and_ordered(self) -> None:
         plan = plan_for({"models": ["iPhone 13 Pro Max", "iPhone 15"], "price": 698_000})
-        row = plan.creates[0].payload()
+        row = creating(plan, "iPhone 15", "مشکی").payload()
         self.assertEqual((row["status"], row["visible"]), ("publish", True))
         self.assertEqual([create.order for create in plan.creates], sorted(create.order for create in plan.creates))
         self.assertEqual(row["attributes"], [{"name": "مدل", "option": "iPhone 15"},
@@ -378,6 +414,228 @@ class NewVariations(unittest.TestCase):
         self.assertEqual(len(plan.deletes), 3)
         self.assertTrue(any("حذف می‌شود" in warning for warning in plan.warnings),
                         "«دو مدل فرستادم و محصول چهل واریژن را از دست داد» باید دیده شود")
+
+
+class AChangedListRebuildsEveryVariation(unittest.TestCase):
+    """«If what a variation is built from changed, delete them all and generate the grid again» —
+    without losing anything the seller did not rewrite."""
+
+    THREE = ["iPhone 13 Pro Max", "S24 Ultra", "iPhone 15"]
+
+    @staticmethod
+    def axes(*lists: tuple[str, list[str]]) -> list[dict]:
+        return [{"id": 0, "name": name, "position": index, "visible": True, "variation": True,
+                 "options": options} for index, (name, options) in enumerate(lists)]
+
+    @staticmethod
+    def variation(index: int, *values: str, image: int = 0, **over: object) -> product_match.ShopVariation:
+        names = ["مدل", "رنگ", "طرح"]
+        row = variation_row(index, "-", "-", **over)  # type: ignore[arg-type]
+        row["attributes"] = [{"id": 0, "name": names[position], "option": value}
+                             for position, value in enumerate(values)]
+        if image:
+            row["image"] = {"id": image}
+        return product_match.ShopVariation.from_row(row)
+
+    # — when it rebuilds —
+    def test_a_list_that_only_repeats_the_shop_rebuilds_nothing(self) -> None:
+        plan = plan_for({"models": ["iPhone 13 Pro Max", "S24 Ultra"], "price": 720_000})
+        self.assertFalse(plan.regenerate)
+        self.assertEqual((plan.creates, plan.deletes), ([], []))
+        self.assertEqual(len(plan.updates), 3, "ساختار همان است؛ فقط قیمت درجا عوض می‌شود")
+
+    def test_the_same_options_in_another_order_rebuild_nothing(self) -> None:
+        plan = plan_for({"models": ["S24 Ultra", "iPhone 13 ProMax"],
+                         "attributes": {"رنگ": ["سبز", "مشکی", "سفید"]}})
+        self.assertTrue(plan.empty, "ترتیب فهرست ساختار را عوض نمی‌کند")
+
+    def test_a_colour_added_rebuilds_the_whole_grid(self) -> None:
+        plan = plan_for({"attributes": {"رنگ": ["مشکی", "سفید", "سبز", "آبی"]}})
+        self.assertTrue(plan.regenerate)
+        self.assertEqual(len(plan.deletes), 3)
+        self.assertEqual(len(plan.creates), 8, "۲ مدل × ۴ رنگ: رنگ را که گفتی، شبکهٔ کامل ساخته می‌شود")
+        self.assertEqual((plan.kept, plan.updates), (0, []))
+
+    def test_any_other_attribute_counts_too(self) -> None:
+        product = shop(attributes=self.axes(("مدل", ["iPhone 15"]), ("رنگ", ["مشکی"]), ("طرح", ["A", "B"])))
+        product.variations = [self.variation(1, "iPhone 15", "مشکی", "A"),
+                              self.variation(2, "iPhone 15", "مشکی", "B")]
+        plan = plan_for({"attributes": {"طرح": ["A", "B", "C"]}}, product=product)
+        self.assertTrue(plan.regenerate)
+        self.assertEqual(sorted(variation.variation_id for variation in plan.deletes), [9001, 9002])
+        self.assertEqual(made(plan), [("iPhone 15", "مشکی", "A"), ("iPhone 15", "مشکی", "B"),
+                                      ("iPhone 15", "مشکی", "C")])
+
+    def test_an_option_no_variation_used_is_dropped_without_a_rebuild(self) -> None:
+        product = shop(attributes=self.axes(("مدل", ["iPhone 15", "iPhone 16"]),
+                                            ("رنگ", ["مشکی", "سفید", "قرمز"])))
+        product.variations = [self.variation(1, "iPhone 15", "مشکی"), self.variation(2, "iPhone 15", "سفید"),
+                              self.variation(3, "iPhone 16", "مشکی"), self.variation(4, "iPhone 16", "سفید")]
+        plan = plan_for({"attributes": {"رنگ": ["مشکی", "سفید"]}}, product=product)
+        self.assertFalse(plan.regenerate, "شبکهٔ ترکیب‌ها همان است؛ فقط فهرست «قرمز» را از دست می‌دهد")
+        self.assertEqual((plan.creates, plan.deletes), ([], []))
+        assert plan.attributes is not None
+        colour = next(item for item in plan.attributes if item["name"] == "رنگ")
+        self.assertEqual(colour["options"], ["مشکی", "سفید"])
+
+    def test_a_variable_product_with_no_variations_just_gets_them(self) -> None:
+        product = shop()
+        product.variations = []
+        plan = plan_for({"models": ["iPhone 15", "iPhone 16"], "price": 698_000}, product=product)
+        self.assertFalse(plan.regenerate, "چیزی نیست که پاک شود")
+        self.assertEqual(plan.deletes, [])
+        self.assertEqual(len(plan.creates), 6)
+
+    # — what a rebuilt combination keeps —
+    def test_a_combination_that_existed_keeps_the_price_the_seller_did_not_write(self) -> None:
+        plan = plan_for({"models": self.THREE})
+        black = creating(plan, "iPhone 13 Pro Max", "مشکی")
+        self.assertEqual((black.price, "price" in black.carried), (698_000, True))
+        self.assertEqual(creating(plan, "S24 Ultra", "سبز").price, 598_000,
+                         "قیمتِ خودش، نه قیمتِ پرتکرارِ گروه")
+        new = creating(plan, "iPhone 15", "مشکی")
+        self.assertEqual((new.price, "price" in new.carried), (698_000, False),
+                         "ترکیبِ تازه قیمتِ فعلیِ گروهش را می‌گیرد (و به فروشنده گفته می‌شود)")
+        self.assertTrue(any("ننوشتی" in warning and "قیمت" in warning for warning in plan.warnings))
+
+    def test_a_combination_that_existed_keeps_its_stock_and_status(self) -> None:
+        product = shop()
+        product.variations = [
+            self.variation(1, "iPhone 13 Pro Max", "مشکی", stock=4, status="instock"),
+            self.variation(2, "S24 Ultra", "سبز", stock=0, status="outofstock"),
+            self.variation(3, "iPhone 13 Pro Max", "سفید", stock=None, manage=False)]
+        plan = plan_for({"models": self.THREE}, product=product)
+        counted = creating(plan, "iPhone 13 Pro Max", "مشکی")
+        self.assertEqual((counted.stock, counted.status), (4, "instock"))
+        self.assertEqual({key: counted.payload()[key] for key in ("manage_stock", "stock_quantity")},
+                         {"manage_stock": True, "stock_quantity": 4})
+        gone = creating(plan, "S24 Ultra", "سبز")
+        self.assertEqual((gone.stock, gone.status), (0, "outofstock"), "ناموجود، ناموجود می‌ماند")
+        uncounted = creating(plan, "iPhone 13 Pro Max", "سفید").payload()
+        self.assertNotIn("manage_stock", uncounted, "بدون شمارش، بدون شمارش می‌ماند")
+        self.assertEqual(uncounted["stock_status"], "instock")
+
+    def test_a_stated_price_and_stock_win_over_the_old_ones(self) -> None:
+        plan = plan_for({"models": self.THREE, "price": 720_000, "stock": 12})
+        for create in plan.creates:
+            self.assertEqual((create.price, create.stock), (720_000, 12), create.label)
+            self.assertFalse({"price", "stock"} & set(create.carried), create.label)
+        text = "\n".join(plan.rows("full"))
+        self.assertIn("698,000 ← 720,000", text)
+        self.assertIn("598,000 ← 720,000", text)
+        self.assertIn("0 ← 12", text)
+        self.assertIn("7 ← 12", text)
+
+    def test_a_combination_that_existed_keeps_its_sale_price_unless_a_new_one_is_written(self) -> None:
+        product = shop()
+        product.variations = [self.variation(1, "iPhone 13 Pro Max", "مشکی", price="698000", sale="598000")]
+        plan = plan_for({"models": ["iPhone 13 Pro Max", "iPhone 15"]}, product=product)
+        kept = creating(plan, "iPhone 13 Pro Max", "مشکی")
+        self.assertEqual((kept.sale, kept.payload()["sale_price"]), (598_000, "598000"))
+        fresh = plan_for({"models": ["iPhone 13 Pro Max", "iPhone 15"], "sale_price": 500_000}, product=product)
+        self.assertEqual(creating(fresh, "iPhone 13 Pro Max", "مشکی").sale, 500_000)
+
+    def test_pictures_survive_a_rebuild_and_a_new_combination_takes_its_colours(self) -> None:
+        product = shop()
+        product.variations = [self.variation(1, "iPhone 13 Pro Max", "مشکی", image=71),
+                              self.variation(2, "iPhone 13 Pro Max", "سفید", image=72),
+                              self.variation(3, "S24 Ultra", "سبز")]
+        plan = plan_for({"models": self.THREE}, product=product)
+        self.assertEqual(creating(plan, "iPhone 13 Pro Max", "مشکی").payload()["image"], {"id": 71})
+        self.assertEqual(creating(plan, "iPhone 13 Pro Max", "سفید").payload()["image"], {"id": 72})
+        self.assertNotIn("image", creating(plan, "S24 Ultra", "سبز").payload(), "عکسی نداشت، عکسی نمی‌گیرد")
+        self.assertEqual(creating(plan, "iPhone 15", "مشکی").payload()["image"], {"id": 71},
+                         "مدلِ تازه عکسِ رنگِ همان مدل‌های دیگر را می‌گیرد")
+        self.assertNotIn("image", creating(plan, "iPhone 15", "سبز").payload(), "برای سبز عکسی در فروشگاه نیست")
+        self.assertEqual(creating(plan, "iPhone 13 Pro Max", "مشکی").payload(image_id=999)["image"], {"id": 999},
+                         "عکسِ تازه‌ای که همین حالا برای آن رنگ آپلود شد، بر عکسِ قبلی می‌چربد")
+
+    def test_a_combination_the_seller_switched_off_stays_switched_off(self) -> None:
+        product = shop()
+        product.variations = [self.variation(1, "iPhone 13 Pro Max", "مشکی"),
+                              replace(self.variation(2, "iPhone 13 Pro Max", "سفید"), status="private")]
+        plan = plan_for({"models": ["iPhone 13 Pro Max", "iPhone 15"]}, product=product)
+        self.assertEqual(creating(plan, "iPhone 13 Pro Max", "سفید").payload()["status"], "private",
+                         "تیکِ «فعال» را برداشته بود؛ بازسازی دوباره منتشرش نمی‌کند")
+        self.assertEqual(creating(plan, "iPhone 13 Pro Max", "مشکی").payload()["status"], "publish")
+        self.assertEqual(creating(plan, "iPhone 15", "مشکی").payload()["status"], "publish",
+                         "ترکیبِ تازه منتشر می‌شود")
+
+    # — what the card says —
+    def test_the_card_says_everything_is_rebuilt_and_what_each_variation_was(self) -> None:
+        plan = plan_for({"models": self.THREE, "price": 720_000})
+        text = "\n".join(plan.rows("full"))
+        self.assertIn("♻️", text)
+        self.assertIn("همهٔ 3 واریژن فعلی پاک می‌شوند و 6 ترکیب از نو ساخته می‌شود", text)
+        self.assertIn("698,000 ← 720,000 تومان (2 واریژن)", text, "قبل ← بعدِ ترکیب‌هایی که از قبل بود")
+        self.assertNotIn("➕ 6 · 🗑 3", text, "شمارش «ساخت/حذف» برای بازسازی گمراه‌کننده است")
+        lines = plan.change_lines()
+        self.assertTrue(any("♻️" in line and "6 ترکیب" in line for line in lines), lines)
+        self.assertIn("واریژن(از نو 6)", plan.summary())
+
+    def test_dropping_most_of_a_list_is_flagged_and_keeping_it_is_not(self) -> None:
+        dropped = plan_for({"models": ["iPhone 15"], "price": 698_000})
+        self.assertTrue(any("2 مدل از 2 حذف می‌شود" in warning for warning in dropped.warnings), dropped.warnings)
+        kept = plan_for({"models": self.THREE})
+        self.assertFalse(any("حذف می‌شود" in warning for warning in kept.warnings),
+                         "همهٔ واریژن‌ها پاک می‌شوند ولی هیچ مدلی از فهرست نمی‌رود؛ هشدارِ «مدل از دست رفت» بی‌جاست")
+
+    # — the signature —
+    def test_a_carried_value_is_not_part_of_the_signature(self) -> None:
+        busy = shop()
+        busy.variations = [replace(busy.variations[0], stock=3), *busy.variations[1:]]
+        self.assertEqual(plan_for({"models": self.THREE}).signature(),
+                         plan_for({"models": self.THREE}, product=busy).signature(),
+                         "موجودیِ فروشگاه با هر سفارش عوض می‌شود؛ زیرِ بازسازیِ بی‌حرف از موجودی، تأیید دوباره نمی‌خواهد")
+        self.assertNotEqual(plan_for({"models": self.THREE, "stock": 12}).signature(),
+                            plan_for({"models": self.THREE, "stock": 13}).signature())
+
+    def test_a_new_variation_in_the_shop_changes_the_signature(self) -> None:
+        crowded = shop(extra=[variation_row(10, "S24 Ultra", "سفید")])
+        self.assertNotEqual(plan_for({"models": self.THREE}).signature(),
+                            plan_for({"models": self.THREE}, product=crowded).signature(),
+                            "یک واریژنِ ندیده هم حذف می‌شد؛ فروشنده آن را تأیید نکرده")
+
+    # — asking again after a rebuild stopped half-way —
+    def test_a_duplicate_combination_is_removed_when_the_same_lists_are_sent_again(self) -> None:
+        product = shop(extra=[variation_row(10, "iPhone 13 Pro Max", "مشکی")])
+        plan = plan_for({"models": ["iPhone 13 Pro Max", "S24 Ultra"]}, product=product)
+        self.assertFalse(plan.regenerate)
+        self.assertEqual([variation.variation_id for variation in plan.deletes], [9001],
+                         "از دو همزاد، تازه‌ترین می‌ماند و قدیمی حذف می‌شود")
+        self.assertEqual(plan.creates, [])
+
+    def test_a_half_done_rebuild_is_completed_without_a_second_rebuild_or_duplicates(self) -> None:
+        # The lists already say [13 Pro Max, iPhone 15]; the shop still holds the old three, a
+        # copy of 13 Pro Max × مشکی the first attempt managed to make, and iPhone 15 × مشکی.
+        product = shop(extra=[variation_row(10, "iPhone 13 Pro Max", "مشکی"),
+                              variation_row(11, "iPhone 15", "مشکی")],
+                       attributes=self.axes(("مدل", ["iPhone 13 Pro Max", "iPhone 15"]),
+                                            ("رنگ", ["مشکی", "سفید", "سبز"])))
+        plan = plan_for({"models": ["iPhone 13 Pro Max", "iPhone 15"]}, product=product, baseline=shop())
+        self.assertFalse(plan.regenerate)
+        self.assertEqual(sorted(variation.variation_id for variation in plan.deletes), [9001, 9003],
+                         "مدلِ رفته و همزادِ قدیمی حذف می‌شوند؛ نسخهٔ تازه می‌ماند")
+        self.assertEqual(made(plan), [("iPhone 15", "سبز"), ("iPhone 15", "سفید")], "فقط آنچه کم است")
+        self.assertEqual(grid_after(product, plan), {
+            ("iPhone 13 Pro Max", "مشکی"), ("iPhone 13 Pro Max", "سفید"),
+            ("iPhone 15", "مشکی"), ("iPhone 15", "سفید"), ("iPhone 15", "سبز")})
+
+    def test_a_model_that_was_only_partly_made_is_not_mistaken_for_a_restricted_one(self) -> None:
+        # iPhone 15 was made in مشکی only before the write stopped. Read from the shop as it is
+        # now, that looks like «iPhone 15 comes in one colour»; read from the product as it was
+        # picked (iPhone 15 did not exist), it is a new model that gets every colour.
+        product = shop(extra=[variation_row(10, "iPhone 13 Pro Max", "مشکی"),
+                              variation_row(11, "iPhone 15", "مشکی")],
+                       attributes=self.axes(("مدل", ["iPhone 13 Pro Max", "iPhone 15"]),
+                                            ("رنگ", ["مشکی", "سفید", "سبز"])))
+        data = {"models": ["iPhone 13 Pro Max", "iPhone 15"]}
+        without_memory = plan_for(data, product=product)
+        self.assertNotIn(("iPhone 15", "سفید"), made(without_memory),
+                         "بدون مبنا، همین حالت نیمه‌کاره را «محدودیتِ عمدی» می‌خواند (حد پایین)")
+        with_memory = plan_for(data, product=product, baseline=shop())
+        self.assertIn(("iPhone 15", "سفید"), made(with_memory))
+        self.assertIn(("iPhone 15", "سبز"), made(with_memory))
 
 
 class SimpleProducts(unittest.TestCase):

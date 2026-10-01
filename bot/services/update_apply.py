@@ -234,7 +234,10 @@ async def _write_variations(client: WooClient, base: str, plan: update_plan.Upda
                      if is_color_attribute(name)})
     by_color = woocommerce_direct.images_by_color(list(uploads), colors) if uploads and colors else {}
     creates: list[dict[str, Any]] = []
-    for create in plan.creates:
+    # A combination the shop already has goes first. A write that stops half-way then always
+    # leaves a *twin* behind, which the next plan recognises; a brand-new model made alone
+    # (no twin) would look like a complete product that simply has fewer colours.
+    for create in sorted(plan.creates, key=lambda row: row.replaces is None):
         color = next((value for name, value in create.combo if is_color_attribute(name)), "")
         creates.append(create.payload(image_id=by_color.get(color, 0)))
     work: list[tuple[str, dict[str, Any]]] = (

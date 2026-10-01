@@ -325,6 +325,15 @@ class PickingTheProduct(UpdateFlowCase):
         self.assertIn("598,000 تا 698,000", text)
         self.assertIn("رنگ‌ها:", text)
 
+    def test_the_guide_tells_the_seller_what_a_list_and_a_missing_price_do(self) -> None:
+        self.start()
+        _result, seen = self.pick()
+        text = str(seen[-1][1])
+        self.assertIn("قیمت نفرستی ← قیمت فعلی می‌ماند", text)
+        self.assertIn("موجودی عوض شد ← موجودی تازه می‌نشیند", text)
+        self.assertIn("همهٔ واریژن‌ها پاک و از نو ساخته می‌شوند", text)
+        self.assertIn("اگر ننویسی، همان می‌ماند", text)
+
     def test_a_product_the_shop_cannot_give_is_a_toast_and_the_list_stays(self) -> None:
         self.shop.product_put_status = None
         self.start()
@@ -402,6 +411,25 @@ class TheDiffCard(UpdateFlowCase):
         text = self.card_text()
         self.assertIn("➕ iPhone 15", text)
         self.assertIn("🗑 S24 Ultra", text)
+
+    def test_a_changed_list_says_that_every_variation_is_rebuilt_and_what_each_was(self) -> None:
+        self.open_update()
+        self.say("iPhone 13 Pro Max\niPhone 15\nقیمت 720000 تومان\nموجودی 12")
+        text = self.card_text()
+        self.assertIn("♻️ واریژن‌ها: همهٔ 3 واریژن فعلی پاک می‌شوند و 5 ترکیب از نو ساخته می‌شود", text)
+        self.assertIn("698,000 ← 720,000 تومان (2 واریژن)", text, "قبل ← بعدِ هر ترکیبی که از قبل بود")
+        self.assertIn("0 ← 12 عدد (2 واریژن)", text)
+        self.assertNotIn("➕ 5 · 🗑 3", text)
+        self.assertEqual([call for call in self.shop.requests if call[0] != "GET"], [],
+                         "پیش‌نمایش چیزی را عوض نمی‌کند")
+
+    def test_a_list_that_repeats_the_shop_says_nothing_about_a_rebuild(self) -> None:
+        self.open_update()
+        self.say("iPhone 13 Pro Max\nS24 Ultra\nقیمت 720000 تومان")
+        text = self.card_text()
+        self.assertNotIn("♻️", text)
+        self.assertNotIn("از نو ساخته", text)
+        self.assertIn("698,000 ← 720,000", text)
 
     def test_the_same_text_as_the_shop_has_is_no_difference(self) -> None:
         self.open_update()
@@ -572,6 +600,38 @@ class ApplyingIt(UpdateFlowCase):
         self.assertEqual(len([item for item in seen if item[0] == "answer"]), 1, "فقط یک toast")
         self.assertNotIn(USER, PF.sessions)
 
+    def test_a_new_model_list_rebuilds_the_grid_and_the_result_card_says_so(self) -> None:
+        self.open_update()
+        self.say("iPhone 13 Pro Max\niPhone 15\nقیمت 720000 تومان\nموجودی 12")
+        before = set(self.shop.variations)
+        result, _seen = self.confirm()
+        self.assertEqual(result, END)
+        self.assertFalse(before & set(self.shop.variations), "همهٔ واریژن‌ها شناسهٔ تازه دارند")
+        self.assertEqual(self.grid_models(), {"iPhone 13 Pro Max", "iPhone 15"})
+        self.assertEqual(len(self.shop.variations), 5)
+        text = plain(self.bot.of("edit")[-1][2])
+        self.assertIn("♻️ واریژن: همهٔ 3 واریژن پاک و 5 ترکیب از نو ساخته شد", text)
+        entry = products_ledger.recent(1)[0]
+        self.assertTrue(any("♻️" in line for line in entry["changes"]))
+
+    def test_a_retry_rebuilds_the_grid_the_first_attempt_meant_from_the_product_as_it_was_picked(self) -> None:
+        self.open_update()
+        self.say("iPhone 13 Pro Max\niPhone 15\nقیمت 720000 تومان\nموجودی 12")
+        picked = self.session.baseline
+        self.assertIsNotNone(picked)
+        self.shop.create_limit = 3            # 13 Pro Max × ۲, then iPhone 15 × مشکی — and the batch stops
+        self.confirm()
+        self.assertIsNotNone(self.shop.by_values("iPhone 15", "مشکی"))
+        self.assertIsNone(self.shop.by_values("iPhone 15", "سفید"))
+        self.assertIs(self.session.baseline, picked, "اولین خواندن عوض نمی‌شود، هرچند target دوباره خوانده شد")
+        self.assertIsNot(self.session.target, picked)
+        self.shop.create_limit = None
+        result, _seen = self.confirm()
+        self.assertEqual(result, END)
+        self.assertEqual(len(self.shop.variations), 5)
+        self.assertIsNotNone(self.shop.by_values("iPhone 15", "سفید"), "iPhone 15 نیمه‌ساخته «فقط مشکی» خوانده نشد")
+        self.assertIsNotNone(self.shop.by_values("iPhone 15", "سبز"))
+
     def test_the_result_card_lists_what_changed_and_offers_the_next_update(self) -> None:
         self.open_update()
         self.say("قیمت 720000 تومان")
@@ -696,9 +756,10 @@ class ApplyingIt(UpdateFlowCase):
         result, _seen = self.confirm()
         self.assertEqual(result, END)
         self.assertEqual(self.grid_models(), {"iPhone 13 Pro Max", "iPhone 15"})
-        updates = [row for call in self.shop.calls("POST", "/variations/batch")
-                   for row in (self.shop.body("POST", "/variations/batch").get("update") or [])]
-        self.assertEqual(updates, [], "قیمت/موجودی که نشسته بود دوباره فرستاده نمی‌شود")
+        self.assertEqual(len(self.shop.variations), 5, "۲ ترکیبِ iPhone 13 + ۳ ترکیبِ iPhone 15")
+        self.assertEqual(len(self.shop.grid()), 5, "هیچ ترکیبی دوبار نیست")
+        self.assertEqual({row["regular_price"] for row in self.shop.variations.values()}, {"720000"})
+        self.assertEqual({row["stock_quantity"] for row in self.shop.variations.values()}, {12})
 
     def test_nothing_applied_is_a_failed_entry_and_the_card_stays(self) -> None:
         self.open_update()

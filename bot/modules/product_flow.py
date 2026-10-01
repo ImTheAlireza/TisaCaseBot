@@ -151,6 +151,10 @@ class ProductSession:
     #: «اپدیت»: the shop's product this session compares its draft with — read when it was
     #: picked, and read again at confirm so the diff that is written is the diff of *now*.
     target: product_match.ShopProduct | None = None
+    #: «اپدیت»: the same product exactly as it was when picked — never re-read. After a write that
+    #: stopped half-way ``target`` is re-read and holds a half-built grid; the colours each model
+    #: came in are still the baseline's, so a retry finishes the grid the first attempt meant.
+    baseline: product_match.ShopProduct | None = None
     #: True once an update already replaced the gallery with this session's photos. A retry after
     #: a half-failed write must not upload (and orphan) the same pictures a second time.
     gallery_applied: bool = False
@@ -1057,7 +1061,8 @@ def _plan_for(session: ProductSession, product: product_match.ShopProduct,
     if not _says_title(session, data):
         guessed = str(payload.get("title") or "").strip()
         payload["title"] = ""
-    plan = update_plan.build(product, payload, image_count=_new_photo_count(session))
+    plan = update_plan.build(product, payload, image_count=_new_photo_count(session),
+                             baseline=session.baseline)
     if guessed and " ".join(guessed.split()) != plan.title_now:
         shown = _short(guessed, 60)
         plan.notes.append(
@@ -2070,7 +2075,9 @@ def _update_guide(product: product_match.ShopProduct) -> str:
         "عکس‌ها، کپشن و اطلاعات تازه را بفرست — همان‌طور که برای «محصول جدید» می‌فرستی.",
         "پیش‌نمایش فقط چیزهایی را نشان می‌دهد که با محصول فعلی فرق دارد؛ هرچه نفرستی دست‌نخورده می‌ماند:",
         "• قیمت نفرستی ← قیمت فعلی می‌ماند",
-        "• فهرست مدل بفرستی ← جای همهٔ مدل‌های فعلی می‌نشیند",
+        "• موجودی عوض شد ← موجودی تازه می‌نشیند",
+        "• فهرست مدل (یا رنگ) بفرستی ← جای فهرست فعلی می‌نشیند و همهٔ واریژن‌ها پاک و از نو ساخته می‌شوند "
+        "(قیمت، موجودی و عکسِ هر ترکیبِ قبلی، اگر ننویسی، همان می‌ماند)",
         "• عکس بفرستی ← جای عکس‌های فعلی می‌نشیند",
     ]
     return "\n".join(lines)
@@ -2092,7 +2099,7 @@ async def begin_update(update: Update, context: ContextTypes.DEFAULT_TYPE,
     message = query.message
     chat_id = message.chat_id if message else user.id
     _cleanup(user.id)
-    session = ProductSession(mode="update", target=product)
+    session = ProductSession(mode="update", target=product, baseline=product)
     session.user_id = user.id
     session.chat_id = chat_id
     session.thread_id = getattr(message, "message_thread_id", None) if message else None

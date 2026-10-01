@@ -9,10 +9,13 @@ else*. Five rules carry the whole design:
   models, no photos) is never touched. A price that is not given stays the old price;
 * **equal is not a change.** A value the draft repeats and the shop already has is left out of
   every request — the card says it is untouched and the shop is not asked to rewrite it;
-* **a list the seller gives is the whole list.** New models replace the old ones: models the shop
-  has and the list does not are deleted, models the list has and the shop does not are created,
-  models in both stay (same variation, only the fields that differ are written). Colours and
-  other attributes follow the same rule. An axis that was not mentioned keeps its options;
+* **a list the seller gives is the whole list — and a changed list rebuilds the variations.** New
+  models replace the old ones, and the moment any list behind the variations (models, colours, any
+  other attribute) comes out different from the shop's, *every* variation is deleted and the whole
+  grid is generated again, the way a new product's would be. Nothing the seller did not touch is
+  lost on the way: a combination that already existed keeps its price, sale price, stock and
+  picture unless the seller wrote something new for it. An axis that was not mentioned keeps its
+  options. A list that only repeats the shop's rebuilds nothing;
 * **new photos replace the gallery.** Nothing is deleted from the media library — only the
   product stops showing the old pictures;
 * **the baseline is the shop, not our memory.** Everything is computed from what
@@ -275,9 +278,20 @@ class VariationChange:
         return row
 
 
+#: The ``create`` row keys each carried-over field puts into a variation (see ``decision``).
+_CARRIED_KEYS: dict[str, tuple[str, ...]] = {
+    "price": ("regular_price",),
+    "sale": ("sale_price",),
+    "stock": ("manage_stock", "stock_quantity"),
+    "status": ("stock_status",),
+    "image": ("image",),
+    "enabled": ("status",),
+}
+
+
 @dataclass(frozen=True)
 class VariationCreate:
-    """A variation the shop does not have yet — a new model, a new colour."""
+    """A variation to make — a new model or colour, or one of a rebuilt grid."""
 
     combo: tuple[tuple[str, str], ...]
     label: str
@@ -287,12 +301,24 @@ class VariationCreate:
     stock: int | None = None
     status: str = ""
     order: int = 0
+    #: media id this combination had (or its colour has on a sibling) — what a rebuild must not lose
+    image_id: int = 0
+    #: «publish», or «private» for a combination the seller had switched off in the shop
+    post_status: str = "publish"
+    #: the variation this one stands in for in a rebuild (same value on every axis); ``None`` = new
+    replaces: ShopVariation | None = None
+    #: fields taken over from the shop because the seller wrote nothing about them
+    carried: tuple[str, ...] = ()
 
     def payload(self, *, image_id: int = 0) -> dict[str, Any]:
-        """The ``create`` row — the same shape :mod:`bot.services.woocommerce_direct` builds."""
+        """The ``create`` row — the same shape :mod:`bot.services.woocommerce_direct` builds.
+
+        ``image_id`` is a photo uploaded just now for this colour; it wins over the picture the
+        combination already had.
+        """
         row: dict[str, Any] = {
             "regular_price": str(self.price),
-            "status": "publish",
+            "status": self.post_status or "publish",
             "visible": True,
             "menu_order": self.order,
             "attributes": [{"name": name, "option": value} for name, value in self.combo],
@@ -304,9 +330,30 @@ class VariationCreate:
             row["stock_quantity"] = self.stock
         if self.stock is not None or self.status:
             row["stock_status"] = self.status or "instock"
-        if image_id:
-            row["image"] = {"id": image_id}
+        picture = image_id or self.image_id
+        if picture:
+            row["image"] = {"id": picture}
         return row
+
+    def decision(self) -> dict[str, Any]:
+        """The row minus what was only carried over from the shop: what the seller *decided*.
+
+        The signature is built from this. A carried stock count moves with every order, and asking
+        the seller to approve again because «5» became «4» under a rebuild that never mentioned
+        stock would be noise.
+        """
+        row = self.payload()
+        for name in self.carried:
+            for key in _CARRIED_KEYS.get(name, ()):
+                row.pop(key, None)
+        return row
+
+    @property
+    def stock_moves(self) -> bool:
+        """The seller's stock differs from what the replaced variation held."""
+        old = self.replaces
+        return (old is not None and "stock" not in self.carried and self.stock is not None
+                and (not old.manage_stock or old.stock != self.stock))
 
 
 @dataclass(frozen=True)
@@ -342,6 +389,8 @@ class UpdatePlan:
     updates: list[VariationChange] = field(default_factory=list)
     creates: list[VariationCreate] = field(default_factory=list)
     deletes: list[ShopVariation] = field(default_factory=list)
+    #: every variation the shop has is deleted and the whole grid is created again (a list changed)
+    regenerate: bool = False
     #: variations the draft matches that already hold every value it states
     kept: int = 0
     notes: list[str] = field(default_factory=list)
@@ -399,7 +448,7 @@ class UpdatePlan:
         body = [
             self.new_title, self.product_fields, self.attributes, self.images_new,
             [row.payload() for row in self.updates],
-            [row.payload() for row in self.creates],
+            [row.decision() for row in self.creates],
             sorted(variation.variation_id for variation in self.deletes),
         ]
         return hashlib.sha1(json.dumps(body, ensure_ascii=False, sort_keys=True,
@@ -452,7 +501,9 @@ class UpdatePlan:
             if change.removed:
                 bits.append(f"🗑 {len(change.removed)}")
             lines.append(f"🎨 {change.name}: " + " · ".join(bits))
-        if self.creates or self.deletes:
+        if self.regenerate:
+            lines.append(f"♻️ واریژن: همهٔ {len(self.deletes)} واریژن پاک و {len(self.creates)} ترکیب از نو ساخته شد")
+        elif self.creates or self.deletes:
             lines.append(f"🧩 واریژن: ➕ {len(self.creates)} · 🗑 {len(self.deletes)}")
         return lines
 
@@ -467,13 +518,18 @@ class UpdatePlan:
                 parts.append(f"{label}({len(pairs)})")
         if self.images_new:
             parts.append(f"تصویر({self.images_new})")
-        if self.creates or self.deletes:
+        if self.regenerate:
+            parts.append(f"واریژن(از نو {len(self.creates)})")
+        elif self.creates or self.deletes:
             parts.append(f"واریژن(+{len(self.creates)} −{len(self.deletes)})")
         return " · ".join(parts) or "بدون تغییر"
 
     # — pairs: (before, after) text for every variation / the simple product that moves —
     def _price_pairs(self) -> list[tuple[str, str]]:
         pairs = [(_toman(row.price[0]), _toman(row.price[1])) for row in self.updates if row.price]
+        pairs += [(_toman(row.replaces.regular_price), _toman(row.price)) for row in self.creates
+                  if row.replaces is not None and "price" not in row.carried
+                  and row.price != row.replaces.regular_price]
         if "regular_price" in self.product_fields:
             pairs.append((_toman(self.product_before.get("regular_price")),
                           _toman(int(self.product_fields["regular_price"]))))
@@ -481,6 +537,9 @@ class UpdatePlan:
 
     def _sale_pairs(self) -> list[tuple[str, str]]:
         pairs = [(_toman(row.sale[0]), _toman(row.sale[1])) for row in self.updates if row.sale]
+        pairs += [(_toman(row.replaces.sale_price), _toman(row.sale)) for row in self.creates
+                  if row.replaces is not None and "sale" not in row.carried
+                  and row.sale and row.sale != row.replaces.sale_price]
         if "sale_price" in self.product_fields:
             pairs.append((_toman(self.product_before.get("sale_price")),
                           _toman(int(self.product_fields["sale_price"]))))
@@ -488,6 +547,8 @@ class UpdatePlan:
 
     def _stock_pairs(self) -> list[tuple[str, str]]:
         pairs = [(_stock_text(row.stock[0]), _stock_text(row.stock[1])) for row in self.updates if row.stock]
+        pairs += [(_stock_text(row.replaces.stock), _stock_text(row.stock)) for row in self.creates
+                  if row.replaces is not None and row.stock is not None and row.stock_moves]
         if "stock_quantity" in self.product_fields:
             pairs.append((_stock_text(self.product_before.get("stock")),
                           _stock_text(int(self.product_fields["stock_quantity"]))))
@@ -496,6 +557,9 @@ class UpdatePlan:
     def _status_pairs(self) -> list[tuple[str, str]]:
         pairs = [(status_text(row.status[0]), status_text(row.status[1])) for row in self.updates
                  if row.status and not row.stock]
+        pairs += [(status_text(row.replaces.stock_status), status_text(row.status)) for row in self.creates
+                  if row.replaces is not None and "status" not in row.carried and row.status
+                  and row.status != row.replaces.stock_status and not row.stock_moves]
         if "stock_status" in self.product_fields and "stock_quantity" not in self.product_fields:
             pairs.append((status_text(str(self.product_before.get("stock_status") or "")),
                           status_text(str(self.product_fields["stock_status"]))))
@@ -537,8 +601,12 @@ class UpdatePlan:
             if change.removed:
                 lines.append(f"   🗑 {_names(change.removed)}")
             if change.kept:
-                lines.append(f"   ✓ {change.kept} مورد بدون تغییر")
-        if self.changes_variations and (self.creates or self.deletes):
+                lines.append(f"   ✓ {change.kept} مورد در فهرست می‌ماند")
+        if self.regenerate:
+            lines.append(f"♻️ <b>واریژن‌ها:</b> همهٔ {len(self.deletes)} واریژن فعلی پاک می‌شوند و "
+                         f"{len(self.creates)} ترکیب از نو ساخته می‌شود")
+            lines.append("   قیمت، موجودی و عکسِ ترکیبی که از قبل بود، اگر چیز تازه‌ای ننوشته باشی، همان می‌ماند")
+        elif self.changes_variations and (self.creates or self.deletes):
             bits = [f"➕ {len(self.creates)}", f"🗑 {len(self.deletes)}"]
             if self.updates:
                 bits.append(f"✏️ {len(self.updates)}")
@@ -605,8 +673,15 @@ def _dedupe(kind: str, values: Sequence[str]) -> list[str]:
     return out
 
 
-def build(product: ShopProduct, data: Mapping[str, Any], *, image_count: int = 0) -> UpdatePlan:
-    """Compare the seller's draft (``ProductData.to_dict()``) with ``product`` as the shop has it."""
+def build(product: ShopProduct, data: Mapping[str, Any], *, image_count: int = 0,
+          baseline: ShopProduct | None = None) -> UpdatePlan:
+    """Compare the seller's draft (``ProductData.to_dict()``) with ``product`` as the shop has it.
+
+    ``baseline`` is the product as it was when the seller picked it, before anything was written.
+    It only answers one question — *which colours did each model come in?* — so that a retry
+    after a write that stopped half-way rebuilds the grid the first attempt meant to, instead of
+    reading a model that was only partly made as a deliberate «this model has only one colour».
+    """
     draft = Draft.from_mapping(data)
     plan = UpdatePlan(
         product_id=product.product_id,
@@ -627,7 +702,7 @@ def build(product: ShopProduct, data: Mapping[str, Any], *, image_count: int = 0
             f"پیشوند SKU نوشته‌شده ({draft.sku_prefix}) با SKU محصول انتخاب‌شده ({product.sku}) "
             "فرق دارد؛ محصول درست را انتخاب کرده‌ای؟ (SKU عوض نمی‌شود)")
     if plan.is_variable:
-        _plan_variable(plan, product, draft)
+        _plan_variable(plan, product, draft, baseline)
     else:
         _plan_simple(plan, product, draft)
     if draft.wholesale:
@@ -689,20 +764,16 @@ def _sale_error(sale: int, price: int, where: str) -> str:
 
 # — a variable product: models, colours, per-variation price and stock —
 
-def _plan_variable(plan: UpdatePlan, product: ShopProduct, draft: Draft) -> None:
+def _plan_variable(plan: UpdatePlan, product: ShopProduct, draft: Draft,
+                   baseline: ShopProduct | None = None) -> None:
     axes = shop_axes(product)
     new_axes, stated = _target_axes(plan, product, axes, draft)
     if plan.errors:
         return
-    # A draft that repeats the shop's own lists changes no structure — and must not rebuild a
-    # deliberately restricted grid. But a shop that disagrees *with itself* (a variation on a
-    # model its list no longer has, a listed model with no variation) is a structure change that
-    # stopped half-way, and asking again has to finish it.
-    structural = (bool(plan.axis_changes) or bool(draft.restrictions)
-                  or (stated and not _consistent(product, axes)))
     price_gaps: list[str] = []
     sale_clash: list[tuple[str, int]] = []
     inherited_from: set[int] = set()
+    model_axis = next((axis for axis in new_axes if axis.kind == MODEL), None)
 
     def update_for(variation: ShopVariation) -> VariationChange | None:
         target_price = draft.price_for(variation.model)
@@ -727,7 +798,69 @@ def _plan_variable(plan: UpdatePlan, product: ShopProduct, draft: Draft) -> None
         return VariationChange(variation.variation_id, variation.label(), variation.model,
                                price=price, sale=sale, stock=stock, status=status)
 
-    if not structural:
+    pictures = _pictures_by_color(product.variations)
+
+    def create_for(order: int, combo: Mapping[str, str], old: ShopVariation | None) -> VariationCreate:
+        """One variation to make. ``old`` is the one it replaces in a rebuild, ``None`` when new.
+
+        What the seller wrote wins. What she did not write is taken from ``old`` (so a rebuild
+        loses nothing) and, for a combination that never existed, from the shop's own habits:
+        the current price of the same price group, no stock count, the picture of the colour.
+        """
+        model = combo.get(model_axis.name, "") if model_axis else ""
+        label = " · ".join(combo.values())
+        carried: list[str] = []
+        price = draft.price_for(model)
+        if not price and old is not None and old.regular_price:
+            price = old.regular_price
+            carried.append("price")
+        if not price:
+            price = _inherited_price(product.variations, model, product.regular_price)
+            if price:
+                inherited_from.add(price)
+        if draft.sale and price and draft.sale >= price:
+            sale_clash.append((label, price))
+        if not price:
+            price_gaps.append(label)
+        sale = draft.sale
+        if not sale and old is not None and old.sale_price:
+            sale = old.sale_price
+            carried.append("sale")
+        quantity: int | None = None
+        status = ""
+        if draft.stock is not None:
+            quantity = draft.stock
+            status = draft.status_for(quantity)
+        elif old is not None:
+            quantity = old.stock if old.manage_stock else None
+            carried.append("stock")
+            status = draft.stock_status
+            if not status:
+                status = old.stock_status
+                carried.append("status")
+        else:
+            status = draft.stock_status
+        if old is not None:
+            picture = old.image_id
+        else:
+            colour = next((value for name, value in combo.items() if _kind(name) == COLOR), "")
+            picture = pictures.get(_key(COLOR, colour), 0) if colour else 0
+        if picture:
+            carried.append("image")
+        published = "publish"
+        if old is not None:
+            # A combination the seller switched off stays switched off: a rebuild must not put a
+            # variation she hid back on sale.
+            published = old.status or "publish"
+            carried.append("enabled")
+        return VariationCreate(
+            combo=tuple(combo.items()), label=label, model=model, price=price, sale=sale,
+            stock=quantity, status=status, order=order, image_id=picture, post_status=published,
+            replaces=old, carried=tuple(carried))
+
+    combos, rebuild = _grid_to_build(plan, product, axes, new_axes, draft, stated, baseline)
+    if combos is None:
+        # The lists are the shop's own: no structure moves, only what the draft states is written.
         for variation in product.variations:
             change = update_for(variation)
             if change is None:
@@ -735,42 +868,36 @@ def _plan_variable(plan: UpdatePlan, product: ShopProduct, draft: Draft) -> None
             else:
                 plan.updates.append(change)
     else:
-        restrictions = draft.restrictions or _inherited_restrictions(product, axes, new_axes, draft)
-        combos = build_combinations([(axis.name, list(axis.options)) for axis in new_axes], restrictions)
         by_key: dict[tuple[str, ...], list[ShopVariation]] = {}
         for variation in product.variations:
             by_key.setdefault(_variation_key(variation, new_axes), []).append(variation)
-        fresh: list[tuple[int, dict[str, str]]] = []
-        for order, combo in enumerate(combos):
-            bucket = by_key.get(_combo_key(combo, new_axes))
-            if bucket:
-                change = update_for(bucket.pop(0))
-                if change is None:
-                    plan.kept += 1
+        if rebuild:
+            # A list the seller sent is different from the shop's: every variation goes and the
+            # whole grid is made again. A combination that existed hands over what it held.
+            plan.regenerate = bool(product.variations)
+            plan.deletes = list(product.variations)
+            for order, combo in enumerate(combos):
+                bucket = by_key.get(_combo_key(combo, new_axes))
+                plan.creates.append(create_for(order, combo, bucket[0] if bucket else None))
+        else:
+            # The lists were already written (by an attempt that stopped half-way) and the shop
+            # disagrees with them: finish that job, keeping what is already right.
+            fresh: list[tuple[int, dict[str, str]]] = []
+            for order, combo in enumerate(combos):
+                bucket = by_key.get(_combo_key(combo, new_axes))
+                if bucket:
+                    # Twins (the old variation and the copy the interrupted rebuild made): keep the
+                    # newest, which already holds what was written, and let the old one go.
+                    change = update_for(bucket.pop())
+                    if change is None:
+                        plan.kept += 1
+                    else:
+                        plan.updates.append(change)
                 else:
-                    plan.updates.append(change)
-            else:
-                fresh.append((order, combo))
-        left = {id(variation) for bucket in by_key.values() for variation in bucket}
-        plan.deletes = [variation for variation in product.variations if id(variation) in left]
-        model_axis = next((axis for axis in new_axes if axis.kind == MODEL), None)
-        for order, combo in fresh:
-            model = combo.get(model_axis.name, "") if model_axis else ""
-            price = draft.price_for(model)
-            if not price:
-                price = _inherited_price(product.variations, model, product.regular_price)
-                if price:
-                    inherited_from.add(price)
-            if draft.sale and price and draft.sale >= price:
-                sale_clash.append((" · ".join(combo.values()), price))
-            label = " · ".join(combo.values())
-            if not price:
-                price_gaps.append(label)
-            quantity = draft.stock
-            plan.creates.append(VariationCreate(
-                combo=tuple(combo.items()), label=label, model=model, price=price, sale=draft.sale,
-                stock=quantity, status=draft.status_for(quantity) if quantity is not None
-                else draft.stock_status, order=order))
+                    fresh.append((order, combo))
+            left = {id(variation) for bucket in by_key.values() for variation in bucket}
+            plan.deletes = [variation for variation in product.variations if id(variation) in left]
+            plan.creates = [create_for(order, combo, None) for order, combo in fresh]
     plan.warnings += _variable_warnings(plan, product, draft, inherited_from)
     if price_gaps:
         sample = "، ".join(price_gaps[:3])
@@ -782,10 +909,54 @@ def _plan_variable(plan: UpdatePlan, product: ShopProduct, draft: Draft) -> None
         plan.errors.append(_sale_error(draft.sale, price, label + more))
 
 
+def _grid_to_build(plan: UpdatePlan, product: ShopProduct, old_axes: Sequence[Axis],
+                   axes: Sequence[Axis], draft: Draft, stated: bool,
+                   baseline: ShopProduct | None = None) -> tuple[list[dict[str, str]] | None, bool]:
+    """The combinations the product has to end up with — or ``None`` when its structure stays.
+
+    Returns ``(combinations, rebuild)``. ``rebuild`` is true when the seller changed a list (or
+    limited the colours per model): then everything is generated again. It is false when the lists
+    already say what the seller wants and only the shop's variations disagree with them — the
+    leftover of a write that stopped half-way — and what is already right should be kept.
+
+    A draft that repeats the shop's own lists changes no structure and must not rebuild a
+    deliberately restricted grid; and a changed list whose grid comes out *the same* (an option no
+    variation used is dropped) needs the attribute write and nothing more.
+    """
+    changed = bool(plan.axis_changes) or bool(draft.restrictions)
+    interrupted = stated and not _consistent(product, old_axes)
+    if not (changed or interrupted) or not axes:
+        return None, False
+    # The colours a model comes in are read from the product as it was before this session wrote
+    # anything: after an interrupted rebuild the shop holds a model that is only partly made.
+    origin = baseline if baseline is not None and baseline.variations_complete and baseline.variations \
+        else product
+    restrictions = draft.restrictions or _inherited_restrictions(origin, shop_axes(origin), axes, draft)
+    combos = build_combinations([(axis.name, list(axis.options)) for axis in axes], restrictions)
+    wanted = Counter(_combo_key(combo, axes) for combo in combos)
+    have = Counter(_variation_key(variation, axes) for variation in product.variations)
+    if wanted == have:
+        return None, False
+    return combos, changed
+
+
+def _pictures_by_color(variations: Sequence[ShopVariation]) -> dict[str, int]:
+    """The picture each colour has in the shop today — every model of a colour shares one."""
+    found: dict[str, int] = {}
+    for variation in variations:
+        if variation.image_id and variation.color:
+            found.setdefault(_key(COLOR, variation.color), variation.image_id)
+    return found
+
+
 def _consistent(product: ShopProduct, axes: Sequence[Axis]) -> bool:
-    """Does the product agree with itself: every variation sits on listed options, every option is used?"""
+    """Does the product agree with itself: every variation sits on listed options, every option is
+    used, and no combination exists twice (the mark of a rebuild that stopped half-way)?"""
     if not product.variations:
         return not any(axis.options for axis in axes)
+    keys = [_variation_key(variation, axes) for variation in product.variations]
+    if axes and len(keys) != len(set(keys)):
+        return False
     for axis in axes:
         used = {_key(axis.kind, _value_for(variation, axis)) for variation in product.variations}
         if any(value and not axis.has(value) for value in
@@ -800,10 +971,20 @@ def _variable_warnings(plan: UpdatePlan, product: ShopProduct, draft: Draft,
                        inherited_from: set[int]) -> list[str]:
     out: list[str] = []
     total = len(product.variations)
-    if len(plan.deletes) >= BIG_DELETE or (total and len(plan.deletes) * 2 > total):
+    if plan.regenerate:
+        # Every variation is rebuilt, so «how many are deleted» says nothing. What matters is how
+        # much of a list the seller's list drops: «I sent two models and the product lost forty».
+        for change in plan.axis_changes:
+            before = change.kept + len(change.removed)
+            if change.removed and (len(change.removed) >= BIG_DELETE or len(change.removed) * 2 > before):
+                word = {MODEL: "مدل", COLOR: "رنگ"}.get(change.kind, change.name)
+                out.append(f"{len(change.removed)} {word} از {before} حذف می‌شود؛ اگر فهرست ناقص است، "
+                           "همین حالا کامل‌ترش را بفرست.")
+    elif len(plan.deletes) >= BIG_DELETE or (total and len(plan.deletes) * 2 > total):
         out.append(f"{len(plan.deletes)} واریژن از {total} حذف می‌شود؛ اگر فهرست مدل‌ها ناقص است، "
                    "همین حالا کامل‌ترش را بفرست.")
-    if plan.creates and draft.stock is None and not draft.stock_status \
+    new_ones = [row for row in plan.creates if row.replaces is None]
+    if new_ones and draft.stock is None and not draft.stock_status \
             and any(variation.manage_stock for variation in product.variations):
         out.append("موجودی واریژن‌های تازه را ننوشتی؛ بدون شمارش (همیشه موجود) ساخته می‌شوند.")
     if plan.creates and not draft.says_price and inherited_from:

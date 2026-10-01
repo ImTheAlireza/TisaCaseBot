@@ -118,6 +118,8 @@ class ShopVariation:
     stock_status: str
     #: media id of the variation's own picture (0 = none); a replaced gallery never touches it
     image_id: int = 0
+    #: the variation's post status: «publish», or «private» when the seller unticked «Enabled»
+    status: str = ""
 
     @classmethod
     def from_row(cls, row: dict[str, Any]) -> ShopVariation:
@@ -140,6 +142,7 @@ class ShopVariation:
             manage_stock=bool(row.get("manage_stock")),
             stock_status=str(row.get("stock_status") or ""),
             image_id=_image_id(row.get("image")),
+            status=str(row.get("status") or ""),
         )
 
     def value_of(self, wanted_name: str) -> str:

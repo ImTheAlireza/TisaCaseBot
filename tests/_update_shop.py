@@ -89,6 +89,7 @@ class UpdateShop:
         self.stale_echo: set[int] = set()               # applied late: the echo still shows the old row
         self.blank_echo: set[int] = set()               # applied, but the echo carries only the id
         self.reject_creates = False                     # create rows come back with an `error` object
+        self.create_limit: int | None = None            # a batch makes this many rows; the rest fail
         self.omit_delete_echo = False                   # deleted, but `delete` comes back empty
         self.refuse_delete: set[int] = set()            # rows the shop refuses to delete
         self.media_status = 201
@@ -221,8 +222,8 @@ class UpdateShop:
         if len(creates) + len(updates) + len(deletes) > BATCH_LIMIT:
             return httpx.Response(400, json={"message": "Maximum 100 items per batch"})
         out: dict[str, list] = {"create": [], "update": [], "delete": []}
-        for item in creates:
-            if self.reject_creates:
+        for index, item in enumerate(creates):
+            if self.reject_creates or (self.create_limit is not None and index >= self.create_limit):
                 out["create"].append({"id": 0, "error": {"code": "woocommerce_rest_invalid", "message": "رد شد"}})
             else:
                 out["create"].append(self._make(item))

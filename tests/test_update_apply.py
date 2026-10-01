@@ -51,13 +51,13 @@ class ShopTestCase(unittest.TestCase):
         return [h.write_image(self.tmp, name) for name in (names or ("01_a.jpg",))]
 
     def update(self, data: dict, files: list[Path] | None = None, *, shop: UpdateShop | None = None,
-               audit: Audit | None = None):
+               audit: Audit | None = None, baseline=None):
         """read → plan → apply, all against the fake shop; returns ``(plan, result)``."""
         shop = shop or self.shop
 
         async def go():
             product = await product_match.read(PRODUCT_ID, transport=shop.transport)
-            plan = update_plan.build(product, data, image_count=len(files or []))
+            plan = update_plan.build(product, data, image_count=len(files or []), baseline=baseline)
             result = await update_apply.apply(plan, files or [], audit=audit, transport=shop.transport)
             return plan, result
 
@@ -78,19 +78,67 @@ class WhatTheShopHoldsAfterwards(ShopTestCase):
         self.assertEqual({row["regular_price"] for row in self.shop.variations.values()}, {"720000"})
         self.assertEqual({row["stock_quantity"] for row in self.shop.variations.values()}, {12})
         self.assertEqual(len(self.shop.product["images"]), 3, "گالری با سه عکس تازه جایگزین شد")
-        self.assertEqual(result.created, 6)
-        self.assertEqual(result.deleted, 1)
-        self.assertEqual(len(result.updated), 2, "دو واریژنِ iPhone 13 Pro Max همان واریژن ماندند")
+        self.assertEqual(result.created, 8, "کل شبکه از نو: ۲ ترکیبِ iPhone 13 + ۳ + ۳")
+        self.assertEqual(result.deleted, 3, "هر سه واریژنِ قبلی پاک شد")
+        self.assertEqual(result.updated, [], "چیزی درجا عوض نشد؛ همه از نو ساخته شد")
         self.assertEqual(plan.variations_after, len(self.shop.variations))
 
-    def test_the_same_variations_keep_their_ids_when_a_model_stays(self) -> None:
-        before = {values: row["id"] for row in self.shop.variations.values()
-                  for values in [tuple(item["option"] for item in row["attributes"])]}
+    def test_a_changed_list_rebuilds_every_variation_even_where_the_model_stays(self) -> None:
+        before = set(self.shop.variations)
         self.update({"models": NEW_MODELS, "price": 720_000})
-        after = {values: row["id"] for row in self.shop.variations.values()
-                 for values in [tuple(item["option"] for item in row["attributes"])]}
-        for values in (("iPhone 13 Pro Max", "مشکی"), ("iPhone 13 Pro Max", "سفید")):
-            self.assertEqual(before[values], after[values], "واریژنِ مدلِ مشترک نباید پاک و دوباره ساخته شود")
+        self.assertFalse(before & set(self.shop.variations),
+                         "هیچ‌کدام از واریژن‌های قبلی (حتی iPhone 13 Pro Max) نمانده؛ همه شناسهٔ تازه دارند")
+        self.assertEqual(len(self.shop.variations), 8)
+        self.assertEqual(len(self.shop.grid()), 8, "هیچ ترکیبی دوبار نیست")
+        self.assertIsNotNone(self.shop.by_values("iPhone 13 Pro Max", "مشکی"))
+
+    def test_a_list_that_only_repeats_the_shop_leaves_the_variations_alone(self) -> None:
+        before = set(self.shop.variations)
+        _plan, result = self.update({"models": ["iPhone 13 Pro Max", "S24 Ultra"], "price": 720_000})
+        self.assertTrue(result.ok, result.summary())
+        self.assertEqual(set(self.shop.variations), before, "ساختار عوض نشده؛ فقط قیمت درجا نوشته شد")
+        self.assertEqual((result.created, result.deleted, len(result.updated)), (0, 0, 3))
+
+    def test_a_rebuild_loses_nothing_the_seller_did_not_write(self) -> None:
+        shop = UpdateShop(variations=[
+            {**variation_row(1, "iPhone 13 Pro Max", "مشکی", stock=4, sale="598000"), "image": {"id": 71}},
+            {**variation_row(2, "iPhone 13 Pro Max", "سفید", stock=0, status="outofstock"), "image": {"id": 72}},
+            variation_row(3, "S24 Ultra", "سبز", stock=7, price="598000"),
+        ])
+        _plan, result = self.update({"models": NEW_MODELS}, shop=shop)
+        self.assertTrue(result.ok, result.summary())
+        black = shop.by_values("iPhone 13 Pro Max", "مشکی")
+        white = shop.by_values("iPhone 13 Pro Max", "سفید")
+        assert black is not None and white is not None
+        self.assertEqual((black["regular_price"], black["sale_price"], black["stock_quantity"]),
+                         ("698000", "598000", 4), "قیمت، قیمت ویژه و موجودی قبلی")
+        self.assertEqual((black["image"], white["image"]), ({"id": 71}, {"id": 72}), "عکس هر واریژن")
+        self.assertEqual((white["stock_quantity"], white["stock_status"]), (0, "outofstock"))
+        fresh = shop.by_values("iPhone 15", "مشکی")
+        assert fresh is not None
+        self.assertEqual(fresh["image"], {"id": 71}, "مدل تازه عکسِ رنگِ مشکی را می‌گیرد")
+        self.assertFalse(fresh["manage_stock"], "موجودی ننوشتی؛ مدلِ تازه بدون شمارش")
+
+    def test_a_rebuild_does_not_put_a_hidden_variation_back_on_sale(self) -> None:
+        shop = UpdateShop(variations=[
+            variation_row(1, "iPhone 13 Pro Max", "مشکی"),
+            {**variation_row(2, "iPhone 13 Pro Max", "سفید"), "status": "private"}])
+        _plan, result = self.update({"models": ["iPhone 13 Pro Max", "iPhone 15"], "price": 698_000}, shop=shop)
+        self.assertTrue(result.ok, result.summary())
+        white = shop.by_values("iPhone 13 Pro Max", "سفید")
+        black = shop.by_values("iPhone 13 Pro Max", "مشکی")
+        assert white is not None and black is not None
+        self.assertEqual((white["status"], black["status"]), ("private", "publish"))
+
+    def test_the_rows_that_duplicate_an_existing_combination_are_sent_first(self) -> None:
+        self.update({"models": ["iPhone 15", "iPhone 13 Pro Max"], "price": 720_000})
+        sent = self.shop.body("POST", "/variations/batch").get("create") or []
+        models = [row["attributes"][0]["option"] for row in sent]
+        self.assertEqual(models[:2], ["iPhone 13 Pro Max", "iPhone 13 Pro Max"],
+                         "اول ترکیب‌هایی که از قبل هستند، تا شکستِ وسط کار همیشه یک «همزاد» باقی بگذارد")
+        orders = {tuple(item["option"] for item in row["attributes"]): row["menu_order"] for row in sent}
+        self.assertLess(orders[("iPhone 15", "مشکی")], orders[("iPhone 13 Pro Max", "مشکی")],
+                        "ترتیبِ نمایش همان ترتیبِ فهرستِ فروشنده است، نه ترتیبِ ارسال")
 
     def test_the_order_is_pictures_then_product_then_variations_then_deletes(self) -> None:
         self.update({"models": NEW_MODELS, "price": 720_000}, self.photos("01_a.jpg", "02_b.jpg"))
@@ -212,9 +260,12 @@ class TheShopIsAskedToConfirm(ShopTestCase):
         _plan, result = self.update({"models": NEW_MODELS, "price": 720_000})
         self.assertTrue(result.ok, result.summary())
         self.assertEqual({values[0] for values in self.shop.grid()}, set(NEW_MODELS))
-        self.assertEqual(len(self.shop.calls("DELETE", "/variations/9003")), 1)
-        self.assertEqual(self.shop.calls("DELETE", "/variations/9003")[0][2].get("force"), "true")
-        self.assertTrue(self.shop.calls("PUT", "/variations/9001"))
+        for old in (9001, 9002, 9003):
+            self.assertEqual(len(self.shop.calls("DELETE", f"/variations/{old}")), 1)
+            self.assertEqual(self.shop.calls("DELETE", f"/variations/{old}")[0][2].get("force"), "true")
+        singles = [call for call in self.shop.calls("POST", "/variations") if not call[1].endswith("/batch")]
+        self.assertEqual(len(singles), 8, "هر ترکیب با یک POST جدا ساخته شد")
+        self.assertEqual(self.shop.calls("PUT", "/variations/"), [], "چیزی درجا عوض نمی‌شود")
 
     def test_a_batch_that_creates_is_never_retried_after_a_400(self) -> None:
         # A 400 on a creating batch may mean some rows were already made; asking one by one
@@ -252,13 +303,13 @@ class TheShopIsAskedToConfirm(ShopTestCase):
     def test_a_delete_the_shop_did_not_echo_is_checked_with_a_reread(self) -> None:
         self.shop.omit_delete_echo = True
         _plan, result = self.update({"models": NEW_MODELS, "price": 720_000})
-        self.assertEqual(result.deleted, 1)
+        self.assertEqual(result.deleted, 3)
         self.assertTrue(result.ok, result.summary())
 
     def test_a_delete_the_shop_refuses_is_reported_not_swallowed(self) -> None:
         self.shop.refuse_delete = {9003}
         _plan, result = self.update({"models": NEW_MODELS, "price": 720_000})
-        self.assertEqual(result.deleted, 0)
+        self.assertEqual(result.deleted, 2, "دو تا پاک شد، یکی را فروشگاه نداد")
         self.assertTrue(any("حذف نشد" in line for line in result.failed))
         self.assertFalse(result.ok)
 
@@ -317,7 +368,7 @@ class WhenTheNetworkOrTheHostMisbehaves(ShopTestCase):
         plan = self.plan({"models": NEW_MODELS, "price": 720_000})
         result = self.apply(plan, flaky(
             self.shop, lambda r: r.url.path.endswith("/variations/batch") and b'"delete"' in r.content))
-        self.assertEqual(result.created, 6)
+        self.assertEqual(result.created, 8)
         self.assertEqual(result.deleted, 0)
         self.assertTrue(any("حذف نشد" in line for line in result.failed))
         self.assertFalse(result.ok)
@@ -366,7 +417,7 @@ class WhenTheNetworkOrTheHostMisbehaves(ShopTestCase):
         self.shop.batch_status = 404
         self.shop.refuse_delete = {9003}
         result = self.apply(self.plan({"models": NEW_MODELS, "price": 720_000}), self.shop.transport)
-        self.assertEqual(result.deleted, 0)
+        self.assertEqual(result.deleted, 2)
         self.assertTrue(any("9003" in line for line in result.failed))
 
     def test_a_recheck_the_shop_cannot_answer_leaves_the_row_unconfirmed(self) -> None:
@@ -387,8 +438,86 @@ class WhenTheNetworkOrTheHostMisbehaves(ShopTestCase):
 
 
 @needs_services
+class AskingAgainAfterARebuildStoppedHalfWay(ShopTestCase):
+    """The write is not transactional: the lists are written, then variations are made, then the
+    old ones go. Whatever stops it, asking again must end on the grid the first try meant — one
+    variation per combination, nothing from the old grid left over, nothing missing."""
+
+    DATA = {"models": NEW_MODELS, "price": 720_000, "stock": 12}
+
+    def original(self):
+        return asyncio.run(product_match.read(PRODUCT_ID, transport=self.shop.transport))
+
+    def assert_converged(self) -> None:
+        self.assertEqual(len(self.shop.variations), 8, sorted(self.shop.grid()))
+        self.assertEqual(len(self.shop.grid()), 8, "هیچ ترکیبی دوبار نیست")
+        self.assertEqual({values[0] for values in self.shop.grid()}, set(NEW_MODELS))
+        self.assertEqual({row["regular_price"] for row in self.shop.variations.values()}, {"720000"})
+        self.assertEqual({row["stock_quantity"] for row in self.shop.variations.values()}, {12})
+        self.assertIsNone(self.shop.by_values("S24 Ultra", "سبز"))
+        self.assertEqual(len(self.shop.options("مدل")), 3)
+
+    def test_creates_that_stopped_half_way_are_completed_without_duplicates(self) -> None:
+        baseline = self.original()
+        self.shop.create_limit = 4            # the first four rows land, the rest are refused
+        _plan, result = self.update(self.DATA, baseline=baseline)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.created, 4)
+        self.assertEqual(len(self.shop.variations), 3 + 4, "قدیمی‌ها هنوز هستند؛ چیزی حذف نشده")
+        self.assertEqual(result.deleted, 0)
+        self.shop.create_limit = None
+        plan, result = self.update(self.DATA, baseline=baseline)
+        self.assertTrue(result.ok, result.summary())
+        self.assertFalse(plan.regenerate, "فهرست‌ها نشسته‌اند؛ کار نیمه‌مانده کامل می‌شود")
+        self.assert_converged()
+        self.assertFalse({9001, 9002, 9003} & set(self.shop.variations),
+                         "از هر دو همزاد، تازه‌ترین ماند؛ هیچ واریژنِ قدیمی باقی نیست")
+        self.assertEqual(result.updated, [], "همزادهای تازه قیمت و موجودیِ درست را از قبل داشتند")
+        again = update_plan.build(self.original(), self.DATA, baseline=baseline)
+        self.assertTrue(again.empty, "بعد از کامل‌شدن چیزی برای فرستادن نیست: " + "\n".join(again.change_lines()))
+
+    def test_a_new_model_made_in_one_colour_only_gets_its_other_colours_on_the_retry(self) -> None:
+        baseline = self.original()
+        self.shop.create_limit = 3            # 13 Pro Max × ۲ (twins), then iPhone 15 × مشکی
+        self.update(self.DATA, baseline=baseline)
+        self.assertIsNotNone(self.shop.by_values("iPhone 15", "مشکی"))
+        self.assertIsNone(self.shop.by_values("iPhone 15", "سفید"))
+        self.shop.create_limit = None
+        self.update(self.DATA, baseline=baseline)
+        self.assertIsNotNone(self.shop.by_values("iPhone 15", "سفید"), "نیمه‌ساخته را «فقط مشکی» نخوانده است")
+        self.assertIsNotNone(self.shop.by_values("iPhone 15", "سبز"))
+        self.assert_converged()
+
+    def test_a_delete_that_was_refused_is_finished_on_the_retry(self) -> None:
+        baseline = self.original()
+        self.shop.refuse_delete = {9001, 9002, 9003}
+        _plan, result = self.update(self.DATA, baseline=baseline)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.created, 8)
+        self.assertEqual(len(self.shop.variations), 3 + 8, "تازه‌ها ساخته شده‌اند؛ قدیمی‌ها هنوز هستند")
+        self.shop.refuse_delete = set()
+        _plan, result = self.update(self.DATA, baseline=baseline)
+        self.assertTrue(result.ok, result.summary())
+        self.assert_converged()
+        self.assertEqual((result.created, result.deleted), (0, 3),
+                         "چیزی دوباره ساخته نشد؛ فقط سه قدیمی پاک شد: دو همزادِ iPhone 13 و S24")
+        self.assertFalse({9001, 9002, 9003} & set(self.shop.variations))
+
+    def test_a_batch_that_never_arrived_leaves_the_old_grid_and_asking_again_rebuilds_it(self) -> None:
+        baseline = self.original()
+        self.shop.reject_creates = True
+        _plan, result = self.update(self.DATA, baseline=baseline)
+        self.assertFalse(result.ok)
+        self.assertEqual(len(self.shop.variations), 3, "محصول بی‌واریژن نماند")
+        self.shop.reject_creates = False
+        _plan, result = self.update(self.DATA, baseline=baseline)
+        self.assertTrue(result.ok, result.summary())
+        self.assert_converged()
+
+
+@needs_services
 class NewVariationsGetTheirPictures(ShopTestCase):
-    def test_a_photo_named_after_a_new_colour_goes_on_that_colours_new_variations(self) -> None:
+    def test_a_photo_named_after_a_new_colour_goes_on_that_colours_variations(self) -> None:
         files = [h.write_image(self.tmp, "01_main.jpg"), h.write_image(self.tmp, "02_آبی.jpg")]
         _plan, result = self.update({"attributes": {"رنگ": ["مشکی", "آبی"]}, "price": 698_000}, files)
         self.assertTrue(result.ok, result.summary())
@@ -400,7 +529,19 @@ class NewVariationsGetTheirPictures(ShopTestCase):
             self.assertIn(row["image"]["id"], media_ids)
         black = self.shop.by_values("iPhone 13 Pro Max", "مشکی")
         assert black is not None
-        self.assertFalse(black.get("image"), "واریژنِ قدیمی عکس خودش را نگه می‌دارد")
+        self.assertFalse(black.get("image"), "عکسی نداشت و رنگ‌اش هم عکسِ هم‌نام ندارد؛ چیزی نمی‌گیرد")
+
+    def test_a_variation_that_had_a_picture_keeps_it_when_the_new_photos_do_not_name_its_colour(self) -> None:
+        shop = UpdateShop(variations=[
+            {**variation_row(1, "iPhone 13 Pro Max", "مشکی"), "image": {"id": 71}},
+            variation_row(2, "iPhone 13 Pro Max", "سفید")])
+        files = [h.write_image(self.tmp, "01_main.jpg"), h.write_image(self.tmp, "02_آبی.jpg")]
+        _plan, result = self.update({"models": ["iPhone 13 Pro Max", "iPhone 15"], "price": 698_000},
+                                    files, shop=shop)
+        self.assertTrue(result.ok, result.summary())
+        black = shop.by_values("iPhone 13 Pro Max", "مشکی")
+        assert black is not None
+        self.assertEqual(black["image"], {"id": 71}, "گالری عوض شد، عکسِ خودِ واریژن نه")
 
 
 @needs_services
@@ -502,8 +643,9 @@ class TheRehearsal(unittest.TestCase):
         self.assertTrue(result.dry_run)
         self.assertTrue(result.ok, result.summary())
         self.assertIn("dry-run", result.summary())
-        self.assertEqual(result.created, 2)
-        self.assertEqual(len(result.updated), 2)
+        self.assertEqual(result.created, 4, "iPhone 13 Pro Max × ۲ و iPhone 15 × ۲ از نو")
+        self.assertEqual(result.deleted, 2)
+        self.assertEqual(result.updated, [])
         self.assertEqual(result.images, 1)
         self.assertTrue(any(line.startswith("[dry-run] PUT") for line in audit.lines))
         self.assertTrue(any(line.startswith("[dry-run] POST") and "variations/batch" in line
