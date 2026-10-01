@@ -229,7 +229,10 @@ class TestCreateDraftDryRun(unittest.IsolatedAsyncioTestCase):
         with patched_settings(_dry_settings(woo_dry_run=False, woocommerce_url="http://127.0.0.1:9")), \
                 no_sleep() as delays, self.assertRaises(Exception) as ctx:
             await create_draft(self._data().to_dict(), [], dry_run=False)
-        self.assertEqual([1, 2], delays, "ConnectError باید دوباره ارسال شود و backoff رشد کند")
+        self.assertEqual(
+            [1, 2], [delay for delay in delays if delay >= 1],
+            "ConnectError باید backoffهای ۱ و ۲ ثانیه‌ای بگیرد (فاصله‌گذاری هم خواب اضافه می‌کند)",
+        )
         cause: BaseException | None = ctx.exception
         for _ in range(6):
             if cause is None or isinstance(cause, OSError):
@@ -342,7 +345,7 @@ class TestFlowDryRun(unittest.IsolatedAsyncioTestCase):
         # همان جریان، ولی با create_draft جعلی: ثابت می‌کند status/گزارش/لاگ درست است
         calls: list[dict[str, object]] = []
 
-        async def fake_create_draft(data, files, *, dry_run=False, report=None, batch_id="", meta=()):
+        async def fake_create_draft(data, files, *, dry_run=False, report=None, batch_id="", meta=(), resume_existing=True):
             calls.append({"dry_run": dry_run, "files": files, "report": report})
             if report is not None:
                 report.extend(["[dry-run] POST /wp-json/wc/v3/products", "🧪 جمع‌بندی: هیچ داده‌ای نوشته نشد"])
@@ -362,7 +365,8 @@ class TestFlowDryRun(unittest.IsolatedAsyncioTestCase):
 
         update, _seen = query_update("product:confirm", user_id=7, chat_id=9)
         ctx = make_context(Bot())  # type: ignore[arg-type]
-        with patched_settings(_dry_settings()):
+        log_chat_id = -1001234567890
+        with patched_settings(_dry_settings(log_chat_id=log_chat_id)):
             result = await PF.confirm(update, ctx)
         self.assertEqual(PF.ConversationHandler.END, result)
         self.assertEqual([True], [c["dry_run"] for c in calls], "جریان باید پرچم را به سرویس بدهد")
@@ -373,14 +377,56 @@ class TestFlowDryRun(unittest.IsolatedAsyncioTestCase):
         sent = bot.messages
         cards = [str(item["text"]) for item in sent]
         self.assertTrue(any("🧪" in text for text in cards), "کارت نتیجه باید بگوید آزمایشی بوده")
-        self.assertTrue(all(item.get("chat_id") == 9 for item in sent),
-                        "کارت و گزارش هر دو به چتِ شروع‌کننده می‌روند، نه به چت خصوصی")
-        trace = [text for text in cards if "درخواست‌هایی که ساخته شدند" in text]
-        self.assertEqual(1, len(trace), "ردپای dry-run باید برای خود کاربر هم برود، نه فقط لاگ")
+        user_messages = [item for item in sent if item.get("chat_id") == 9]
+        group_messages = [item for item in sent if item.get("chat_id") == log_chat_id]
+        self.assertTrue(user_messages, "کارت نتیجه همچنان برای چت شروع‌کننده می‌ماند")
+        trace = [str(item["text"]) for item in group_messages
+                 if "درخواست‌هایی که ساخته شدند" in str(item["text"])]
+        self.assertEqual(1, len(trace), "ردپای dry-run فقط در گروه لاگ فرستاده می‌شود")
         self.assertIn("POST /wp-json/wc/v3/products", trace[0])
+        self.assertFalse(any("درخواست‌هایی که ساخته شدند" in str(item["text"]) for item in user_messages),
+                         "ردپای فنی نباید به پیوی یا چت شروع‌کننده برود")
+
+    async def test_live_publish_trace_is_truthful_and_group_only(self) -> None:
+        async def fake_create_draft(data, files, *, dry_run=False, report=None, batch_id="", meta=(), resume_existing=True):
+            if report is not None:
+                report.extend([
+                    "[http:start] #1 POST /wp-json/wc/v3/products",
+                    "[http:done] #1 POST /wp-json/wc/v3/products → HTTP 201 در 20 ms",
+                ])
+            return 810_002, "https://shop.example/wp-admin/post.php?post=810002&action=edit"
+
+        real = PF.create_draft
+        PF.create_draft = fake_create_draft
+        self.addCleanup(setattr, PF, "create_draft", real)
+        bot = SimpleNamespace(messages=[], documents=[])
+
+        class Bot:
+            async def send_message(self, *args, text="", **kwargs):
+                bot.messages.append({"text": text, **kwargs})
+
+            async def edit_message_text(self, *args, **kwargs):
+                return None
+
+        update, _seen = query_update("product:confirm", user_id=7, chat_id=9)
+        ctx = make_context(Bot())  # type: ignore[arg-type]
+        log_chat_id = -1001234567890
+        with patched_settings(settings_with(log_chat_id=log_chat_id)):
+            result = await PF.confirm(update, ctx)
+
+        self.assertEqual(PF.ConversationHandler.END, result)
+        user_messages = [item for item in bot.messages if item.get("chat_id") == 9]
+        group_messages = [item for item in bot.messages if item.get("chat_id") == log_chat_id]
+        traces = [str(item["text"]) for item in group_messages if "ردپای انتشار واقعی" in str(item["text"])]
+        self.assertEqual(1, len(traces))
+        self.assertIn("درخواست‌ها به سایت ارسال شدند", traces[0])
+        self.assertIn("HTTP 201", traces[0])
+        self.assertNotIn("هیچ‌کدام به سایت نرفتند", traces[0])
+        self.assertFalse(any("[http:start]" in str(item["text"]) for item in user_messages),
+                         "جزئیات HTTP نباید به پیوی/چت کاربر برود")
 
     async def test_result_card_delivery_failure_does_not_downgrade_a_created_product(self) -> None:
-        async def fake_create_draft(data, files, *, dry_run=False, report=None, batch_id="", meta=()):
+        async def fake_create_draft(data, files, *, dry_run=False, report=None, batch_id="", meta=(), resume_existing=True):
             return 810_001, "https://shop.example/wp-admin/post.php?post=810001&action=edit"
 
         real = PF.create_draft
@@ -412,10 +458,10 @@ class TestFlowDryRun(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("کارت نتیجه ناموفق بود" in str(m["text"]) for m in group_messages))
         self.assertTrue(any("پیش‌نویس ساخته شد" in str(action[1]) for action in seen if action[0] == "edit"))
 
-    async def test_dry_publish_does_not_send_trace_to_non_sudo_admin(self) -> None:
+    async def test_dry_publish_trace_goes_to_log_group_for_non_sudo_admin(self) -> None:
         calls: list[dict[str, object]] = []
 
-        async def fake_create_draft(data, files, *, dry_run=False, report=None, batch_id="", meta=()):
+        async def fake_create_draft(data, files, *, dry_run=False, report=None, batch_id="", meta=(), resume_existing=True):
             calls.append({"dry_run": dry_run, "files": files, "report": report})
             if report is not None:
                 report.extend(["[dry-run] POST /wp-json/wc/v3/products", "🧪 جمع‌بندی: هیچ داده‌ای نوشته نشد"])
@@ -436,14 +482,18 @@ class TestFlowDryRun(unittest.IsolatedAsyncioTestCase):
         PF.rbac.is_sudo = lambda user_id: False
         update, _seen = query_update("product:confirm", user_id=7, chat_id=9)
         ctx = make_context(Bot())  # type: ignore[arg-type]
-        with patched_settings(_dry_settings()):
+        log_chat_id = -1001234567890
+        with patched_settings(_dry_settings(log_chat_id=log_chat_id)):
             result = await PF.confirm(update, ctx)
         self.assertEqual(PF.ConversationHandler.END, result)
         sent = bot.messages
-        cards = [str(item["text"]) for item in sent]
-        self.assertTrue(any("🧪" in text for text in cards), "کارت نتیجه باید بیاید")
-        trace = [text for text in cards if "درخواست‌هایی که ساخته شدند" in text]
-        self.assertEqual(0, len(trace), "ردپای فنی نباید برای ادمین عادی ارسال شود")
+        user_messages = [item for item in sent if item.get("chat_id") == 9]
+        group_messages = [item for item in sent if item.get("chat_id") == log_chat_id]
+        self.assertTrue(any("🧪" in str(item["text"]) for item in user_messages), "کارت نتیجه باید بیاید")
+        trace = [str(item["text"]) for item in group_messages
+                 if "درخواست‌هایی که ساخته شدند" in str(item["text"])]
+        self.assertEqual(1, len(trace), "ردپای ساخت حتی برای ادمین غیر sudo باید به گروه لاگ برود")
+        self.assertFalse(any("درخواست‌هایی که ساخته شدند" in str(item["text"]) for item in user_messages))
 
     async def test_preview_marks_dry_mode_concisely(self) -> None:
         with patched_settings(_dry_settings()):

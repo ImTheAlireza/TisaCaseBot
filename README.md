@@ -88,10 +88,10 @@ required to start.
 | `IMAGE_QUALITY` | no | JPEG quality for compressed output (default `88`). |
 | `AI_BASE_URL` / `AI_TOKEN` / `AI_MODEL` | no | Optional OpenAI-compatible API for normalizing messy phone captions. |
 | `AI_TIMEOUT_SECONDS` | no | Timeout for the AI calls (default `30`). AI failures are logged and the deterministic parser is used. |
-| `LOG_CHAT_ID` | no | Telegram chat receiving the product-processing log. **Empty = disabled** — there is no built-in default on purpose. |
-| `VERBOSE_LOG` | no | `yes` = the log chat also gets the full step-by-step trace of each product (as extra messages, after the card). The trace is always in `logs/bot.log`. |
+| `LOG_CHAT_ID` | no | Telegram chat receiving the product card and detailed WooCommerce publish trace (with an explicit dry-run/live label). Detailed traces never go to the user's private chat. **Empty = disabled** — there is no built-in default on purpose. |
+| `VERBOSE_LOG` | no | `yes` = the log chat also gets the full step-by-step flow trace (image handling, captions, extracted fields) after the card. The publish HTTP trace goes to `LOG_CHAT_ID` either way; the complete trace is also in `logs/bot.log`. |
 | `PRICE_MIN` / `PRICE_MAX` | no | Sanity range for a parsed price in toman (defaults `1000` / `500000000`). Anything outside is reported instead of published. |
-| `REQUIRE_MODELS` | no | Refuse to publish a product with zero detected models (default `yes`). |
+| `REQUIRE_MODELS` | no | Opt-in strict validation: `yes` blocks products with no detected model. Default `no`; model-less products are allowed and can be created as simple products. |
 | `TISA_DATA_DIR` | no | Where the JSON stores live (roles, publish history, learned rules). Default `./data`. On a shared host point it **out of the code directory** (e.g. `/var/lib/tisaposttowp`) so a redeploy or `git clean` cannot delete the shop's history. `python main.py --check-config` prints the resolved path and **fails** if it is not writable — the JSON writers never raise. |
 | `TISA_DRY_RUN` | no | `yes` = rehears every publish: the real payload is built and sent to a fake transport, so **nothing is written on the shop** (default `no`). See [dry-run](#-حالت-آزمایشی-انتشار-dry-run). |
 | `FLOW_TIMEOUT_SECONDS` | no | Idle time before a product flow is closed and its temp files deleted (default `900`). |
@@ -480,14 +480,15 @@ xiaomi (فقط سفید)
 2. بالای صفحهٔ پیش‌نمایش محصول یک خط اضافه می‌شود: «🧪 حالت آزمایشی روشن است —
    «تأیید و ساخت» هیچ محصولی در سایت نمی‌سازد».
 3. «✅ تأیید و ساخت پیش‌نویس» را بزن. **همان کد واقعی** اجرا می‌شود: payload ساخته
-   می‌شود، SKU از کاتالوگ اسکن می‌شود، دسته‌ها پیدا می‌شوند، بستهٔ تصویر آمادهٔ
-   آپلود می‌شود، و بچِ واریژن‌ها بسته‌بندی می‌شود — فقط سوکت با یک پاسخ‌دهندهٔ جعلی
+   می‌شود، SKU از high-water محلی (و در صورت نبود، افزونه/کاتالوگ) انتخاب می‌شود،
+   دسته‌ها resolve می‌شوند، بستهٔ تصویر آمادهٔ آپلود می‌شود، و بچِ واریژن‌ها بسته‌بندی می‌شود — فقط سوکت با یک پاسخ‌دهندهٔ جعلی
    عوض شده است، پس یک بایت هم به سایت نمی‌رود. دروازهٔ اعتبارنامه‌ها هم سر جایشان
    می‌مانند: اگر `WOOCOMMERCE_*` یا `WORDPRESS_*` کامل نباشد، dry-run هم خطا می‌دهد
    (چون آن خطا بخشی از همان تست است).
-4. بعدش دو پیام می‌گیری: کارت نتیجه با 🧪 (بدون id و بدون لینک ویرایش، چون محصولی
-   وجود ندارد) و لیست «🧪 درخواست‌هایی که ساخته شدند و ارسال نشدند» با بدنهٔ JSON
-   هر درخواست. بدنهٔ تصویر به‌صورت `<۴۷۱ بایت دادهٔ دودویی>` می‌آید، نه بایت‌های خام.
+4. کارت نتیجه با 🧪 (بدون id و لینک ویرایش) به همان چتی می‌آید که انتشار را شروع کرد؛
+   گزارش فنی «درخواست‌هایی که ساخته شدند و ارسال نشدند» فقط به گروه/کانال `LOG_CHAT_ID`
+   می‌رود، نه پیوی کاربر. در گزارش، بدنهٔ تصویر به‌صورت خلاصه می‌آید، نه بایت‌های خام.
+   اگر `LOG_CHAT_ID` تنظیم نیست، trace محلی در `logs/bot.log` می‌ماند.
 5. در «🧾 آخرین محصولات» هم همان رکورد با 🧪 و **بدون product_id** دیده می‌شود، پس
    یک تمرین هرگز جای انتشار واقعی را نمی‌گیرد.
 

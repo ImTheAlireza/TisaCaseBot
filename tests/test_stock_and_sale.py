@@ -433,9 +433,10 @@ class TestCategoryLookupReuse(unittest.TestCase):
         import asyncio
         import httpx
 
-        from bot.services.woocommerce_direct import _resolve_categories
+        from bot.services.woocommerce_direct import _resolve_categories, clear_category_cache
         from bot.services.woo_client import Audit
 
+        clear_category_cache()
         parent = "قاب و کاور گوشی و تبلت"
         catalog = {
             parent: [{"id": 1, "name": parent, "parent": 0}],
@@ -444,7 +445,8 @@ class TestCategoryLookupReuse(unittest.TestCase):
         }
 
         class Client:
-            def __init__(self) -> None:
+            def __init__(self, *, dry_run: bool = False) -> None:
+                self.dry_run = dry_run
                 self.searched: list[str] = []
 
             async def get(self, _url, *, params):
@@ -461,6 +463,26 @@ class TestCategoryLookupReuse(unittest.TestCase):
         ))
         self.assertEqual([parent, "آیفون iphone", "سامسونگ samsung"], client.searched)
         self.assertEqual([{"id": 1}, {"id": 2}, {"id": 3}], result)
+
+        again = asyncio.run(_resolve_categories(
+            client,
+            "https://shop.example/wp-json/wc/v3/products",
+            [f"{parent} > آیفون iphone", f"{parent} > سامسونگ samsung"],
+            Audit(),
+        ))
+        self.assertEqual(result, again)
+        self.assertEqual(3, len(client.searched), "انتشار بعدی دسته‌های یکسان را دوباره نمی‌خواند")
+
+        clear_category_cache()
+        dry_client = Client(dry_run=True)
+        for _ in range(2):
+            asyncio.run(_resolve_categories(
+                dry_client,
+                "https://shop.example/wp-json/wc/v3/products",
+                [f"{parent} > آیفون iphone"],
+                Audit(),
+            ))
+        self.assertEqual(4, len(dry_client.searched), "شناسه‌های ساختگی dry-run نباید cache شوند")
 
 
 @needs_flow

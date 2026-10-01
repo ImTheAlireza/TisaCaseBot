@@ -57,11 +57,15 @@ class TestSkuResolution(unittest.IsolatedAsyncioTestCase):
         self.audit = Audit()
         self.script = TransportScript()
 
-    async def resolve(self, *steps: Any, prefix: str = "BO", default: Any = (200, [])) -> str:
+    async def resolve(
+        self, *steps: Any, prefix: str = "BO", default: Any = (200, []), verify_candidate: bool = True
+    ) -> str:
         """یک client روی اسکریپت ساختگی؛ `default` یعنی «هر چیز دیگری: جوابِ خالی».\""""
         self.script = TransportScript(*steps, default=default)
         async with WooClient(audit=self.audit, transport=self.script.transport(), attempts=1) as client:
-            return await sku.next_free(client, BASE, prefix, self.audit)
+            return await sku.next_free(
+                client, BASE, prefix, self.audit, verify_candidate=verify_candidate
+            )
 
     @property
     def lines(self) -> str:
@@ -105,17 +109,61 @@ class TestSkuResolution(unittest.IsolatedAsyncioTestCase):
         probes = sum(1 for request in self.script.requests if "sku" in request.url.params)
         self.assertEqual(200, probes, "سقف پراب همان چیزی است که در کد نوشته شده — و بیشتر نه")
 
-    async def test_the_plugin_answer_wins_for_the_starting_point(self) -> None:
+    async def test_fresh_local_high_water_mark_skips_plugin_and_uses_one_read(self) -> None:
         with patched_settings(settings_with(
             woocommerce_url="https://shop.example", woocommerce_key="ck", woocommerce_secret="cs",
             wordpress_url="https://shop.example", wordpress_username="admin",
             wordpress_app_password="aaaa bbbb",
         )):
             sku.remember("BO", 3)
-            await self.resolve(respond(200, {"sku": "BO900"}))
+            await self.resolve()
+        self.assertEqual(1, self.script.sends, "کشِ تازه افزونه/اسکن را حذف می‌کند؛ فقط تأیید اختیاری می‌ماند")
+        self.assertEqual("BO4", self.script.requests[0].url.params["sku"])
+        self.assertNotIn("next-sku", self.script.requests[0].url.path)
+        self.assertIn("کش محلی", self.lines)
+
+    async def test_cold_cache_uses_the_plugin_before_scanning(self) -> None:
+        with patched_settings(settings_with(
+            woocommerce_url="https://shop.example", woocommerce_key="ck", woocommerce_secret="cs",
+            wordpress_url="https://shop.example", wordpress_username="admin",
+            wordpress_app_password="aaaa bbbb",
+        )):
+            await self.resolve(respond(200, {"sku": "BO900"}), respond(200, []))
         self.assertEqual("BO900", self.script.requests[-1].url.params["sku"])
         self.assertIn("افزونهٔ next-sku پاسخ داد", self.lines)
         self.assertNotIn("اسکن با search", self.lines, "جواب افزونه یعنی نیازی به اسکن نیست")
+
+    async def test_writer_can_skip_the_non_reserving_exact_sku_read(self) -> None:
+        with patched_settings(settings_with(
+            woocommerce_url="https://shop.example", woocommerce_key="ck", woocommerce_secret="cs",
+            wordpress_url="https://shop.example", wordpress_username="admin",
+            wordpress_app_password="aaaa bbbb",
+        )):
+            sku.remember("BO", 3)
+            value = await self.resolve(verify_candidate=False)
+        self.assertEqual("BO4", value)
+        self.assertEqual(0, self.script.sends, "POST خود محصول یکتایی را کنترل می‌کند")
+        self.assertIn("یکتایی هنگام POST", self.lines)
+
+    async def test_product_post_handles_a_stale_sku_without_probe_gets(self) -> None:
+        import json
+
+        from bot.services.woocommerce_direct import _create_with_sku_retry
+
+        script = TransportScript(
+            respond(400, {"message": "Invalid or duplicated SKU."}),
+            respond(201, {"id": 77, "sku": "BO12"}),
+        )
+        audit = Audit()
+        with patched_settings(settings_with(**NO_PLUGIN)):
+            async with WooClient(audit=audit, transport=script.transport(), attempts=1) as client:
+                response = await _create_with_sku_retry(
+                    client, BASE, {"name": "قاب", "sku": "BO11"}, "BO", "BO11", audit
+                )
+        self.assertEqual(201, response.status_code)
+        self.assertEqual(["POST /wp-json/wc/v3/products"] * 2, script.methods)
+        self.assertEqual("BO11", json.loads(script.requests[0].content)["sku"])
+        self.assertEqual("BO12", json.loads(script.requests[1].content)["sku"])
 
 
 @needs_httpx

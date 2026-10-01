@@ -168,14 +168,17 @@ def update(key: str, **fields: Any) -> dict[str, Any] | None:
     return None
 
 
+def batch_history(batch_id: str) -> list[dict[str, Any]]:
+    """Every retained attempt for this content, newest first (including dry runs)."""
+    if not batch_id:
+        return []
+    return [entry for entry in _load() if str(entry.get("batch_id") or "") == str(batch_id)]
+
+
 def find_batch(batch_id: str) -> dict[str, Any] | None:
     """The newest card built from this content (``None`` if we never tried)."""
-    if not batch_id:
-        return None
-    for entry in _load():
-        if str(entry.get("batch_id") or "") == str(batch_id):
-            return entry
-    return None
+    history = batch_history(batch_id)
+    return history[0] if history else None
 
 
 def recent(limit: int = 10) -> list[dict[str, Any]]:

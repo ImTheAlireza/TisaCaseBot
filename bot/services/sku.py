@@ -1,4 +1,4 @@
-"""SKU policy for the shop: ask the plugin, else scan the catalog, then probe (plan 4.4).
+"""SKU policy for the shop: local high-water mark → plugin → catalog scan (plan 4.4).
 
 Split out of :mod:`bot.services.woocommerce_direct` because "what number may this shop use
 next" is a rule of its own, with three sources of truth (the optional `next-sku` plugin,
@@ -12,12 +12,10 @@ string. The collision handling that has to re-POST lives in the writer
 (:func:`bot.services.woocommerce_direct.create_draft`), because only it knows whether a
 product was already created in this attempt.
 
-The high-water mark per prefix is remembered in ``data/sku_state.json``. Without it every
-publish paid up to a hundred serial list requests (``search`` pages, then a catalog walk)
-in front of the admin — 10–60 s on a shared host, which is how this file was profiled in
-the review (P1-10). The cache is a *starting hint only*: :func:`next_free` still verifies
-each candidate against the store, so a stale or too-high number costs one extra probe, and
-a too-low one costs a few — never a duplicate SKU.
+The high-water mark per prefix is remembered in ``data/sku_state.json``. A fresh local hint
+avoids both the plugin request and the catalog walk. A stale hint is safe: WooCommerce's
+product POST enforces uniqueness, and the writer advances after a duplicate response instead
+of sending a redundant preflight GET that cannot reserve the number.
 """
 from __future__ import annotations
 
@@ -216,36 +214,44 @@ async def scan_max(client: WooClient, base: str, prefix: str, audit: Sink) -> in
     return maximum
 
 
-async def next_free(client: WooClient, base: str, prefix: str, audit: Sink) -> str:
-    """Resolve a free SKU for ``prefix`` (e.g. BO -> BO148).
+async def next_free(
+    client: WooClient,
+    base: str,
+    prefix: str,
+    audit: Sink,
+    *,
+    verify_candidate: bool = True,
+) -> str:
+    """Choose a starting SKU for ``prefix`` (e.g. BO -> BO148).
 
-    The candidate is verified against the store with the exact `sku` filter and
-    bumped until it is truly free, so a stale plugin counter or a catalog too
-    large to scan completely can never produce a duplicate-SKU 400. Note: this
-    can only see what the REST API exposes; ghost rows in WooCommerce's
-    ``wc_product_meta_lookup`` table are invisible here and are instead handled
-    by the writer's POST retry loop.
+    A fresh local high-water mark is cheapest, followed by the optional site plugin and a
+    catalog scan. ``verify_candidate`` is retained for diagnostic callers; the product writer
+    leaves it off because a standalone GET cannot reserve a SKU. WooCommerce's product POST
+    is the final uniqueness check and its bounded collision retry advances stale hints safely.
     """
     prefix = (prefix or "").strip().upper()
     if not prefix:
         audit.log("[sku] پیشوند SKU خالی است؛ بدون SKU ادامه می‌دهیم.")
         return ""
 
-    # The plugin returns the next SKU it considers free; the catalog scan
-    # returns the highest existing number. Start probing from whichever we
-    # have (the plugin's suggested SKU wins) and skip anything the API sees.
     start = 0
-    plugin_sku = await from_plugin(client, prefix, audit)
-    if plugin_sku:
-        start = number(plugin_sku, prefix) or 0
-    if not start:
-        cached = cached_max(prefix)
-        if cached:
-            start = cached + 1
-            audit.log(f"[sku] کش محلی: آخرین {prefix}{cached}؛ ادامه از {prefix}{start} (بدون اسکن کاتالوگ)")
+    cached = cached_max(prefix)
+    if cached:
+        start = cached + 1
+        audit.log(f"[sku] کش محلی: آخرین {prefix}{cached}؛ ادامه از {prefix}{start} (بدون API خواندنی)")
+    else:
+        plugin_sku = await from_plugin(client, prefix, audit)
+        if plugin_sku:
+            start = number(plugin_sku, prefix) or 0
     if not start:
         start = await scan_max(client, base, prefix, audit) + 1
         audit.log(f"[sku] شروع جستجو از: {prefix}{start}")
+
+    if not verify_candidate:
+        candidate = f"{prefix}{start}"
+        remember(prefix, start)
+        audit.log(f"[sku] کاندید «{candidate}» انتخاب شد؛ یکتایی هنگام POST ووکامرس کنترل می‌شود.")
+        return candidate
 
     for attempt in range(200):
         candidate = f"{prefix}{start + attempt}"

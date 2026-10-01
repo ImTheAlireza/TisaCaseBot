@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import re
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -203,6 +204,38 @@ async def send_log_message(bot: Any, text: str, *, parse_mode: str | None = None
         return False
 
 
+def publish_trace_report(
+    lines: Sequence[str], *, dry_run: bool = False, budget: int = 3600
+) -> str:
+    """Format a truthful, compact shop-request trace for the configured log chat."""
+    if not lines:
+        return ""
+    steps = [str(line) for line in lines if str(line).startswith("[dry-run]")]
+    notes = [
+        str(line) for line in lines
+        if not str(line).startswith(("[dry-run]", "[payload]"))
+    ]
+    body = "\n".join([*steps, *notes])
+    if len(body) > budget:
+        kept = body[:budget].rsplit("\n", 1)[0]
+        dropped = body.count("\n") - kept.count("\n")
+        body = kept + "\n" + f"… ({dropped} خط دیگر — کاملش در لاگ فایل است)"
+    header = (
+        "🧪 درخواست‌هایی که ساخته شدند و ارسال نشدند (هیچ‌کدام به سایت نرفتند):"
+        if dry_run
+        else "📋 ردپای انتشار واقعی (درخواست‌ها به سایت ارسال شدند):"
+    )
+    return header + ("\n" + body if body else "")
+
+
+async def send_publish_trace(
+    bot: Any, lines: Sequence[str], *, dry_run: bool = False
+) -> bool:
+    """Send the detailed publish audit only to ``LOG_CHAT_ID`` (never to the owner DM)."""
+    text = publish_trace_report(lines, dry_run=dry_run)
+    return await send_log_message(bot, text) if text else False
+
+
 def journal_for(context: Any) -> Journal | None:
     """This chat's journal (created on first use); ``None`` without a ``chat_data``."""
     data = getattr(context, "chat_data", None)
@@ -274,4 +307,7 @@ async def _send(context: Any, card: str, journal: Journal, *, chat_id: object) -
         )
 
 
-__all__ = ["Journal", "flush", "journal_for", "reset", "send_log_message"]
+__all__ = [
+    "Journal", "flush", "journal_for", "publish_trace_report", "reset",
+    "send_log_message", "send_publish_trace",
+]

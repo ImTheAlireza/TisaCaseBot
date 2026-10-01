@@ -82,7 +82,7 @@ def validate_draft(
     image_count: int = 0,
     price_min: int = 1_000,
     price_max: int = 500_000_000,
-    require_models: bool = True,
+    require_models: bool = False,
     unapplied_model_words: Iterable[tuple[str, Iterable[str]]] = (),
 ) -> IssueList:
     """Check a product draft. ``data`` is ``ProductData.to_dict()``."""
@@ -106,10 +106,15 @@ def validate_draft(
             report.add(LEVEL_ERROR, "E_NO_SKU",
                        "پیشوند SKU پیدا نشد.",
                        "حروف بزرگِ تنها در متن (مثلاً «BO») پیشوند SKU است.")
-        if require_models and not models:
-            report.add(LEVEL_ERROR, "E_NO_MODELS",
-                       "هیچ مدل گوشی/لوازم تشخیص داده نشد.",
-                       "مدل‌ها را در یک خط بنویس (مثلاً «17promax», «S24 اولترا»).")
+        if not models:
+            if require_models:
+                report.add(LEVEL_ERROR, "E_NO_MODELS",
+                           "هیچ مدل گوشی/لوازم تشخیص داده نشد.",
+                           "اگر محصول واقعاً مدل ندارد، REQUIRE_MODELS را در .env روی no بگذار.")
+            else:
+                report.add(LEVEL_WARN, "W_NO_MODELS",
+                           "مدلی تشخیص داده نشد؛ محصول بدون محور مدل ساخته می‌شود.",
+                           "اگر ویژگی متغیر دیگری ندارد، محصول به‌صورت ساده در ووکامرس ساخته خواهد شد.")
         if image_count == 0:
             report.add(LEVEL_ERROR, "E_NO_IMAGES", "هیچ عکسی برای این محصول دریافت نشد.")
         if not price and not prices:

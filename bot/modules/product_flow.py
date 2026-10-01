@@ -20,9 +20,10 @@ from contextlib import AsyncExitStack
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
-from telegram.error import TimedOut, NetworkError
+from telegram.error import BadRequest, TimedOut, NetworkError
 from telegram.ext import Application, CallbackQueryHandler, ContextTypes, ConversationHandler, CommandHandler, MessageHandler, filters
 
 from bot import rbac
@@ -149,6 +150,23 @@ album_tasks: dict[tuple[int, str], asyncio.Task] = {}
 logger = logging.getLogger(__name__)
 
 
+async def _edit_message_if_changed(target: Any, *args: Any, **kwargs: Any) -> bool:
+    """Treat Telegram's idempotent "message is not modified" response as a no-op.
+
+    Callback updates can be delivered again after the preview was already replaced (or
+    still contains the same validation text). That is not an operational failure; other
+    Telegram errors remain visible to the caller.
+    """
+    try:
+        await target.edit_message_text(*args, **kwargs)
+        return True
+    except BadRequest as exc:
+        if "message is not modified" in str(exc).casefold():
+            logger.debug("Telegram edit skipped: message content and markup are unchanged")
+            return False
+        raise
+
+
 async def _telegram_log(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     """Record one step of this product — the card at the end is what gets sent.
 
@@ -202,12 +220,12 @@ async def _flush_journal(
 
 
 def _audit_for_chat(lines: list[str]) -> str:
-    """Condense the WooCommerce audit trail into the most diagnostic lines.
+    """Condense the WooCommerce audit into a short diagnostic for operator text.
 
     The single most valuable line is the FIRST POST attempt: it carries the
     actual WooCommerce error message and body. The per-attempt SKU probes are
-    collapsed into one-line counts so that spam never crowds the real error out
-    of the chat message (the full trace still goes to the log group).
+    collapsed into one-line counts so that repeated collisions do not bury the
+    useful error (the complete, truthfully labeled trace belongs in the log group).
     """
     if not lines:
         return ""
@@ -271,39 +289,8 @@ def _audit_for_chat(lines: list[str]) -> str:
 
 
 def _dry_run_report(lines: Sequence[str], budget: int = 3600) -> str:
-    """The rehearsal trace, for the owner's chat.
-
-    Deliberately NOT :func:`_audit_for_chat`: that one is built for a *failure*
-    (it keeps the first POST attempt and collapses the SKU probes so a real error
-    is not drowned out). A dry run has no error to surface — what matters is which
-    requests would have gone out, in which order, so every step is kept, minus the
-    payload dump that the ``[payload]`` line already carries.
-    """
-    if not lines:
-        return ""
-    steps = [line for line in lines if line.startswith("[dry-run]")]
-    notes = [line for line in lines if not line.startswith("[dry-run]") and not line.startswith("[payload]")]
-    body = "\n".join([*steps, *notes])
-    if len(body) > budget:
-        kept = body[:budget].rsplit("\n", 1)[0]
-        dropped = body.count("\n") - kept.count("\n")
-        body = kept + "\n" + f"… ({dropped} خط دیگر — کاملش در لاگ)"
-    header = "🧪 درخواست‌هایی که ساخته شدند و ارسال نشدند (هیچ‌کدام به سایت نرفتند):"
-    return header + "\n" + body
-
-
-def _attach_audit(message: str, audit_lines: list[str], budget: int = 4000) -> str:
-    """Append a condensed audit to a chat message, staying under Telegram's limit."""
-    view = _audit_for_chat(audit_lines)
-    if not view:
-        return message
-    header = "\n\n📋 جزئیات تلاش‌ها:\n"
-    available = budget - len(message) - len(header)
-    if available <= 0:
-        return message
-    if len(view) > available:
-        view = view[: max(0, available - 1)] + "…"
-    return message + header + view
+    """Compatibility wrapper for the dry-run trace format (sent to the log group)."""
+    return product_journal.publish_trace_report(lines, dry_run=True, budget=budget)
 
 
 def _already_published_note(entry: dict[str, object]) -> str:
@@ -642,8 +629,8 @@ def _preview(session: ProductSession) -> str:
             unmatched_model_words("\n".join((session.model_text, session.info_text)))
         ),
     )
-    if issues.blocking:
-        lines.extend(f"⛔ {html.escape(issue.message)}" for issue in issues.errors[:3])
+    lines.extend(f"⛔ {html.escape(issue.message)}" for issue in issues.errors[:3])
+    lines.extend(f"⚠️ {html.escape(issue.message)}" for issue in issues.warnings[:3])
     return "\n".join(lines)
 
 
@@ -1334,7 +1321,7 @@ async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE, *,
         # delete the id and link the owner may still be reading.
         await query.message.reply_text(prompt)
     else:
-        await query.edit_message_text(prompt)
+        await _edit_message_if_changed(query, prompt)
     return COLLECT
 
 
@@ -1474,7 +1461,9 @@ async def set_image_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     session.image_mode = "replace" if query.data == CB.PHONE_IMAGE_REPLACE else "keep"
     await query.answer("حالت تصاویر ذخیره شد.")
     if session.data:
-        await query.edit_message_text(_preview(session), parse_mode="HTML", reply_markup=_keyboard(session))
+        await _edit_message_if_changed(
+            query, _preview(session), parse_mode="HTML", reply_markup=_keyboard(session)
+        )
     return REVIEW
 
 
@@ -1517,9 +1506,8 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     data.categories = _canonical_category_paths(
         apply_sku_category_policy(data.categories, data.sku_prefix)
     )
-    # ONE shared gate for both output paths. It used to be two different checks,
-    # so the REST path happily published a product with no models while the ZIP
-    # importer rejected exactly that.
+    # ONE shared gate for both output paths. Missing models are a warning by default:
+    # a product with no model axis is still valid and WooCommerce can create it as simple.
     issues = validate_draft(
         data.to_dict(),
         mode=session.mode,
@@ -1533,15 +1521,20 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     )
     if issues.blocking:
         await query.answer(f"⛔ {issues.errors[0].message}", show_alert=True)
-        await query.edit_message_text(
-            _preview(session), parse_mode="HTML", reply_markup=_keyboard(session)
+        await _edit_message_if_changed(
+            query, _preview(session), parse_mode="HTML", reply_markup=_keyboard(session)
         )
         return REVIEW
     # ♻️ idempotency (plan 4.3): the same content from the same chat is ONE product.
     # The key is derived from the payload (see bot/services/publish_batch.py), so a
     # retry after a crash finds its own earlier attempt instead of doubling it.
     batch = publish_batch.batch_id(data.to_dict(), session.files, chat_id=session.chat_id or user.id)
-    prior = products_ledger.find_batch(batch)
+    batch_history = products_ledger.batch_history(batch)
+    prior = batch_history[0] if batch_history else None
+    has_live_attempt = any(
+        str(entry.get("status") or "") in {"pending", "queued", "failed", "created"}
+        for entry in batch_history
+    )
     same_product = prior and str(prior.get("status")) == "created" and str(prior.get("mode") or "new") == session.mode
     if same_product and not session.force_publish:
         await query.answer("♻️ این بسته پیش‌تر ساخته شده است", show_alert=True)
@@ -1560,7 +1553,7 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
         # Replacing the keyboard with a plain «working» message is what makes a
         # double tap impossible instead of merely unlikely.
-        await query.edit_message_text("⏳ در حال ساخت… لطفاً چند لحظه صبر کن.")
+        await _edit_message_if_changed(query, "⏳ در حال ساخت… لطفاً چند لحظه صبر کن.")
     except Exception:
         pass
     await query.answer("در حال ساخت پیش‌نویس مستقیم..." if session.mode == "new" else "در حال ساخت فایل ZIP...")
@@ -1611,7 +1604,7 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         except Exception:
             logger.exception("Could not log post-publish notification failure")
         try:
-            await query.edit_message_text(notice)
+            await _edit_message_if_changed(query, notice)
         except Exception as notify_exc:
             logger.warning(
                 "Product %s was created, but its result could not be shown to user %s (%s): %s",
@@ -1640,6 +1633,9 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             product_id, edit_url = await create_draft(
                 data.to_dict(), session.files, dry_run=settings.woo_dry_run, report=report,
                 batch_id=batch,
+                # Any retained live attempt keeps recovery enabled. A dry-run card may
+                # follow an older real failure, so inspect this batch's full local history.
+                resume_existing=has_live_attempt,
                 meta=publish_batch.source_meta(
                     batch, chat_id=session.chat_id or user.id, thread_id=session.thread_id,
                     images=len(session.files), variations=data.variation_count,
@@ -1653,7 +1649,9 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 f"[product:{user.id}] "
                 + ("حالت آزمایشی (dry-run) اجرا شد؛ چیزی در سایت ساخته نشد. "
                    if settings.woo_dry_run else f"پیش‌نویس مستقیم ساخته شد: {product_id}")
-                + (("\n--- گزارش dry-run ---\n" + "\n".join(report)) if report else ""),
+                + ("\n" + product_journal.publish_trace_report(
+                    report, dry_run=settings.woo_dry_run
+                ) if report else ""),
             )
             outcome_warnings = [issue.message for issue in issues.warnings] + (
                 ["🧪 حالت آزمایشی روشن است: هیچ چیزی در سایت ساخته نشد."] if settings.woo_dry_run else []
@@ -1690,10 +1688,12 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 text=result_card(entry), parse_mode="HTML", reply_markup=result_keyboard(entry),
                 **_target(session, user.id),
             )
-            if report and rbac.is_sudo(user.id):
-                # The whole point of a dry run is the trace, so it goes to the
-                # sudo user (owner) and not only to the log group (LOG_CHAT_ID is optional).
-                await context.bot.send_message(text=_dry_run_report(report), **_target(session, user.id))
+            if report and not settings.verbose_log:
+                # Detailed HTTP traces belong in the configured log group, never in the
+                # owner's private chat. VERBOSE_LOG already sends the full journal trace.
+                await product_journal.send_publish_trace(
+                    context.bot, report, dry_run=settings.woo_dry_run
+                )
             _cleanup(user.id)
             return ConversationHandler.END
         except WooCommerceAPIError as exc:
@@ -1702,8 +1702,10 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             audit_lines = exc.diagnostics or []
             await _telegram_log(
                 context,
-                f"[product:{user.id}] ساخت مستقیم ناموفق بود (HTTP {exc.status_code}): {exc}\n\n"
-                f"--- لاگ گام‌به‌گام ---\n" + "\n".join(audit_lines),
+                f"[product:{user.id}] ساخت مستقیم ناموفق بود (HTTP {exc.status_code}): {exc}"
+                + ("\n\n" + product_journal.publish_trace_report(
+                    audit_lines, dry_run=settings.woo_dry_run
+                ) if audit_lines else ""),
             )
             reason = f"HTTP {exc.status_code}: {exc}"
             queued = _queue_for_retry(exc, user_id=user.id, session=session, data=data,
@@ -1713,7 +1715,11 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                            key=intent_key, batch_id=batch, error=reason)
             await _flush_journal(context, status="queued" if queued else "failed", data=data,
                                  session=session, batch=batch, errors=[reason])
-            await query.edit_message_text(_attach_audit(message, audit_lines))
+            if audit_lines and not settings.verbose_log:
+                await product_journal.send_publish_trace(
+                    context.bot, audit_lines, dry_run=settings.woo_dry_run
+                )
+            await _edit_message_if_changed(query, message)
             session.submitting = False
             return REVIEW
         except Exception as exc:
@@ -1725,7 +1731,9 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             await _telegram_log(
                 context,
                 f"[product:{user.id}] ساخت مستقیم ناموفق بود: {reason}"
-                + ("\n\n--- لاگ گام‌به‌گام ---\n" + "\n".join(audit_lines) if audit_lines else "")
+                + ("\n\n" + product_journal.publish_trace_report(
+                    audit_lines, dry_run=settings.woo_dry_run
+                ) if audit_lines else "")
                 + f"\n\n{details}",
             )
             queued = _queue_for_retry(exc, user_id=user.id, session=session, data=data,
@@ -1734,10 +1742,12 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                            key=intent_key, batch_id=batch, error=reason)
             await _flush_journal(context, status="queued" if queued else "failed", data=data,
                                  session=session, batch=batch, errors=[reason])
-            await query.edit_message_text(
-                _attach_audit(
-                    f"❌ ساخت مستقیم محصول ناموفق بود:\n{reason}" + _queued_note(queued), audit_lines
+            if audit_lines and not settings.verbose_log:
+                await product_journal.send_publish_trace(
+                    context.bot, audit_lines, dry_run=settings.woo_dry_run
                 )
+            await _edit_message_if_changed(
+                query, f"❌ ساخت مستقیم محصول ناموفق بود:\n{reason}" + _queued_note(queued)
             )
             session.submitting = False
             return REVIEW
@@ -1767,7 +1777,7 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                                         caption="✅ فایل محصول آماده شد. این فایل را در افزونه وردپرس آپلود کن.",
                                         **_target(session, user.id))  # type: ignore[arg-type]
     await _telegram_log(context, f"[product:{user.id}] ZIP برای کاربر ارسال شد.")
-    await query.edit_message_text("✅ ZIP ساخته و ارسال شد.")
+    await _edit_message_if_changed(query, "✅ ZIP ساخته و ارسال شد.")
     entry = _record_result(user.id, session, data, status="zip", batch_id=batch,
                            warnings=[issue.message for issue in issues.warnings])
     await _flush_journal(context, status="zip", data=data, session=session, batch=batch,
@@ -1841,7 +1851,8 @@ async def cb_back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await query.answer()
     if user:
         _cleanup(user.id)
-    await query.edit_message_text(
+    await _edit_message_if_changed(
+        query,
         main_menu_text(user.id if user else None, user),
         reply_markup=main_menu_keyboard(user.id if user else None),
         parse_mode="HTML",
@@ -2245,7 +2256,9 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.callback_query.answer()
     if user:
         _cleanup(user.id)
-    await update.callback_query.edit_message_text("❌ ساخت محصول لغو شد. برای شروع دوباره /start را بزن.")
+    await _edit_message_if_changed(
+        update.callback_query, "❌ ساخت محصول لغو شد. برای شروع دوباره /start را بزن."
+    )
     return ConversationHandler.END
 
 

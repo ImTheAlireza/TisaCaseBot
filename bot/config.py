@@ -156,8 +156,8 @@ class Settings:
     price_max: int = 500_000_000
     # Built-in heuristic: a bare 3-digit amount means thousands of toman.
     bare_three_digit_means_thousands: bool = True
-    # A product must have at least one phone/accessory model to be publishable.
-    require_models: bool = True
+    # Opt-in stricter gate; model-less products are simple products by default.
+    require_models: bool = False
     #: TISA_DRY_RUN=1 → the whole publish path runs, but the socket is replaced by a
     #: fake transport: nothing is created on the shop. Built so that a release can be
     #: rehearsed on the real site without polluting the catalog.
@@ -236,7 +236,7 @@ class Settings:
             note("PRICE_MAX باید بزرگ‌تر از PRICE_MIN باشد؛ به پیش‌فرض برگشت.")
             price_min, price_max = 1_000, 500_000_000
 
-        require_models, problem = _as_bool("REQUIRE_MODELS", True)
+        require_models, problem = _as_bool("REQUIRE_MODELS", False)
         note(problem)
         woo_dry_run, problem = _as_bool("TISA_DRY_RUN", False)
         note(problem)

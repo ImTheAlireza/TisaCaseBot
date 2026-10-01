@@ -187,9 +187,15 @@ class TestValidationGate(unittest.TestCase):
         data.update(overrides)
         return data
 
-    def test_missing_models_block_a_new_product(self):
-        # old: models were not required at all for mode="new"
+    def test_missing_models_are_a_warning_by_default(self):
         report = validate_draft(self._data(models=[]), mode="new", image_count=3)
+        self.assertFalse(report.blocking, "model-less simple products are valid")
+        self.assertIn("W_NO_MODELS", [issue.code for issue in report.warnings])
+
+    def test_missing_models_can_still_be_required_explicitly(self):
+        report = validate_draft(
+            self._data(models=[]), mode="new", image_count=3, require_models=True
+        )
         self.assertTrue(report.blocking)
         self.assertIn("E_NO_MODELS", [issue.code for issue in report.errors])
 
@@ -322,6 +328,10 @@ class TestSettings(unittest.TestCase):
         self.assertEqual(settings.flow_timeout_seconds, 60)
         self.assertEqual(settings.log_level, "INFO")
         self.assertTrue(settings.problems, "the bad values must be reported")
+
+    def test_models_are_not_required_by_default(self):
+        settings = Settings.from_env()
+        self.assertFalse(settings.require_models)
 
     def test_price_range_and_model_requirement_are_configurable(self):
         os.environ["REQUIRE_MODELS"] = "no"
