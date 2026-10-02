@@ -176,7 +176,7 @@ class TestPublishingIsSingleShot(unittest.IsolatedAsyncioTestCase):
         self.query_stub = query_stub
         self.calls: list = []
 
-        async def fake_create_draft(data, files, *, dry_run=False, report=None, batch_id="", meta=()):
+        async def fake_create_draft(data, files, *, dry_run=False, report=None, batch_id="", meta=(), resume_existing=True):
             self.calls.append({"data": data, "dry_run": dry_run, "batch_id": batch_id, "meta": meta})
             await asyncio.sleep(0.05)     # the window a double tap used to hit
             return 1234, "https://example.test/edit"
@@ -210,16 +210,25 @@ class TestPublishingIsSingleShot(unittest.IsolatedAsyncioTestCase):
 class TestConfirmGate(unittest.IsolatedAsyncioTestCase):
     """The gate is wired into the flow, not only into the service."""
 
-    async def test_missing_models_block_publishing(self):
+    async def test_missing_models_are_allowed_and_publishable_as_simple_product(self):
         import tempfile
+        from _flow_harness import patched_settings, settings_with, temp_ledger
+        from bot.services import products_ledger
         from bot.services.product_extractor import ProductData
 
-        data = ProductData(title="قاب", price=698_000, sku_prefix="BO", models=[], attributes={})
-        session = PF.ProductSession(mode="new", files=[Path(tempfile.mktemp())], data=data)
+        workspace = Path(tempfile.mkdtemp(prefix="tisa-no-models-"))
+        self.addCleanup(__import__("shutil").rmtree, workspace, True)
+        image = workspace / "item.jpg"
+        image.write_bytes(b"image")
+        data = ProductData(title="قاب ساده", price=698_000, sku_prefix="BO", models=[], attributes={})
+        session = PF.ProductSession(
+            mode="new", files=[image], data=data, workspace=workspace, chat_id=101
+        )
         PF.sessions[101] = session
         self.addCleanup(PF.sessions.pop, 101, None)
 
-        answered = []
+        answered: list[str | None] = []
+        sent: list[dict] = []
 
         async def answer(text=None, **kwargs):
             answered.append(text)
@@ -227,26 +236,55 @@ class TestConfirmGate(unittest.IsolatedAsyncioTestCase):
         async def edit_message_text(text=None, **kwargs):
             return None
 
+        class Bot:
+            async def send_message(self, *args, text="", **kwargs):
+                sent.append({"text": text, **kwargs})
+                return SimpleNamespace(message_id=101)
+
+            async def edit_message_text(self, *args, **kwargs):
+                return None
+
         update = SimpleNamespace(
             callback_query=SimpleNamespace(
-                data="product:confirm", answer=answer, edit_message_text=edit_message_text
+                data="product:confirm", answer=answer, edit_message_text=edit_message_text,
+                message=SimpleNamespace(chat_id=101),
             ),
             effective_user=SimpleNamespace(id=101, username="t", first_name="t"),
             effective_message=None,
         )
-        calls = []
+        calls: list[dict] = []
 
-        async def must_not_run(*args, **kwargs):  # pragma: no cover
-            calls.append(args)
+        async def fake_create_draft(data, files, *, report=None, **kwargs):
+            calls.append(data)
+            if report is not None:
+                report.append("[product] simple product created")
+            return 1234, "https://shop.example/wp-admin/post.php?post=1234&action=edit"
 
         real = PF.create_draft
-        PF.create_draft = must_not_run
+        PF.create_draft = fake_create_draft
         self.addCleanup(setattr, PF, "create_draft", real)
 
-        state = await PF.confirm(update, SimpleNamespace(bot=None))
-        self.assertEqual(state, PF.REVIEW, "a blocked publish returns to the review screen")
-        self.assertEqual(calls, [], "publishing must not have started")
-        self.assertTrue(any("مدل" in (text or "") for text in answered), answered)
+        context = SimpleNamespace(bot=Bot(), chat_data={})
+        with temp_ledger(), patched_settings(settings_with(require_models=False)):
+            state = await PF.confirm(update, context)
+            entries = products_ledger.recent(1)
+
+        self.assertEqual(PF.ConversationHandler.END, state)
+        self.assertEqual(1, len(calls), "missing a model must not prevent the publish attempt")
+        self.assertEqual("created", entries[0]["status"])
+        self.assertEqual([], calls[0]["models"])
+        self.assertTrue(any("مدلی تشخیص داده نشد" in str(item["text"]) for item in sent),
+                        "the preview/result can explain the simple-product path without blocking")
+        self.assertFalse(any(str(text or "").startswith("⛔") for text in answered))
+
+    async def test_message_not_modified_is_an_idempotent_edit_noop(self):
+        from telegram.error import BadRequest
+
+        async def unchanged(*args, **kwargs):
+            raise BadRequest("Message is not modified: specified new message content and reply markup are exactly the same")
+
+        target = SimpleNamespace(edit_message_text=unchanged)
+        self.assertFalse(await PF._edit_message_if_changed(target, "same preview"))
 
 
 if __name__ == "__main__":

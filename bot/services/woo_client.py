@@ -37,6 +37,8 @@ import json
 import logging
 import re
 import time
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from typing import Any, Protocol
 from collections.abc import Mapping, Sequence
 
@@ -253,6 +255,8 @@ class WooClient:
         attempts: int = DEFAULT_ATTEMPTS,
         key: str | None = None,
         secret: str | None = None,
+        min_request_interval: float = 0.0,
+        max_concurrent_requests: int = 20,
     ) -> None:
         """``key``/``secret`` override ``.env`` — the credential tester verifies a candidate
         pair before it is saved, so it must not be pinned to the settings in force."""
@@ -262,6 +266,10 @@ class WooClient:
         self.timeout_seconds = timeout
         self.attempts = max(1, attempts)
         self._request_number = 0
+        self.min_request_interval = max(0.0, float(min_request_interval))
+        self._request_slots = asyncio.Semaphore(max(1, int(max_concurrent_requests)))
+        self._pace_lock = asyncio.Lock()
+        self._last_request_started = 0.0
         kwargs: dict[str, Any] = {
             "timeout": timeout,
             "follow_redirects": True,
@@ -282,6 +290,17 @@ class WooClient:
 
     async def __aexit__(self, *_exc: object) -> None:
         await self.aclose()
+
+    async def _pace(self) -> None:
+        """Keep this client's outgoing request starts at least the configured gap apart."""
+        if self.min_request_interval <= 0:
+            return
+        async with self._pace_lock:
+            now = time.monotonic()
+            delay = self.min_request_interval - (now - self._last_request_started)
+            if delay > 0:
+                await _sleep(delay)
+            self._last_request_started = time.monotonic()
 
     # — requests —
     async def request(
@@ -324,12 +343,17 @@ class WooClient:
         for attempt in range(self.attempts):
             last_try = attempt == self.attempts - 1
             started = time.perf_counter()
-            self.audit.log(
-                f"[http:start] #{request_id} {method} {path} "
-                f"(تلاش {attempt + 1}/{self.attempts}؛ مهلت هر فاز={self.timeout_seconds:g}s)"
-            )
             try:
-                response = await self._client.request(method, str(url), **merged)
+                # Product publishing configures one in-flight request per client. That keeps
+                # image and variation fallbacks from turning into bursts on a shared host.
+                async with self._request_slots:
+                    await self._pace()
+                    started = time.perf_counter()
+                    self.audit.log(
+                        f"[http:start] #{request_id} {method} {path} "
+                        f"(تلاش {attempt + 1}/{self.attempts}؛ مهلت هر فاز={self.timeout_seconds:g}s)"
+                    )
+                    response = await self._client.request(method, str(url), **merged)
             except httpx.TransportError as exc:
                 elapsed_ms = (time.perf_counter() - started) * 1000
                 retry = not last_try and self._retry_network(exc)
@@ -352,10 +376,10 @@ class WooClient:
                 f"در {elapsed_ms:.0f} ms (تلاش {attempt + 1}/{self.attempts})"
             )
             if not last_try and self._retry_status(method, response):
-                delay = 2**attempt
+                delay = self._retry_delay(response, attempt)
                 self.audit.log(
                     f"[retry] #{request_id} HTTP {response.status_code} موقت است؛ "
-                    f"تلاش مجدد پس از {delay}s"
+                    f"تلاش مجدد پس از {delay:g}s"
                 )
                 await _sleep(delay)
                 continue
@@ -380,6 +404,25 @@ class WooClient:
         # 429 is the rate limiter saying "not processed"; a 5xx on a write may mean
         # "processed, answer lost" — that case must not be sent again.
         return response.status_code in RETRY_IF_SAFE and method.upper() in IDEMPOTENT_METHODS
+
+    @staticmethod
+    def _retry_delay(response: httpx.Response, attempt: int) -> float:
+        """Use exponential backoff, but never retry earlier than the server requested."""
+        fallback = float(2**attempt)
+        raw = response.headers.get("Retry-After", "").strip()
+        if not raw:
+            return fallback
+        try:
+            requested = max(0.0, float(raw))
+        except ValueError:
+            try:
+                retry_at = parsedate_to_datetime(raw)
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=UTC)
+                requested = max(0.0, (retry_at - datetime.now(UTC)).total_seconds())
+            except (TypeError, ValueError, OverflowError):
+                return fallback
+        return max(fallback, requested)
 
     async def get(self, url: str, **kwargs: Any) -> httpx.Response:
         return await self.request("GET", url, **kwargs)
@@ -426,9 +469,14 @@ def _demo_product() -> dict[str, Any]:
         "stock_quantity": None,
         "stock_status": "instock",
         "purchasable": True,
+        # Two pictures, so a rehearsal of an update can say «جایگزین ۲ تصویر فعلی».
+        "images": [{"id": 700_001, "src": "https://dry.run/demo-1.jpg"},
+                   {"id": 700_002, "src": "https://dry.run/demo-2.jpg"}],
         "attributes": [
-            {"name": "مدل", "variation": True, "options": ["iPhone 13 Pro Max", "S24 Ultra"]},
-            {"name": "رنگ", "variation": True, "options": ["مشکی", "سفید"]},
+            {"id": 0, "name": "مدل", "position": 0, "visible": True, "variation": True,
+             "options": ["iPhone 13 Pro Max", "S24 Ultra"]},
+            {"id": 0, "name": "رنگ", "position": 1, "visible": True, "variation": True,
+             "options": ["مشکی", "سفید"]},
         ],
     }
 
@@ -544,7 +592,10 @@ def dry_run_transport(audit: Sink) -> httpx.MockTransport:
                 if isinstance(row, dict):
                     echoed.append({key: value for key, value in row.items() if key != "id"}
                                   | {"id": row.get("id")})
-            return httpx.Response(201, json={"create": created, "update": echoed})
+            # `delete` is echoed the way WooCommerce does (the removed objects), so the update
+            # writer verifies deletions in a rehearsal exactly as it does for real.
+            removed = [{"id": variation_id} for variation_id in sent.get("delete") or []]
+            return httpx.Response(201, json={"create": created, "update": echoed, "delete": removed})
         if method == "POST" and "/variations" in path:
             ids["variation"] += 1
             return httpx.Response(201, json={"id": ids["variation"]})

@@ -1,13 +1,13 @@
 """Finding «همان محصول» in the shop, and reading what the shop says today (plan 5.1).
 
-A restock used to start with «برو در پیشخوان وردپرس جستجو کن، SKU را یادت باشد، برگرد
-اینجا». That is two places to be wrong in: the seller picks one product, the bot charges
+An update used to start with «برو در پیشخوان وردپرس جستجو کن، SKU را یادت باشد، برگرد
+اینجا». That is two places to be wrong in: the seller picks one product, the bot changes
 another. So the lookup happens here instead — the seller types a SKU or a few words of the
 title, and the shop's own answer is shown back as buttons.
 
 Two rules shape this module:
 
-* **read-only.** Nothing here writes; :mod:`bot.services.restock_apply` does. A module that
+* **read-only.** Nothing here writes; :mod:`bot.services.update_apply` does. A module that
   both finds and mutates is how a typo in a search box becomes a price change.
 * **the shop's numbers are the diff's baseline.** `read()` returns price/stock *as the store
   answered them*, because «موجودی ۱۲ واریژن ۰→۳» is only honest if the ۰ came from the shop
@@ -36,6 +36,29 @@ def _money(row: dict[str, Any], key: str) -> int:
         return 0
     try:
         return int(float(str(raw).replace(",", "")))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _body(response: Any) -> Any:
+    """The JSON of a *successful* response — or a clear error instead of a ``JSONDecodeError``.
+
+    A shop in maintenance (or behind a login wall) answers 200 with an HTML page; that must read as
+    «the shop did not answer», never as an exception from deep inside a parser.
+    """
+    try:
+        return response.json()
+    except ValueError as exc:
+        raise WooCommerceAPIError(
+            getattr(response, "status_code", 0), "پاسخ فروشگاه JSON نبود (تعمیرات یا خطای هاست؟)") from exc
+
+
+def _image_id(raw: Any) -> int:
+    """The media id inside WooCommerce's ``image`` object (``None`` / ``{}`` / ``{"id": 0}`` → 0)."""
+    if not isinstance(raw, dict):
+        return 0
+    try:
+        return int(raw.get("id") or 0)
     except (TypeError, ValueError):
         return 0
 
@@ -93,6 +116,10 @@ class ShopVariation:
     stock: int | None
     manage_stock: bool
     stock_status: str
+    #: media id of the variation's own picture (0 = none); a replaced gallery never touches it
+    image_id: int = 0
+    #: the variation's post status: «publish», or «private» when the seller unticked «Enabled»
+    status: str = ""
 
     @classmethod
     def from_row(cls, row: dict[str, Any]) -> ShopVariation:
@@ -114,6 +141,8 @@ class ShopVariation:
             stock=None if raw_stock in (None, "") else int(raw_stock),
             manage_stock=bool(row.get("manage_stock")),
             stock_status=str(row.get("stock_status") or ""),
+            image_id=_image_id(row.get("image")),
+            status=str(row.get("status") or ""),
         )
 
     def value_of(self, wanted_name: str) -> str:
@@ -172,19 +201,31 @@ class ShopProduct:
     stock_status: str
     variations: list[ShopVariation] = field(default_factory=list)
     attribute_names: dict[str, str] = field(default_factory=dict)
+    #: the product's ``attributes`` exactly as the shop sent them (name, options, variation,
+    #: visible, position, id…). An update has to send the *whole* list back — the shop replaces
+    #: it rather than merging — so what it does not change must travel unchanged.
+    attributes: list[dict[str, Any]] = field(default_factory=list)
+    #: media ids of the gallery, featured image first
+    image_ids: list[int] = field(default_factory=list)
     #: non-empty when a step of the read could not be done; the caller must say it, not
     #: assume «there are no variations».
     notes: list[str] = field(default_factory=list)
+    #: False when the variation list is missing or cut short. A diff against half a list would
+    #: «create» what exists and «delete» what it never saw, so a writer must refuse to plan on it.
+    variations_complete: bool = True
 
     @classmethod
     def from_row(cls, row: dict[str, Any]) -> ShopProduct:
         raw_stock = row.get("stock_quantity")
         names: dict[str, str] = {}
+        attributes: list[dict[str, Any]] = []
         for item in row.get("attributes") or []:
             if isinstance(item, dict):
+                attributes.append({**item, "options": [str(v) for v in (item.get("options") or [])]})
                 name = str(item.get("name") or "").strip()
                 if name:
                     names[name] = " ".join(str(value) for value in (item.get("options") or [])[:12])
+        image_ids = [_image_id(image) for image in (row.get("images") or []) if isinstance(image, dict)]
         return cls(
             product_id=int(row.get("id") or 0),
             title=str(row.get("name") or "").strip(),
@@ -197,6 +238,8 @@ class ShopProduct:
             manage_stock=bool(row.get("manage_stock")),
             stock_status=str(row.get("stock_status") or ""),
             attribute_names=names,
+            attributes=attributes,
+            image_ids=[value for value in image_ids if value],
         )
 
     @property
@@ -250,7 +293,7 @@ async def find(
         if _SKU_LIKE_RE.match(wanted):
             response = await client.get(f"{base}/sku/{quote(wanted)}")
             if response.is_success:
-                row = response.json()
+                row = _body(response)
                 if isinstance(row, dict) and row.get("id"):
                     trace.log(f"[match] SKU دقیق «{wanted}» → محصول {row['id']}")
                     return [Candidate.from_row(row)]
@@ -271,10 +314,17 @@ async def find(
                       "(پیش‌نویس‌ها ممکن است در نتیجه نباشند).")
             response = await client.get(base, params=params)
         check(response)
-        rows = response.json()
+        rows = _body(response)
         if not isinstance(rows, list):
             raise WooCommerceAPIError(response.status_code, "پاسخ ووکامرس فهرست نبود")
         return [Candidate.from_row(row) for row in rows if isinstance(row, dict) and row.get("id")]
+
+
+#: One page of variations. WooCommerce caps ``per_page`` at 100, and a phone-case product is
+#: easily 30 models × 4 colours — reading only the first page would make a diff think 20
+#: variations were missing and create them a second time.
+VARIATIONS_PAGE = 100
+MAX_VARIATION_PAGES = 10
 
 
 async def read(
@@ -285,30 +335,62 @@ async def read(
     transport: Any | None = None,
     dry_run: bool = False,
 ) -> ShopProduct:
-    """The product and its variations, with every failed step recorded in ``notes``."""
+    """The product and its variations, with every failed step recorded in ``notes``.
+
+    A simple product has no variations, so asking for them is a request spent on nothing; only a
+    ``variable`` product is followed up. The variation list is read page by page — and when any
+    page fails, ``variations_complete`` says so instead of handing back a plausible half.
+    """
     trace = audit or Audit()
     async with WooClient(audit=trace, dry_run=dry_run, transport=transport) as client:
         base = products_base()
         response = await client.get(f"{base}/{int(product_id)}")
         check(response)
-        product = ShopProduct.from_row(response.json())
-        if not include_variations:
+        product = ShopProduct.from_row(_body(response))
+        if not include_variations or product.type != "variable":
+            # Variations that were deliberately not read are not «none»: a writer must not plan
+            # on them, so a variable product read without them says it is incomplete.
+            product.variations_complete = product.type != "variable"
             return product
-        var_response = await client.get(f"{base}/{int(product_id)}/variations", params={"per_page": 100})
-        if not var_response.is_success:
-            product.notes.append(
-                f"واریژن‌ها خوانده نشدند (HTTP {var_response.status_code}: "
-                f"{error_message(var_response)[:80]})"
-            )
-            trace.log(f"[match] {product.notes[-1]}")
+        rows, problem = await read_variation_rows(client, base, int(product_id), trace)
+        product.variations = [ShopVariation.from_row(row) for row in rows]
+        if problem:
+            product.notes.append(problem)
+            product.variations_complete = False
+            trace.log(f"[match] {problem}")
             return product
-        rows = var_response.json()
-        if isinstance(rows, list):
-            product.variations = [ShopVariation.from_row(row) for row in rows if isinstance(row, dict)]
-        else:
-            product.notes.append("پاسخ واریژن‌ها فهرست نبود")
         trace.log(f"[match] محصول {product.product_id}: {len(product.variations)} واریژن خوانده شد")
         return product
+
+
+async def read_variation_rows(client: WooClient, base: str, product_id: int,
+                               trace: Audit) -> tuple[list[dict[str, Any]], str]:
+    """Every variation row of a product, or whatever was read plus the reason it is not all."""
+    url = f"{base}/{product_id}/variations"
+    params: dict[str, Any] = {"per_page": VARIATIONS_PAGE, "page": 1, "status": "any"}
+    rows: list[dict[str, Any]] = []
+    for page in range(1, MAX_VARIATION_PAGES + 1):
+        params["page"] = page
+        response = await client.get(url, params=params)
+        if response.status_code == 400 and "status" in params:
+            # Some hosts refuse `status=any` here as they do on the product list. Disabled
+            # variations are still variations, so say it in the trace instead of hiding it.
+            params.pop("status")
+            trace.log("[match] هاست `status=any` را برای واریژن‌ها نپذیرفت؛ بدون آن خوانده می‌شود.")
+            response = await client.get(url, params=params)
+        if not response.is_success:
+            return rows, (f"واریژن‌ها خوانده نشدند (HTTP {response.status_code}: "
+                          f"{error_message(response)[:80]})")
+        try:
+            page_rows = _body(response)
+        except WooCommerceAPIError as exc:
+            return rows, f"واریژن‌ها خوانده نشدند ({exc})"
+        if not isinstance(page_rows, list):
+            return rows, "پاسخ واریژن‌ها فهرست نبود"
+        rows.extend(row for row in page_rows if isinstance(row, dict))
+        if len(page_rows) < VARIATIONS_PAGE:
+            return rows, ""
+    return rows, f"واریژن‌ها بیشتر از {VARIATIONS_PAGE * MAX_VARIATION_PAGES} است و کامل خوانده نشد"
 
 
 __all__ = [
@@ -321,5 +403,6 @@ __all__ = [
     "matches_color",
     "matches_model",
     "read",
+    "read_variation_rows",
     "status_text",
 ]

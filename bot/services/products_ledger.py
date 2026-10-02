@@ -68,9 +68,11 @@ def record(
     variations: int = 0,
     price: int = 0,
     price_groups: dict[str, int] | None = None,
+    model_prices: dict[str, int] | None = None,
     sale_price: int = 0,
     stock: int | None = None,
     stock_status: str = "",
+    stock_matrix: dict[str, dict[str, int | None]] | None = None,
     sku_prefix: str = "",
     images: int = 0,
     categories: Iterable[str] = (),
@@ -79,6 +81,7 @@ def record(
     report: str = "",
     key: str | None = None,
     batch_id: str = "",
+    changes: Iterable[str] = (),
 ) -> dict[str, Any]:
     """Append one result card and return it (also used directly as the message).
 
@@ -97,15 +100,24 @@ def record(
         "variations": max(0, int(variations)),
         "price": int(price or 0),
         "price_groups": {str(k): int(v) for k, v in (price_groups or {}).items()},
+        "model_prices": {
+            str(k): int(v) for k, v in (model_prices or {}).items() if int(v or 0) > 0
+        },
         # Stored so the card can say what the shop was told. ``None`` is a real state here:
         # «the text never mentioned stock» must not be recorded as 0.
         "sale_price": int(sale_price or 0),
         "stock": None if stock in (None, "") else int(stock),
         "stock_status": str(stock_status or ""),
+        "stock_matrix": {
+            str(design): {str(model): quantity for model, quantity in row.items()}
+            for design, row in (stock_matrix or {}).items()
+        },
         "sku_prefix": sku_prefix,
         "images": int(images or 0),
         "categories": [str(x) for x in categories][:6],
         "warnings": [str(x) for x in warnings][:8],
+        #: an update's own list of what moved («💰 قیمت: ۶۹۸٬۰۰۰ ← ۷۲۰٬۰۰۰»)
+        "changes": [str(x) for x in changes][:12],
         "error": (error or "")[:400],
         "report": (report or "")[:REPORT_LIMIT],
         "batch_id": batch_id,
@@ -139,7 +151,7 @@ def _count(entry: dict[str, Any], *, previous: str = "") -> None:
         metrics.incr("products_created")
         if entry.get("variations"):
             metrics.incr("variations_created", int(entry["variations"]))
-    elif status == "restocked":
+    elif status in ("restocked", "updated"):
         metrics.incr("restocks_applied")
     elif status == "queued":
         metrics.incr("publish_queued")
@@ -168,14 +180,17 @@ def update(key: str, **fields: Any) -> dict[str, Any] | None:
     return None
 
 
+def batch_history(batch_id: str) -> list[dict[str, Any]]:
+    """Every retained attempt for this content, newest first (including dry runs)."""
+    if not batch_id:
+        return []
+    return [entry for entry in _load() if str(entry.get("batch_id") or "") == str(batch_id)]
+
+
 def find_batch(batch_id: str) -> dict[str, Any] | None:
     """The newest card built from this content (``None`` if we never tried)."""
-    if not batch_id:
-        return None
-    for entry in _load():
-        if str(entry.get("batch_id") or "") == str(batch_id):
-            return entry
-    return None
+    history = batch_history(batch_id)
+    return history[0] if history else None
 
 
 def recent(limit: int = 10) -> list[dict[str, Any]]:
@@ -204,7 +219,7 @@ def summary(entry: dict[str, Any]) -> str:
     status = str(entry.get("status"))
     mark = {
         "created": "✅", "zip": "📦", "failed": "❌", "dry": "🧪", "pending": "⏳",
-        "queued": "🐇", "restocked": "🔄",
+        "queued": "🐇", "restocked": "🔄", "updated": "🔄",
     }.get(status, "•")
     title = str(entry.get("title") or "(بدون عنوان)")
     bits = [f"{mark} {title[:38]}"]
@@ -213,7 +228,7 @@ def summary(entry: dict[str, Any]) -> str:
     if entry.get("variations"):
         bits.append(f"{entry['variations']} واریژن")
     if entry.get("mode") in ("update", "restock"):
-        bits.append("شارژ")
+        bits.append("اپدیت")
     if entry.get("error"):
         error = str(entry["error"])
         bits.append(error.partition(":")[0] if status == "queued" else error[:40])
@@ -230,7 +245,17 @@ def summary(entry: dict[str, Any]) -> str:
 
 def price_range(entry: dict[str, Any]) -> str:
     """The price(s) a card was built with, as one honest string."""
+    models = {str(k): int(v) for k, v in (entry.get("model_prices") or {}).items() if int(v or 0) > 0}
     groups = {str(k): int(v) for k, v in (entry.get("price_groups") or {}).items() if int(v or 0) > 0}
+    if models:
+        # Model-specific prices are the real range on the storefront; the base price
+        # is only what the remaining models get, so say it that way.
+        base = int(entry.get("price") or 0)
+        parts = [f"{name}: {value:,}" for name, value in models.items()]
+        parts += [f"{name}: {value:,}" for name, value in groups.items()]
+        if base:
+            parts.append(f"پایه: {base:,}")
+        return " | ".join(parts)
     if groups:
         return " | ".join(f"{name}: {value:,}" for name, value in groups.items())
     value = int(entry.get("price") or 0)

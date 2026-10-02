@@ -80,6 +80,15 @@ class TestExtractionCorpus(unittest.TestCase):
         for key, value in wanted.items():
             self.assertEqual(value, got[key], f"«{key}» در این پست فرق کرد: {got!r}")
 
+    def test_explicit_sku_label_is_read_and_brand_headers_are_not_sku_codes(self) -> None:
+        labelled = run("", "SKU: BO147\nقاب مات")
+        self.assertEqual("BO", labelled["sku_prefix"])
+        corrected = run("", "SKU: BO147\nSKU: CH22\nقاب مات")
+        self.assertEqual("CH", corrected["sku_prefix"])
+
+        brand_header = run("", "Apple\niPhone 15\nقاب مات")
+        self.assertEqual("", brand_header["sku_prefix"])
+
     def test_print_category_is_controlled_by_sku_not_marketing_copy(self) -> None:
         """«چاپ IMD» توصیف طرح است؛ فقط شناسه‌های CH/SB مجاز به دستهٔ چاپی‌اند."""
         self.assertIn("controlled ONLY by the product SKU prefix", product_extractor.SYSTEM_PROMPT)
@@ -132,6 +141,140 @@ class TestExtractionCorpus(unittest.TestCase):
             data = asyncio.run(extract_product(info, [], "", caption="", info_text=info))
         self.assertEqual("AS", data.sku_prefix, "the explicit deterministic SKU beats the AI guess")
         self.assertFalse(any("چاپی" in category for category in data.categories))
+
+    def test_ai_cannot_override_an_explicit_product_info_title(self) -> None:
+        content = json.dumps({
+            "title": "عنوان حدس‌زده‌شدهٔ AI",
+            "price": 698000,
+            "attributes": {},
+            "model_colors": {},
+            "categories": [],
+        }, ensure_ascii=False)
+
+        async def fake_post(_client, url, **_kwargs):
+            request = product_extractor.httpx.Request("POST", url)
+            return product_extractor.httpx.Response(
+                200, json={"choices": [{"message": {"content": content}}]}, request=request
+            )
+
+        online_settings = replace(
+            product_extractor.settings,
+            ai_base_url="https://ai.example/v1",
+            ai_token="test-token",
+            ai_model="test-model",
+        )
+        info = "عنوان: قاب اصلاح‌شده\nقیمت 698000"
+        caption = "قاب فانتزی آیفون 15"
+        with (
+            patch.object(product_extractor, "settings", online_settings),
+            patch("httpx.AsyncClient.post", new=fake_post),
+        ):
+            data = asyncio.run(extract_product(
+                f"{info}\n{caption}", ["iPhone 15"], "",
+                caption=caption, info_text=info,
+            ))
+        self.assertEqual("قاب اصلاح‌شده", data.title)
+
+    def test_ai_only_price_and_sku_are_marked_as_guesses(self) -> None:
+        content = json.dumps({
+            "title": "قاب ساده",
+            "price": "698000 تومان",
+            "sku_prefix": "CH",
+            "attributes": {},
+            "model_colors": {},
+            "categories": [],
+        }, ensure_ascii=False)
+
+        async def fake_post(_client, url, **_kwargs):
+            request = product_extractor.httpx.Request("POST", url)
+            return product_extractor.httpx.Response(
+                200, json={"choices": [{"message": {"content": content}}]}, request=request
+            )
+
+        online_settings = replace(
+            product_extractor.settings,
+            ai_base_url="https://ai.example/v1",
+            ai_token="test-token",
+            ai_model="test-model",
+        )
+        info = "عنوان: قاب ساده"
+        with (
+            patch.object(product_extractor, "settings", online_settings),
+            patch("httpx.AsyncClient.post", new=fake_post),
+        ):
+            data = asyncio.run(extract_product(info, [], "", caption="", info_text=info))
+        self.assertEqual(698000, data.price)
+        self.assertEqual("CH", data.sku_prefix)
+        self.assertEqual("ai", data.evidence["price"].source)
+        self.assertEqual("ai", data.evidence["sku_prefix"].source)
+        self.assertIn("price", product_extractor.ev.inferred_fields(data.evidence))
+
+    def test_ai_cannot_override_or_drop_explicit_group_prices(self) -> None:
+        content = json.dumps({
+            "title": "قاب ساده",
+            "price": 710000,
+            "prices": {"iphone": 720000},
+            "attributes": {},
+            "model_colors": {},
+            "categories": [],
+        }, ensure_ascii=False)
+
+        async def fake_post(_client, url, **_kwargs):
+            request = product_extractor.httpx.Request("POST", url)
+            return product_extractor.httpx.Response(
+                200, json={"choices": [{"message": {"content": content}}]}, request=request
+            )
+
+        online_settings = replace(
+            product_extractor.settings,
+            ai_base_url="https://ai.example/v1",
+            ai_token="test-token",
+            ai_model="test-model",
+        )
+        info = "قیمت ایفون 698 اندروید 598"
+        with (
+            patch.object(product_extractor, "settings", online_settings),
+            patch("httpx.AsyncClient.post", new=fake_post),
+        ):
+            data = asyncio.run(extract_product(info, [], "", caption="", info_text=info))
+        self.assertEqual(698000, data.price)
+        self.assertEqual({"iphone": 698000, "android": 598000}, data.prices)
+
+    def test_ai_only_group_price_is_marked_as_unverified(self) -> None:
+        content = json.dumps({
+            "title": "قاب ساده",
+            "price": 720000,
+            "prices": {"iphone": 720000, "android": 598000},
+            "attributes": {},
+            "model_colors": {},
+            "categories": [],
+        }, ensure_ascii=False)
+
+        async def fake_post(_client, url, **_kwargs):
+            request = product_extractor.httpx.Request("POST", url)
+            return product_extractor.httpx.Response(
+                200, json={"choices": [{"message": {"content": content}}]}, request=request
+            )
+
+        online_settings = replace(
+            product_extractor.settings,
+            ai_base_url="https://ai.example/v1",
+            ai_token="test-token",
+            ai_model="test-model",
+        )
+        info = "قیمت ایفون 698"
+        with (
+            patch.object(product_extractor, "settings", online_settings),
+            patch("httpx.AsyncClient.post", new=fake_post),
+        ):
+            data = asyncio.run(extract_product(info, [], "", caption="", info_text=info))
+        self.assertEqual(698000, data.price)
+        self.assertEqual({"iphone": 698000, "android": 598000}, data.prices)
+        self.assertEqual("ai", data.evidence["prices"].source)
+        self.assertTrue(
+            any("قیمت گروهی هوش مصنوعی برای آیفون" in note for note in data.notes),
+            data.notes,
+        )
 
     def test_group_prices_survive_the_noise_lines(self) -> None:
         """P0-2/P0-3/P0-4: وزن، تاریخ و کد ملی قیمت نیستند؛ دو گروه در یک خط، دو قیمت."""

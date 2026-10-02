@@ -54,6 +54,9 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["B011", "RUF012", "ARG002", "ARG005", "E402", "RUF059", "RUF005"]
 "bot/constants.py" = ["RUF012"]
+# شبیه‌سازهای فلو، همان قراردادهای تلگرام/بات را با امضاهای کامل پیاده می‌کنند که
+# بخشی از پارامترهایشان در شبیه‌سازی مصرف نمی‌شود؛ مثل tests، این قاعده‌ها خاموش‌اند.
+"scripts/simulate_*.py" = ["ARG002", "ARG005", "E402"]
 
 [tool.ruff.lint.flake8-bugbear]
 # The codebase catches broad Exception on purpose in handlers/teardown paths:

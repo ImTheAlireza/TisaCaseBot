@@ -187,9 +187,15 @@ class TestValidationGate(unittest.TestCase):
         data.update(overrides)
         return data
 
-    def test_missing_models_block_a_new_product(self):
-        # old: models were not required at all for mode="new"
+    def test_missing_models_are_a_warning_by_default(self):
         report = validate_draft(self._data(models=[]), mode="new", image_count=3)
+        self.assertFalse(report.blocking, "model-less simple products are valid")
+        self.assertIn("W_NO_MODELS", [issue.code for issue in report.warnings])
+
+    def test_missing_models_can_still_be_required_explicitly(self):
+        report = validate_draft(
+            self._data(models=[]), mode="new", image_count=3, require_models=True
+        )
         self.assertTrue(report.blocking)
         self.assertIn("E_NO_MODELS", [issue.code for issue in report.errors])
 
@@ -197,11 +203,32 @@ class TestValidationGate(unittest.TestCase):
         report = validate_draft(self._data(price=250), mode="new", image_count=3)
         self.assertIn("E_PRICE_RANGE", [issue.code for issue in report.errors])
 
-    def test_restock_needs_at_least_one_change(self):
+    def test_an_update_told_nothing_has_nothing_to_apply(self):
         report = validate_draft(
-            self._data(price=0, models=[], attributes={}), mode="update", image_count=0
+            self._data(title="", price=0, models=[], attributes={}), mode="update", image_count=0
         )
         self.assertIn("E_NOTHING_TO_APPLY", [issue.code for issue in report.errors])
+
+    def test_an_update_is_something_when_any_one_thing_is_said(self):
+        # price, stock, a status, a sale, a title, models, colours or photos — each is an update
+        # on its own; what is not said is simply not touched.
+        silent = {"title": "", "price": 0, "models": [], "attributes": {}}
+        for said in ({"stock": 5}, {"stock": 0}, {"stock_status": "outofstock"}, {"sale_price": 1000},
+                     {"title": "قاب تازه"}, {"price": 700_000}, {"models": ["iPhone 15"]},
+                     {"attributes": {"رنگ": ["مشکی", "سفید"]}}):
+            report = validate_draft(self._data(**{**silent, **said}), mode="update", image_count=0)
+            self.assertNotIn("E_NOTHING_TO_APPLY", [issue.code for issue in report.errors], said)
+        report = validate_draft(self._data(**silent), mode="update", image_count=2)
+        self.assertNotIn("E_NOTHING_TO_APPLY", [issue.code for issue in report.errors],
+                         "عکسِ تنها هم یک اپدیت است")
+
+    def test_an_update_does_not_demand_what_a_new_product_demands(self):
+        report = validate_draft(
+            self._data(title="", sku_prefix="", price=0, models=[], attributes={}, stock=5),
+            mode="update", image_count=0)
+        codes = [issue.code for issue in report.errors]
+        for needed_for_new in ("E_NO_TITLE", "E_NO_SKU", "E_NO_IMAGES", "E_NO_PRICE", "E_NO_MODELS"):
+            self.assertNotIn(needed_for_new, codes)
 
     def test_a_clean_draft_passes(self):
         report = validate_draft(self._data(variation_count=4), mode="new", image_count=2)
@@ -322,6 +349,10 @@ class TestSettings(unittest.TestCase):
         self.assertEqual(settings.flow_timeout_seconds, 60)
         self.assertEqual(settings.log_level, "INFO")
         self.assertTrue(settings.problems, "the bad values must be reported")
+
+    def test_models_are_not_required_by_default(self):
+        settings = Settings.from_env()
+        self.assertFalse(settings.require_models)
 
     def test_price_range_and_model_requirement_are_configurable(self):
         os.environ["REQUIRE_MODELS"] = "no"

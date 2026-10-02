@@ -24,6 +24,29 @@ class TestLogChatDelivery(unittest.IsolatedAsyncioTestCase):
             text="compression trace",
         )
 
+    async def test_publish_trace_is_truthful_and_sent_only_to_the_log_group(self) -> None:
+        bot = SimpleNamespace(send_message=AsyncMock())
+        with patch.object(product_journal, "settings", SimpleNamespace(log_chat_id=-1001234567890)):
+            sent = await product_journal.send_publish_trace(
+                bot,
+                ["[http:start] #1 POST /wp-json/wc/v3/products"],
+                dry_run=False,
+            )
+
+        self.assertTrue(sent)
+        bot.send_message.assert_awaited_once()
+        kwargs = bot.send_message.await_args.kwargs
+        self.assertEqual(-1001234567890, kwargs["chat_id"])
+        self.assertIn("درخواست‌ها به سایت ارسال شدند", kwargs["text"])
+        self.assertNotIn("هیچ‌کدام به سایت نرفتند", kwargs["text"])
+        self.assertIn("[http:start]", kwargs["text"])
+
+    async def test_dry_run_trace_says_no_shop_request_was_sent(self) -> None:
+        text = product_journal.publish_trace_report(
+            ["[dry-run] POST /wp-json/wc/v3/products"], dry_run=True
+        )
+        self.assertIn("هیچ‌کدام به سایت نرفتند", text)
+
     async def test_failed_group_send_returns_false_instead_of_raising(self) -> None:
         bot = SimpleNamespace(send_message=AsyncMock(side_effect=RuntimeError("bot is not a member")))
         with patch.object(product_journal, "settings", SimpleNamespace(log_chat_id=-1001234567890)):

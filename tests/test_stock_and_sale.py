@@ -62,6 +62,10 @@ class TestScanStock(unittest.TestCase):
     def test_stock_with_a_label_and_a_colon_and_latin_digits(self) -> None:
         self.assertEqual(7, _scan("موجودی: 7")["stock"])
 
+    def test_labelled_stock_accepts_a_count_suffix(self) -> None:
+        self.assertEqual(20, _scan("موجودی ۲۰ عدد")["stock"])
+        self.assertEqual(20, _scan("موجودی ۲۰ تا")["stock"])
+
     def test_count_suffix_is_stock_even_without_a_label(self) -> None:
         self.assertEqual(15, _scan("۱۵ عدد")["stock"])
 
@@ -85,12 +89,24 @@ class TestScanStock(unittest.TestCase):
 
     def test_stock_with_the_number_on_the_next_line(self) -> None:
         self.assertEqual(12, _scan("موجودی:", "۱۲")["stock"])
+        self.assertEqual(12, _scan("موجودی:", "۱۲ عدد")["stock"])
+
+    def test_latest_stock_count_corrects_an_earlier_message(self) -> None:
+        self.assertEqual(5, _scan("موجودی ۲۰", "موجودی ۵")["stock"])
+
+    def test_latest_availability_status_corrects_an_earlier_message(self) -> None:
+        self.assertEqual("instock", _scan("ناموجود", "موجود")["stock_status"])
+        self.assertEqual("instock", _scan("ناموجود نیست")["stock_status"])
+        self.assertEqual("outofstock", _scan("موجود نیست")["stock_status"])
 
     def test_sale_price_from_its_own_label(self) -> None:
         self.assertEqual(498000, _scan("قیمت ویژه 498000")["sale_price"])
 
     def test_sale_price_in_toman_shorthand(self) -> None:
         self.assertEqual(498000, _scan("قیمت فروش ویژه: 498t")["sale_price"])
+
+    def test_latest_sale_price_corrects_an_earlier_message(self) -> None:
+        self.assertEqual(390000, _scan("قیمت ویژه 420000", "قیمت ویژه 390000")["sale_price"])
 
     def test_a_price_line_never_becomes_a_sale_price(self) -> None:
         self.assertEqual(0, _scan("قیمت 698000")["sale_price"])
@@ -176,6 +192,45 @@ class TestValidation(unittest.TestCase):
     def test_out_of_stock_with_a_number_is_a_contradiction(self) -> None:
         report = self._report(stock=30, stock_status="outofstock")
         self.assertIn("W_STOCK_CONTRADICTION", [issue.code for issue in report.warnings])
+
+    def test_complete_stock_matrix_is_valid(self) -> None:
+        report = self._report(
+            models=["iPhone 13", "iPhone 14"],
+            attributes={"طرح": ["A", "B"]},
+            stock=None,
+            stock_status="",
+            stock_matrix={
+                "A": {"iPhone 13": 7, "iPhone 14": 0},
+                "B": {"iPhone 13": None, "iPhone 14": 3},
+            },
+        )
+        codes = [issue.code for issue in report.errors]
+        self.assertNotIn("E_STOCK_MATRIX_INCOMPLETE", codes)
+        self.assertNotIn("E_STOCK_MATRIX_AXES", codes)
+        self.assertNotIn("E_STOCK_MATRIX_CONFLICT", codes)
+
+    def test_incomplete_stock_matrix_blocks_creation(self) -> None:
+        report = self._report(
+            models=["iPhone 13", "iPhone 14"],
+            attributes={"طرح": ["A", "B"]},
+            stock_matrix={
+                "A": {"iPhone 13": 7, "iPhone 14": 0},
+                "B": {"iPhone 14": 3},
+            },
+        )
+        self.assertIn("E_STOCK_MATRIX_INCOMPLETE", [issue.code for issue in report.errors])
+
+    def test_global_stock_cannot_be_mixed_with_stock_matrix(self) -> None:
+        report = self._report(
+            models=["iPhone 13", "iPhone 14"],
+            attributes={"طرح": ["A", "B"]},
+            stock=20,
+            stock_matrix={
+                "A": {"iPhone 13": 7, "iPhone 14": 0},
+                "B": {"iPhone 13": None, "iPhone 14": 3},
+            },
+        )
+        self.assertIn("E_STOCK_MATRIX_CONFLICT", [issue.code for issue in report.errors])
 
 
 @needs_flow
@@ -336,6 +391,52 @@ class TestWhatGoesToTheShop(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("موجودی 20" in line for line in report),
                         "کارت باید بگوید عدد روی چند واریژن نوشته می‌شود")
 
+    async def test_matrix_sets_a_different_quantity_for_each_design_and_model(self) -> None:
+        data = _draft(
+            models=["iPhone 13", "iPhone 14"],
+            attributes={"طرح": ["A", "B"]},
+            stock=None,
+            stock_status="",
+            stock_matrix={
+                "A": {"iPhone 13": 7, "iPhone 14": 0},
+                "B": {"iPhone 13": None, "iPhone 14": 3},
+            },
+        )
+        store, _report = await self._publish(data)
+        parent = store.product_create_body()
+        self.assertNotIn("stock_quantity", parent)
+        variations = store.variation_items()
+        self.assertEqual(3, len(variations), "«-» باید ترکیب را نسازد")
+        actual = {
+            (tuple((item["name"], item["option"]) for item in variation["attributes"])):
+            (variation["stock_quantity"], variation["stock_status"])
+            for variation in variations
+        }
+        self.assertEqual(
+            {
+                (("مدل", "iPhone 13"), ("طرح", "A")): (7, "instock"),
+                (("مدل", "iPhone 14"), ("طرح", "A")): (0, "outofstock"),
+                (("مدل", "iPhone 14"), ("طرح", "B")): (3, "instock"),
+            },
+            actual,
+        )
+
+    async def test_incomplete_matrix_is_rejected_before_any_woo_request(self) -> None:
+        from bot.services.woocommerce_direct import create_draft
+
+        data = _draft(
+            models=["iPhone 13", "iPhone 14"],
+            attributes={"طرح": ["A", "B"]},
+            stock=None,
+            stock_matrix={"A": {"iPhone 13": 7, "iPhone 14": 0}, "B": {"iPhone 14": 3}},
+        )
+        store = FakeStore()
+        with self.assertRaisesRegex(ValueError, "ماتریس موجودی ناقص"):
+            await create_draft(
+                data.to_dict(), [], report=[], transport=store.transport,
+            )
+        self.assertEqual([], store.requests, "ماتریس ناقص نباید حتی محصول والد بسازد")
+
     async def test_variations_keep_the_order_the_seller_listed(self) -> None:
         store, _report = await self._publish(_draft())
         self.assertEqual([0, 1, 2, 3], [v["menu_order"] for v in store.variation_items()])
@@ -377,6 +478,11 @@ class TestWhatGoesToTheShop(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("", manifest["stock_status"])
         self.assertEqual("simple", manifest["product_type"])
         self.assertIn('"stock": 20', json.dumps(manifest, ensure_ascii=False))
+        matrix_data = _draft(stock=None, stock_matrix={"A": {"iPhone 13": 7}})
+        matrix_manifest = _zip_manifest(
+            matrix_data, usable_attributes={"طرح": ["A", "B"]}, image_mode="keep", batch="def456"
+        )
+        self.assertEqual({"A": {"iPhone 13": 7}}, matrix_manifest["stock_matrix"])
 
 
 @needs_flow
@@ -433,9 +539,10 @@ class TestCategoryLookupReuse(unittest.TestCase):
         import asyncio
         import httpx
 
-        from bot.services.woocommerce_direct import _resolve_categories
+        from bot.services.woocommerce_direct import _resolve_categories, clear_category_cache
         from bot.services.woo_client import Audit
 
+        clear_category_cache()
         parent = "قاب و کاور گوشی و تبلت"
         catalog = {
             parent: [{"id": 1, "name": parent, "parent": 0}],
@@ -444,7 +551,8 @@ class TestCategoryLookupReuse(unittest.TestCase):
         }
 
         class Client:
-            def __init__(self) -> None:
+            def __init__(self, *, dry_run: bool = False) -> None:
+                self.dry_run = dry_run
                 self.searched: list[str] = []
 
             async def get(self, _url, *, params):
@@ -461,6 +569,26 @@ class TestCategoryLookupReuse(unittest.TestCase):
         ))
         self.assertEqual([parent, "آیفون iphone", "سامسونگ samsung"], client.searched)
         self.assertEqual([{"id": 1}, {"id": 2}, {"id": 3}], result)
+
+        again = asyncio.run(_resolve_categories(
+            client,
+            "https://shop.example/wp-json/wc/v3/products",
+            [f"{parent} > آیفون iphone", f"{parent} > سامسونگ samsung"],
+            Audit(),
+        ))
+        self.assertEqual(result, again)
+        self.assertEqual(3, len(client.searched), "انتشار بعدی دسته‌های یکسان را دوباره نمی‌خواند")
+
+        clear_category_cache()
+        dry_client = Client(dry_run=True)
+        for _ in range(2):
+            asyncio.run(_resolve_categories(
+                dry_client,
+                "https://shop.example/wp-json/wc/v3/products",
+                [f"{parent} > آیفون iphone"],
+                Audit(),
+            ))
+        self.assertEqual(4, len(dry_client.searched), "شناسه‌های ساختگی dry-run نباید cache شوند")
 
 
 @needs_flow
@@ -493,6 +621,23 @@ class TestProductPreview(unittest.TestCase):
     def test_out_of_stock_status_is_kept(self) -> None:
         text = self._preview(_draft(stock=None, stock_status="outofstock", sale_price=0))
         self.assertIn("<b>موجودی:</b> ناموجود", text)
+
+    def test_preview_shows_the_exact_matrix_values(self) -> None:
+        data = _draft(
+            models=["iPhone 13", "iPhone 14"],
+            attributes={"طرح": ["A", "B"]},
+            stock=None,
+            stock_status="",
+            stock_matrix={
+                "A": {"iPhone 13": 7, "iPhone 14": 0},
+                "B": {"iPhone 13": None, "iPhone 14": 3},
+            },
+        )
+        text = self._preview(data)
+        self.assertIn("موجودی طرح × دسته", text)
+        self.assertIn("A: 7 | 0", text)
+        self.assertIn("B: — | 3", text)
+        self.assertIn("10 عدد", text)
 
     def test_simple_product_says_simple(self) -> None:
         text = self._preview(_draft(models=[], attributes={}))
@@ -557,6 +702,17 @@ class TestTheAiPathDoesNotOverrideATypedNumber(unittest.TestCase):
         self.assertEqual(3, merged["stock"])
         self.assertEqual("outofstock", merged["stock_status"])
         self.assertTrue(merged["ai_used"], "باید گفته شود این عدد را آدمک خوانده، نه متن")
+        self.assertEqual("ai", fallback.evidence["stock"].source)
+        self.assertTrue(any("هوش مصنوعی" in note for note in fallback.notes))
+
+    def test_explicit_out_of_stock_status_blocks_an_ai_stock_guess(self) -> None:
+        from bot.services.product_extractor import _merge_stock_and_sale
+
+        fallback = ProductData(title="t", stock_status="outofstock")
+        merged = _merge_stock_and_sale(fallback, {"stock": 3, "sale_price": 0})
+        self.assertIsNone(merged["stock"])
+        self.assertEqual("outofstock", merged["stock_status"])
+        self.assertFalse(merged["ai_used"])
 
 
 @needs_flow
@@ -602,6 +758,24 @@ class TestSaleAndStatusLinesAreNotData(unittest.TestCase):
             with self.subTest(line=line):
                 data = _fallback(f"قاب مات آیفون 14\n{line}\nقیمت 320000", ["iPhone 14"])
                 self.assertEqual("قاب مات آیفون 14", data.title)
+
+    def test_latest_labeled_title_is_a_correction_not_a_second_product(self) -> None:
+        data = _fallback("عنوان: قاب قدیمی\nعنوان: قاب اصلاح‌شده", [])
+        self.assertEqual("قاب اصلاح‌شده", data.title)
+
+    def test_product_info_stock_and_sale_override_caption(self) -> None:
+        from bot.services.postmodel import parse_sources
+        from bot.services import postmodel as evidence
+
+        blocks = parse_sources([
+            ("info", "قاب مات\nموجودی ۱۲\nقیمت ویژه 420000"),
+            ("caption", "موجودی ۹۹\nقیمت ویژه 390000"),
+        ])
+        data = _fallback("", [], blocks=blocks)
+        self.assertEqual(12, data.stock)
+        self.assertEqual(420000, data.sale_price)
+        self.assertEqual(evidence.INFO, data.evidence["stock"].source)
+        self.assertEqual(evidence.INFO, data.evidence["sale_price"].source)
 
 
 if __name__ == "__main__":

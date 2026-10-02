@@ -18,7 +18,7 @@ from telegram.ext import Application, ContextTypes
 from bot import __version__ as _BOT_VERSION
 from bot.config import settings
 from bot.keyboards import result_card, result_keyboard
-from bot.services import outbox, products_ledger, publish_batch
+from bot.services import outbox, product_journal, products_ledger, publish_batch
 from bot.services.woo_client import WooCommerceAPIError, describe_exception
 from bot.services.woocommerce_direct import create_draft
 
@@ -99,6 +99,7 @@ async def _attempt(app: Application, entry: outbox.QueuedPublish) -> None:
     try:
         product_id, edit_url = await create_draft(
             entry.payload, list(entry.images), report=report, batch_id=entry.batch_id,
+            resume_existing=True,
             meta=publish_batch.source_meta(
                 entry.batch_id, chat_id=entry.chat_id or entry.user_id, thread_id=entry.thread_id,
                 images=len(entry.images),
@@ -107,6 +108,9 @@ async def _attempt(app: Application, entry: outbox.QueuedPublish) -> None:
             ),
         )
     except Exception as exc:
+        trace = report or list(getattr(exc, "diagnostics", []) or [])
+        if trace:
+            await product_journal.send_publish_trace(app.bot, trace)
         reason = f"HTTP {exc.status_code}: {exc}" if isinstance(exc, WooCommerceAPIError) \
             else describe_exception(exc)
         if outbox.is_transient(exc):
@@ -133,6 +137,8 @@ async def _attempt(app: Application, entry: outbox.QueuedPublish) -> None:
         )
         return
 
+    if report:
+        await product_journal.send_publish_trace(app.bot, report)
     outbox.succeed(entry.batch_id)
     entry_payload = entry.payload
     card = _finish_card(
@@ -143,6 +149,7 @@ async def _attempt(app: Application, entry: outbox.QueuedPublish) -> None:
         title=str(entry_payload.get("title") or ""),
         price=int(entry_payload.get("price") or 0),
         price_groups=dict(entry_payload.get("prices") or {}),
+        model_prices=dict(entry_payload.get("model_prices") or {}),
         sale_price=int(entry_payload.get("sale_price") or 0),
         stock=entry_payload.get("stock"),
         stock_status=str(entry_payload.get("stock_status") or ""),

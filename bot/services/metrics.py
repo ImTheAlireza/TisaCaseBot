@@ -65,7 +65,7 @@ COUNTERS: dict[str, Counter] = {
         Counter("products_created", "محصول ساخته‌شده", hint="شمارش فقط وقتی است که فروشگاه product id داده."),
         Counter("variations_created", "واریژن ساخته‌شده"),
         Counter("images_uploaded", "تصویر آپلودشده"),
-        Counter("restocks_applied", "شارژ اعمال‌شده"),
+        Counter("restocks_applied", "اپدیت اعمال‌شده"),
         Counter("publish_queued", "به صفِ تلاشِ دوباره رفته", hint="یعنی یک خطای موقتِ شبکه/سایت؛ در 📤 صف ببین."),
         Counter(
             "publish_failed",

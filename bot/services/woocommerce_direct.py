@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from urllib.parse import quote
 from pathlib import Path
 from typing import Any
@@ -12,16 +13,16 @@ from collections.abc import Sequence
 import httpx
 
 from bot.config import settings
-from bot.services import metrics, publish_batch
+from bot.services import metrics, pricing, publish_batch
 from bot.services.color_matrix import build_combinations, color_key
-from bot.services.plan import plan_from_dict
+from bot.services.plan import VariationPlan, plan_from_dict
 from bot.services.sku import (
     MAX_GHOST_SPAN,
     MAX_SKU_RETRIES,
-    exists as sku_exists,
     is_collision as is_sku_collision,
     next_free as next_sku,
     number as sku_number,
+    remember as remember_sku,
 )
 from bot.services.woo_client import (
     Audit,
@@ -38,13 +39,29 @@ from bot.services.woo_client import (
 
 logger = logging.getLogger(__name__)
 
+# A publish uses one in-flight shop request at a time and leaves a small gap between
+# very fast responses. Normal shared-host latency is already much longer than this;
+# the limit mainly prevents concurrent image/variation fallbacks from bursting.
+PUBLISH_MIN_REQUEST_INTERVAL_SECONDS = 0.35
+_CATEGORY_CACHE_TTL_SECONDS = 600
+_CATEGORY_ID_CACHE: dict[tuple[str, int, str], tuple[float, int]] = {}
+
+
+def clear_category_cache() -> None:
+    """Clear the short-lived category-ID cache (also useful for isolated tests)."""
+    _CATEGORY_ID_CACHE.clear()
+
+
 # WooCommerceAPIError is raised here and caught by bot.modules.product_flow, which imports it
 # from this module; it lives in :mod:`bot.services.woo_client` because every HTTP layer failure
 # — not just this one — is reported with it.
 __all__ = [
+    "PUBLISH_MIN_REQUEST_INTERVAL_SECONDS",
     "WooCommerceAPIError",
     "create_draft",
+    "images_by_color",
     "product_description",
+    "upload_images",
 ]
 
 def product_description(data: dict[str, Any]) -> str:
@@ -68,12 +85,18 @@ def product_description(data: dict[str, Any]) -> str:
     return ""
 
 
-def _price_for_model(model: str, common: int, prices: dict[str, int]) -> int:
-    if prices.get("iphone") and re.search(r"\biphone\b", model, re.I):
-        return prices["iphone"]
-    if prices.get("android"):
-        return prices["android"]
-    return common
+def _price_for_model(
+    model: str,
+    common: int,
+    prices: dict[str, int],
+    model_prices: dict[str, int] | None = None,
+) -> int:
+    """Backwards-compatible wrapper around the shared resolver.
+
+    ``bot.services.pricing`` is also what the preview and validation read, so the
+    number on the card is the number in the payload.
+    """
+    return pricing.price_for_model(model, common, prices, model_prices)
 
 
 def _clean_options(values: Sequence[Any]) -> list[str]:
@@ -159,16 +182,15 @@ async def _upload_media(client: WooClient, path: Path, audit: Sink) -> int:
 
 
 async def _upload_media_many(client: WooClient, paths: list[Path], audit: Sink) -> list[tuple[int, Path]]:
-    """Upload every image concurrently, keeping ``(media id, source file)`` pairs.
+    """Upload images one at a time, keeping each ``(media id, source file)`` pair.
 
     The pair, not just the id, because a seller who names the file after the colour
     («01_مشکی.jpg») has already done the mapping work: the variation of that colour gets
-    that picture, which is the only way a per-variation image can be honest — inventing an
-    order (first image → first colour) would attach the wrong photo to a product.
+    that picture. Serial uploads also avoid a burst of WordPress media writes on shared hosts.
     """
     if not paths:
         return []
-    semaphore = asyncio.Semaphore(4)
+    semaphore = asyncio.Semaphore(1)
 
     async def upload(path: Path) -> tuple[int, Path]:
         async with semaphore:
@@ -190,6 +212,18 @@ def _images_by_color(uploads: list[tuple[int, Path]], colors: Sequence[str]) -> 
                 out[str(color)] = media_id
                 break
     return out
+
+
+# The two media helpers below are what an *update* needs as well (see bot.services.update_apply):
+# one upload policy, one colour-by-file-name rule. Public names, same functions.
+async def upload_images(client: WooClient, paths: list[Path], audit: Sink) -> list[tuple[int, Path]]:
+    """Upload ``paths`` one at a time; ``(media id, source file)`` per image, in order."""
+    return await _upload_media_many(client, paths, audit)
+
+
+def images_by_color(uploads: list[tuple[int, Path]], colors: Sequence[str]) -> dict[str, int]:
+    """``colour -> media id`` for uploads whose file name says that colour."""
+    return _images_by_color(uploads, colors)
 
 
 async def _create_without_sku_then_set(
@@ -275,6 +309,8 @@ async def _create_with_sku_retry(
             last_sku = candidate
         response = await client.post(base, json=payload)
         if response.is_success:
+            if prefix:
+                remember_sku(prefix, candidate_num)
             audit.log(f"[attempt {attempt}] POST موفق با SKU «{candidate}» → HTTP {response.status_code}")
             return response
         message = error_message(response)
@@ -295,21 +331,16 @@ async def _create_with_sku_retry(
                 if fallback_response is not None:
                     return fallback_response
             if attempt <= linear_attempts:
-                # Probe the API (including Trash) to distinguish a real product
-                # from a ghost row for the diagnostic log.
-                visible = await sku_exists(client, base, candidate or last_sku, include_trash=True)
-                if visible:
-                    audit.log(f"[sku] {candidate} محصول واقعی/در زباله‌دان است؛ رد شد.")
-                else:
-                    audit.log(
-                        f"[sku] {candidate} در API و زباله‌دان دیده نمی‌شود اما ووکامرس آن را اشغال می‌داند "
-                        f"→ رکورد شبح در wc_product_meta_lookup."
-                    )
+                # The POST response is authoritative. A follow-up product/Trash read only
+                # labelled the collision; it did not make the next candidate safer.
                 candidate_num += 1
+                audit.log(f"[sku] برخورد SKU در زمان ساخت؛ ادامه از «{prefix}{candidate_num}» بدون درخواست تشخیصی.")
             else:
                 jump *= 2
                 candidate_num += jump
                 audit.log(f"[sku] عبور از بلوک رکوردهای شبح: پرش +{jump} → کاندید بعدی {prefix}{candidate_num}")
+            if prefix:
+                remember_sku(prefix, candidate_num - 1)
             continue
         check(response)
 
@@ -363,8 +394,8 @@ async def _create_with_sku_retry(
 async def _create_variations_individually(
     client: WooClient, base: str, product_id: int, payloads: list[dict[str, Any]], audit: Sink
 ) -> None:
-    """Fallback: create variations with concurrent individual POSTs."""
-    semaphore = asyncio.Semaphore(5)
+    """Fallback: create variations one at a time if the batch route is unavailable."""
+    semaphore = asyncio.Semaphore(1)
 
     async def one(payload: dict[str, Any]) -> None:
         async with semaphore:
@@ -500,6 +531,8 @@ async def _create_variations(
     stock: int | None = None,
     stock_status: str = "",
     images_by_color: dict[str, int] | None = None,
+    variation_plan: VariationPlan | None = None,
+    model_prices: dict[str, int] | None = None,
 ) -> None:
     """Create every variation in bulk via the batch endpoint, with a fallback.
 
@@ -539,7 +572,7 @@ async def _create_variations(
     for index, combo in enumerate(combos):
         model = combo.get("مدل", "")
         variation: dict[str, Any] = {
-            "regular_price": str(_price_for_model(model, common_price, prices)),
+            "regular_price": str(_price_for_model(model, common_price, prices, model_prices)),
             "status": "publish",
             # visible + menu_order are what the seller actually judges: a variation that is
             # created but hidden, or listed in hash order instead of the order the message
@@ -550,11 +583,22 @@ async def _create_variations(
         }
         if sale_price:
             variation["sale_price"] = str(sale_price)
-        if stock is not None:
+        if variation_plan is not None and variation_plan.stock_matrix:
+            matrix_quantity = variation_plan.matrix_stock_for(combo)
+            if matrix_quantity is None:
+                raise ValueError(
+                    "برای این ترکیب مقدار ماتریس موجودی پیدا نشد: "
+                    + " × ".join(combo.values())
+                )
             variation["manage_stock"] = True
-            variation["stock_quantity"] = stock
-        if stock is not None or stock_status:
-            variation["stock_status"] = stock_status or "instock"
+            variation["stock_quantity"] = matrix_quantity
+            variation["stock_status"] = "instock" if matrix_quantity > 0 else "outofstock"
+        else:
+            if stock is not None:
+                variation["manage_stock"] = True
+                variation["stock_quantity"] = stock
+            if stock is not None or stock_status:
+                variation["stock_status"] = stock_status or "instock"
         image_id = images_by_color.get(str(combo.get("رنگ") or ""))
         if image_id:
             variation["image"] = {"id": image_id}
@@ -574,13 +618,19 @@ async def _create_variations(
             endpoint,
             json={"create": chunk}
         )
-        if response.status_code in (404, 405, 501) or not response.is_success:
+        if response.status_code in (404, 405, 501):
             audit.log(
-                f"[variation] بچ در دسترس نیست یا ناموفق بود (HTTP {response.status_code})؛ "
-                f"بازگشت به ساخت تکی موازی."
+                f"[variation] endpoint بچ پشتیبانی نمی‌شود (HTTP {response.status_code})؛ "
+                "فقط در این حالت ساخت تکی و سریالی انجام می‌شود."
             )
             await _create_variations_individually(client, base, product_id, payloads[start:], audit)
             return
+        if not response.is_success:
+            audit.log(
+                f"[variation] بچ ناموفق بود (HTTP {response.status_code})؛ "
+                "برای جلوگیری از درخواست/ساخت تکراری، ساخت تکی شروع نمی‌شود."
+            )
+            check(response)
         body = response.json()
         items = body.get("create", []) if isinstance(body, dict) else []
         for item in items:
@@ -616,9 +666,10 @@ async def _resolve_categories(client: WooClient, base: str, categories: list[str
     endpoint = f"{base}/categories"
     category_ids: list[dict[str, int]] = []
     seen_ids: set[int] = set()
-    # Multiple selected branches usually share their root (e.g. phone-brand
-    # children). Cache by parent + case-folded name within this publish so each
-    # common ancestor costs one WooCommerce round trip, without stale cross-run IDs.
+    # Repeated product categories are stable for long stretches. Keep positive ID matches
+    # for ten minutes so adjacent product entries do not repeat the same taxonomy reads.
+    # Dry-run IDs are synthetic and must never enter the real-shop cache.
+    cacheable = not bool(getattr(client, "dry_run", False))
     resolved: dict[tuple[int, str], int | None] = {}
     for raw_path in categories:
         parts = [part.strip() for part in str(raw_path).replace("&gt;", ">").split(">") if part.strip()]
@@ -635,23 +686,47 @@ async def _resolve_categories(client: WooClient, base: str, categories: list[str
                 parent_id = category_id
                 continue
 
-            response = await client.get(endpoint, params={"search": part, "per_page": 100})
-            if not response.is_success:
-                audit.log(f"[cat] جستجوی دستهٔ «{part}» ناموفق: HTTP {response.status_code}")
-                continue
-            matches = [item for item in response.json() if str(item.get("name", "")).casefold() == part.casefold()]
-            exact = next((item for item in matches if parent_id and int(item.get("parent", 0)) == parent_id), None)
-            exact = exact or (matches[0] if matches else None)
-            if exact:
-                category_id = int(exact["id"])
-                resolved[cache_key] = category_id
-                if category_id not in seen_ids:
-                    category_ids.append({"id": category_id})
-                    seen_ids.add(category_id)
-                parent_id = category_id
-            else:
-                resolved[cache_key] = None
-                audit.log(f"[cat] دستهٔ «{part}» در فروشگاه پیدا نشد؛ نادیده گرفته شد.")
+            global_key = (base, parent_id, part.casefold())
+            category_id = None
+            cached = _CATEGORY_ID_CACHE.get(global_key) if cacheable else None
+            if cached is not None:
+                cached_at, cached_id = cached
+                if time.monotonic() - cached_at <= _CATEGORY_CACHE_TTL_SECONDS:
+                    category_id = cached_id
+                    audit.log(f"[cat] کش محلی: «{part}» → {category_id}")
+                else:
+                    _CATEGORY_ID_CACHE.pop(global_key, None)
+
+            if category_id is None:
+                response = await client.get(endpoint, params={"search": part, "per_page": 100})
+                if not response.is_success:
+                    resolved[cache_key] = None
+                    audit.log(f"[cat] جستجوی دستهٔ «{part}» ناموفق: HTTP {response.status_code}")
+                    continue
+                items = response.json()
+                matches = [
+                    item for item in items if isinstance(item, dict)
+                    and str(item.get("name", "")).casefold() == part.casefold()
+                ] if isinstance(items, list) else []
+                exact = next(
+                    (item for item in matches if parent_id and int(item.get("parent", 0)) == parent_id),
+                    None,
+                )
+                exact = exact or (matches[0] if matches else None)
+                if exact:
+                    category_id = int(exact["id"])
+                    if cacheable:
+                        _CATEGORY_ID_CACHE[global_key] = (time.monotonic(), category_id)
+                else:
+                    resolved[cache_key] = None
+                    audit.log(f"[cat] دستهٔ «{part}» در فروشگاه پیدا نشد؛ نادیده گرفته شد.")
+                    continue
+
+            resolved[cache_key] = category_id
+            if category_id not in seen_ids:
+                category_ids.append({"id": category_id})
+                seen_ids.add(category_id)
+            parent_id = category_id
     audit.log(f"[cat] دسته‌های نهایی: {[c['id'] for c in category_ids] if category_ids else '(هیچ)'}")
     return category_ids
 
@@ -663,6 +738,7 @@ async def create_draft(
     dry_run: bool = False,
     report: list[str] | None = None,
     batch_id: str = "",
+    resume_existing: bool = True,
     meta: Sequence[dict[str, str]] = (),
     transport: httpx.BaseTransport | None = None,
 ) -> tuple[int, str]:
@@ -674,10 +750,11 @@ async def create_draft(
     link to a product that does not exist would be worse than no link.
     ``report`` receives the audit lines so the caller can show them.
 
-    ``batch_id`` (see :mod:`bot.services.publish_batch`) makes the call idempotent: before
-    creating anything we look for a product carrying the same id — which is what a crash
-    between «product POSTed» and «response received» leaves behind — and top it up instead
-    of publishing a second copy. ``meta`` is written verbatim into the product.
+    ``batch_id`` (see :mod:`bot.services.publish_batch`) makes retries idempotent. When
+    ``resume_existing`` is true, the writer searches for a matching partial product before
+    creating anything; the interactive flow disables that extra read on a brand-new attempt
+    (its local ledger proves there was no earlier request) and enables it for retries. ``meta``
+    is written verbatim into the product.
     """
     if not all((settings.woocommerce_url, settings.woocommerce_key, settings.woocommerce_secret)):
         raise RuntimeError("اطلاعات WooCommerce API در .env کامل نیست.")
@@ -686,7 +763,20 @@ async def create_draft(
 
     base = products_base()
     prices = {str(k): int(v) for k, v in (data.get("prices") or {}).items() if v}
+    model_prices = {
+        str(k): int(v) for k, v in (data.get("model_prices") or {}).items() if int(v or 0) > 0
+    }
+    pricing_errors = [str(item) for item in (data.get("pricing_errors") or []) if str(item).strip()]
+    if pricing_errors:
+        # An unmapped series/model price table would otherwise put one amount on
+        # every variation. Refuse before the first request, like the stock matrix.
+        raise ValueError("قیمت‌ها قابل‌اعمال نیستند: " + "؛ ".join(pricing_errors[:3]))
     common_price = int(data.get("price") or (next(iter(prices.values())) if prices else 0))
+    raw_stock_matrix = data.get("stock_matrix") or {}
+    if not isinstance(raw_stock_matrix, dict) or any(
+        not isinstance(row, dict) for row in raw_stock_matrix.values()
+    ):
+        raise ValueError("ساختار ماتریس موجودی معتبر نیست.")
     plan = plan_from_dict(data)
     attrs = plan.woo_attributes()
     restrictions = plan.restrictions
@@ -702,6 +792,21 @@ async def create_draft(
     stock = None if raw_stock in (None, "") else int(raw_stock)
     stock_status = str(data.get("stock_status") or "").strip()
     sale_price = int(data.get("sale_price") or 0)
+    stock_matrix_errors = [
+        str(item) for item in (data.get("stock_matrix_errors") or []) if str(item).strip()
+    ]
+    if stock_matrix_errors:
+        raise ValueError("ماتریس موجودی نامعتبر است: " + "؛ ".join(stock_matrix_errors[:3]))
+    if plan.stock_matrix:
+        if plan.matrix_axis_errors or plan.matrix_missing:
+            detail = "; ".join(plan.matrix_axis_errors[:2])
+            if plan.matrix_missing:
+                detail += ("؛ " if detail else "") + f"{len(plan.matrix_missing)} خانه خالی است"
+            raise ValueError("ماتریس موجودی ناقص/ناسازگار است: " + detail)
+        if stock is not None or stock_status:
+            raise ValueError("ماتریس موجودی با موجودی یا وضعیت کلی هم‌زمان مجاز نیست.")
+        if not plan.combos:
+            raise ValueError("ماتریس موجودی هیچ ترکیب قابل‌ساختی ندارد.")
 
     audit = Audit()
     if audit_note:
@@ -710,6 +815,11 @@ async def create_draft(
     audit.log(f"[config] WooCommerce: {settings.woocommerce_url or '(تنظیم نشده)'} (نسخه API: {settings.woocommerce_version})")
     audit.log(f"[config] WordPress media: {settings.wordpress_url or '(تنظیم نشده)'}")
     audit.log(f"[config] عنوان: {data.get('title', '(خالی)')} | پیشوند SKU: {prefix or '(خالی)'} | قیمت پایه: {common_price} | قیمت‌های گروهی: {prices or '(هیچ)'}")
+    if model_prices:
+        audit.log(
+            f"[price:model] {len(model_prices)} قیمت مدل‌محور روی واریژن همان مدل می‌نشیند: "
+            f"{model_prices}"
+        )
     audit.log(
         "[config] موجودی: "
         + (f"{stock} عدد" if stock is not None else "ارسال نمی‌شود")
@@ -717,6 +827,13 @@ async def create_draft(
         + (f" | قیمت ویژه: {sale_price}" if sale_price else "")
     )
     audit.log(f"[config] ویژگی‌ها: {[a['name'] for a in attrs] or '(هیچ)'} | تعداد تصاویر: {len(image_paths)}")
+    if plan.stock_matrix:
+        matrix_quantities = [plan.matrix_stock_for(combo) for combo in plan.combos]
+        known_quantities = [value for value in matrix_quantities if value is not None]
+        audit.log(
+            f"[stock:matrix] {len(known_quantities)} ترکیب؛ "
+            f"جمع موجودی {sum(known_quantities):,}؛ هر تعداد روی واریژن متناظر ثبت می‌شود"
+        )
     if restrictions:
         audit.log(
             f"[config] ماتریس رنگ هر مدل: {len(restrictions)} مدل محدود شد "
@@ -725,18 +842,25 @@ async def create_draft(
 
     try:
         # One client, one policy (auth, timeout, redirect, retry, redaction): see
-        # :mod:`bot.services.woo_client`. ``transport`` stays a seam for the suite — a store
-        # that answers with 500s, missing endpoints or a half-created product — and dry_run
-        # wins over it inside the client: a rehearsal must never reach the real shop.
-        async with WooClient(audit=audit, dry_run=dry_run, transport=transport) as client:
+        # :mod:`bot.services.woo_client`. Publish requests are deliberately serialized and
+        # paced; ``dry_run`` still wins over an injected transport and cannot reach the shop.
+        async with WooClient(
+            audit=audit,
+            dry_run=dry_run,
+            transport=transport,
+            min_request_interval=PUBLISH_MIN_REQUEST_INTERVAL_SECONDS,
+            max_concurrent_requests=1,
+        ) as client:
             resumed: dict[str, Any] | None = None
             # A resumed attempt uploads nothing, so it has no new media ids to attach: the
             # variations it still lacks are created without a per-colour image, and saying
             # so beats silently pretending the pictures were re-used.
             images_by_color: dict[str, int] = {}
             colors_for_images: list[str] = []
-            if batch_id and not dry_run:
+            if batch_id and not dry_run and resume_existing:
                 resumed = await _find_resumable(client, base, str(data.get("title") or ""), batch_id, audit)
+            elif batch_id and not dry_run:
+                audit.log("[resume] جستجوی محصول نیمه‌کاره انجام نشد؛ دفتر محلی این را تلاش اول می‌داند.")
             if resumed is not None:
                 # Nothing is re-created on purpose: the previous attempt may have attached
                 # images and categories already, and re-uploading would leave the old
@@ -751,7 +875,9 @@ async def create_draft(
                 )
             else:
                 category_ids = await _resolve_categories(client, base, data.get("categories") or [], audit)
-                sku = await next_sku(client, base, prefix, audit)
+                # The product POST enforces SKU uniqueness. Avoid a separate exact-SKU GET;
+                # a collision is handled by the bounded POST retry loop below.
+                sku = await next_sku(client, base, prefix, audit, verify_candidate=False)
                 uploads = await _upload_media_many(client, image_paths, audit)
                 media_ids = [media_id for media_id, _path in uploads]
                 colors_for_images = [
@@ -780,7 +906,13 @@ async def create_draft(
                     # Never replaces regular_price: the strikethrough price has to survive
                     # the day the sale is removed, and it does if we only add a sale.
                     payload["sale_price"] = str(sale_price)
-                if stock is not None or stock_status:
+                if plan.stock_matrix and not attrs:
+                    matrix_quantity = plan.matrix_stock_for({})
+                    if matrix_quantity is not None:
+                        payload["manage_stock"] = True
+                        payload["stock_quantity"] = matrix_quantity
+                        payload["stock_status"] = "instock" if matrix_quantity > 0 else "outofstock"
+                elif stock is not None or stock_status:
                     if attrs:
                         # A variable product owns no stock of its own — WooCommerce computes
                         # the parent from its variations — so only the status goes here and
@@ -832,6 +964,8 @@ async def create_draft(
                         restrictions, plan.combos, existing_combos=existing,
                         sale_price=sale_price, stock=stock, stock_status=stock_status,
                         images_by_color=images_by_color,
+                        variation_plan=plan,
+                        model_prices=model_prices,
                     )
             except Exception as exc:
                 # Half-built is worse than not built: a product with a missing

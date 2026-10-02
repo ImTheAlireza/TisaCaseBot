@@ -43,6 +43,10 @@ def clean_values(values: Iterable[Any]) -> list[str]:
     return out
 
 
+def _matrix_key(value: object) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip()).casefold()
+
+
 @dataclass
 class VariationPlan:
     """The exact matrix that will be created, plus what was dropped on the way."""
@@ -52,6 +56,10 @@ class VariationPlan:
     dropped: list[tuple[str, int, int]] = field(default_factory=list)  # (name, in, out)
     models: list[str] = field(default_factory=list)
     restrictions: dict[str, list[str]] = field(default_factory=dict)
+    stock_matrix: dict[str, dict[str, int | None]] = field(default_factory=dict)
+    matrix_missing: list[tuple[str, str]] = field(default_factory=list)
+    matrix_axis_errors: list[str] = field(default_factory=list)
+    matrix_unavailable: int = 0
 
     @property
     def count(self) -> int:
@@ -86,14 +94,35 @@ class VariationPlan:
         """The ``attributes`` object for ``product.json`` (ZIP importer)."""
         return {name: list(values) for name, values in self.axes if name != "مدل"}
 
+    def matrix_stock_for(self, combo: dict[str, str]) -> int | None:
+        """Return the explicit quantity for a planned model × design pair."""
+        if not self.stock_matrix:
+            return None
+        design = combo.get("طرح") or (next(iter(self.stock_matrix)) if len(self.stock_matrix) == 1 else "")
+        row = next(
+            (values for label, values in self.stock_matrix.items() if _matrix_key(label) == _matrix_key(design)),
+            None,
+        )
+        if row is None:
+            return None
+        model = combo.get("مدل")
+        model_labels = list(dict.fromkeys(label for values in self.stock_matrix.values() for label in values))
+        if not model and len(model_labels) == 1:
+            model = model_labels[0]
+        return next(
+            (quantity for label, quantity in row.items() if _matrix_key(label) == _matrix_key(model)),
+            None,
+        )
+
     def summary(self) -> str:
         if not self.axes:
             # The dropped axes must still be named here: three colour lines that
-            # were one colour are something the seller can fix, and a card that
+            # were one color are something the seller can fix, and a card that
             # only says "simple product" reads as if the bot ignored them.
-            if not self.dropped:
-                return "هیچ ویژگی قابل‌انتخابی نمانده؛ محصول simple ساخته می‌شود."
-            return "هیچ ویژگی قابل‌انتخابی نمانده؛ محصول simple ساخته می‌شود.\n" + _dropped_text(self.dropped)
+            text = "هیچ ویژگی قابل‌انتخابی نمانده؛ محصول simple ساخته می‌شود."
+            if self.dropped:
+                text += "\n" + _dropped_text(self.dropped)
+            return self._matrix_summary(text)
         parts = [f"{name} ({len(values)})" for name, values in self.axes]
         text = " | ".join(parts)
         if self.restricted:
@@ -102,6 +131,28 @@ class VariationPlan:
             text += f" = {self.count} واریژن"
         if self.dropped:
             text += "\n" + _dropped_text(self.dropped)
+        return self._matrix_summary(text)
+
+    def _matrix_summary(self, text: str) -> str:
+        if not self.stock_matrix:
+            return text
+        models = list(dict.fromkeys(
+            label for row in self.stock_matrix.values() for label in row
+        ))
+        total = sum(
+            quantity for row in self.stock_matrix.values() for quantity in row.values()
+            if quantity is not None
+        )
+        text += (
+            f"\nموجودی ماتریسی: {len(self.stock_matrix)} طرح × {len(models)} دسته؛ "
+            f"{total:,} عدد"
+        )
+        if self.matrix_unavailable:
+            text += f"؛ {self.matrix_unavailable} ترکیب ساخته نمی‌شود (−)"
+        if self.matrix_missing:
+            text += f"؛ ⚠️ {len(self.matrix_missing)} خانهٔ موجودی نامشخص"
+        if self.matrix_axis_errors:
+            text += "؛ ⚠️ ماتریس با محورهای ویژگی جور نیست"
         return text
 
 
@@ -110,12 +161,28 @@ def _dropped_text(dropped: list[tuple[str, int, int]]) -> str:
     return "؛ ".join(f"«{name}» با {had} مقدار به {left} رسید و حذف شد" for name, had, left in dropped)
 
 
+def _matrix_cell(
+    matrix: dict[str, dict[str, int | None]], design: str, model: str
+) -> tuple[bool, int | None]:
+    row = next(
+        (values for label, values in matrix.items() if _matrix_key(label) == _matrix_key(design)),
+        None,
+    )
+    if row is None:
+        return False, None
+    for label, quantity in row.items():
+        if _matrix_key(label) == _matrix_key(model):
+            return (type(quantity) is int or quantity is None), quantity
+    return False, None
+
+
 def build_plan(
     models: Sequence[str],
     attributes: dict[str, Sequence[str]] | None,
     restrictions: dict[str, Sequence[str]] | None = None,
     *,
     model_axis_name: str = "مدل",
+    stock_matrix: dict[str, dict[str, int | None]] | None = None,
 ) -> VariationPlan:
     """Resolve models + attributes + per-model colours into the final matrix.
 
@@ -162,12 +229,67 @@ def build_plan(
         # naming mismatch makes the restriction unusable; keep the real count.
         combos = restrict_combinations(combos, clean_restrictions) or combos
 
+    matrix = {
+        str(design): {
+            str(model): quantity
+            for model, quantity in values.items()
+        }
+        for design, values in (stock_matrix or {}).items()
+        if isinstance(values, dict)
+    }
+    matrix_missing: list[tuple[str, str]] = []
+    matrix_axis_errors: list[str] = []
+    matrix_unavailable = 0
+    if matrix:
+        axis_names = {name.casefold() for name, _values in axes}
+        extra_axes = sorted(name for name, _values in axes if name.casefold() not in {"مدل", "طرح"})
+        if extra_axes:
+            matrix_axis_errors.append("موجودی ماتریسی فقط محورهای «مدل» و «طرح» را پوشش می‌دهد")
+        matrix_designs = list(matrix)
+        matrix_models = list(dict.fromkeys(
+            model for row in matrix.values() for model in row
+        ))
+        if len(matrix_designs) > 1 and "طرح" not in axis_names:
+            matrix_axis_errors.append("محور «طرح» در گزینه‌های محصول پیدا نشد")
+        if len(matrix_models) > 1 and model_axis_name.casefold() not in axis_names:
+            matrix_axis_errors.append("محور مدل‌های ماتریس در گزینه‌های محصول پیدا نشد")
+        if clean_models and matrix_models and {
+            _matrix_key(value) for value in clean_models
+        } != {_matrix_key(value) for value in matrix_models}:
+            matrix_axis_errors.append("دسته‌های گوشیِ محصول با سرستون‌های ماتریس یکی نیست")
+        if len(matrix_designs) > 1:
+            attributes_designs = next(
+                (values for name, values in axes if name.casefold() == "طرح"), []
+            )
+            if {_matrix_key(value) for value in attributes_designs} != {
+                _matrix_key(value) for value in matrix_designs
+            }:
+                matrix_axis_errors.append("نام طرح‌های محصول با ردیف‌های ماتریس یکی نیست")
+
+        planned: list[dict[str, str]] = []
+        for combo in combos:
+            design = combo.get("طرح") or (matrix_designs[0] if len(matrix_designs) == 1 else "")
+            model = combo.get(model_axis_name) or (matrix_models[0] if len(matrix_models) == 1 else "")
+            found, quantity = _matrix_cell(matrix, design, model)
+            if not found:
+                matrix_missing.append((design or "؟", model or "؟"))
+                planned.append(combo)
+            elif quantity is None:
+                matrix_unavailable += 1
+            else:
+                planned.append(combo)
+        combos = planned
+
     return VariationPlan(
         axes=axes,
         combos=combos,
         dropped=dropped,
         models=clean_models,
         restrictions=clean_restrictions,
+        stock_matrix=matrix,
+        matrix_missing=matrix_missing,
+        matrix_axis_errors=list(dict.fromkeys(matrix_axis_errors)),
+        matrix_unavailable=matrix_unavailable,
     )
 
 
@@ -177,6 +299,7 @@ def plan_from_dict(data: dict[str, Any]) -> VariationPlan:
         data.get("models") or [],
         data.get("attributes") or {},
         data.get("model_colors") or {},
+        stock_matrix=data.get("stock_matrix") or None,
     )
 
 

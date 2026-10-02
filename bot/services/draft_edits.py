@@ -101,6 +101,44 @@ def parse_price(text: str) -> int:
     return value
 
 
+def parse_model_prices(text: str) -> dict[str, int]:
+    """«iPhone 17 Pro 598» on each line → ``{"iPhone 17 Pro": 598000}``.
+
+    Labels are kept as typed here; :func:`apply_edit` matches them against the
+    product's real model options, so a typo is reported instead of silently
+    becoming a price nobody sees.
+    """
+    raw = (text or "").strip()
+    if _is_clear(raw):
+        return {}
+    out: dict[str, int] = {}
+    for line in raw.splitlines():
+        line = line.strip().strip("،,;")
+        if not line:
+            continue
+        amounts = money.amounts_in_line(line)
+        if not amounts:
+            raise ValueError(f"در «{_one_line(line)}» قیمتی پیدا نشد؛ مثل «iPhone 17 Pro 598» بنویس.")
+        last = amounts[-1]
+        label = money.digits(line[: last.start]).strip(" \t:=،-–—")
+        value = money.apply_bare_policy(last, where=line).value
+        if not label or not value:
+            raise ValueError(f"خط «{_one_line(line)}» خوانده نشد؛ نام مدل و قیمت را بنویس.")
+        if not money.in_accepted_range(value):
+            raise ValueError(
+                f"قیمت «{label}» ({money.format_toman(value)}) خارج از بازهٔ مجاز فروشگاه است."
+            )
+        out[label] = value
+    if not out:
+        raise ValueError("قیمتی پیدا نشد؛ هر خط را به شکل «نام مدل + قیمت» بنویس.")
+    return out
+
+
+def parse_wholesale_price(text: str) -> int:
+    """The cooperation/wholesale base price; ``0`` when cleared («حذف»)."""
+    return parse_price(_one_line(text))
+
+
 def parse_group_prices(text: str) -> GroupPrice:
     """«ایفون 698 اندروید 598» → {\"iphone\": 698000, \"android\": 598000}."""
     raw = (text or "").strip()
@@ -311,6 +349,16 @@ def _fields() -> dict[str, dict[str, Any]]:
             "hint": "«ایفون 698 اندروید 598» — برای حذف بنویس «حذف»",
             "parse": parse_group_prices,
         },
+        "model_prices": {
+            "label": "قیمت مدل‌های خاص",
+            "hint": "هر خط: نام دقیق مدل + قیمت؛ مثال «iPhone 17 Pro 598» — برای حذف «حذف»",
+            "parse": parse_model_prices,
+        },
+        "wholesale_price": {
+            "label": "قیمت همکاری",
+            "hint": "مثلاً 448 یا 448t؛ فقط ثبت/نمایش می‌شود و در سایت اعمال نمی‌شود — حذف: «حذف»",
+            "parse": parse_wholesale_price,
+        },
         "sale_price": {
             "label": "قیمت ویژه",
             "hint": "مثلاً 498000 یا 498t — باید از قیمت اصلی کمتر باشد؛ برای حذف بنویس «حذف»",
@@ -342,7 +390,8 @@ def editable_fields(data: Any) -> list[tuple[str, str, str]]:
     """
     out: list[tuple[str, str, str]] = []
     specs = _fields()
-    for key in ("title", "price", "sale_price", "prices", "stock", "stock_status", "colors", "models", "sku_prefix", "categories"):
+    for key in ("title", "price", "sale_price", "prices", "model_prices", "wholesale_price",
+                "stock", "stock_status", "colors", "models", "sku_prefix", "categories"):
         out.append((key, specs[key]["label"], display_value(data, key)))
     for name, values in (getattr(data, "attributes", None) or {}).items():
         if name == "رنگ":
@@ -402,6 +451,12 @@ def display_value(data: Any, key: str) -> str:
     if key == "prices":
         groups = getattr(data, "prices", None) or {}
         return " | ".join(f"{g}: {v:,}" for g, v in groups.items()) or "—"
+    if key == "model_prices":
+        models = getattr(data, "model_prices", None) or {}
+        return " | ".join(f"{m}: {v:,}" for m, v in models.items()) or "—"
+    if key == "wholesale_price":
+        value = getattr(data, "wholesale_price", 0)
+        return money.format_toman(value) if value else "—"
     if key == "colors":
         colors = (getattr(data, "attributes", None) or {}).get("رنگ") or []
         return " | ".join(colors) or "—"
@@ -481,6 +536,21 @@ def apply_edit(data: Any, key: str, raw: str) -> str | None:
                 data.attributes = attributes
                 data.model_colors = _prune_matrix(getattr(data, "model_colors", None) or {}, stored)
                 evidence_key = "colors"
+            elif key == "model_prices":
+                from bot.services import pricing
+
+                matched, unmatched = pricing.map_labels(
+                    stored or {}, list(getattr(data, "models", None) or [])
+                )
+                if unmatched:
+                    return (
+                        "این نام‌ها به هیچ مدل یکتایی از این محصول وصل نشدند: "
+                        + "، ".join(unmatched[:4])
+                        + " — نام مدل را دقیقاً مثل گزینه‌های محصول بنویس."
+                    )
+                data.model_prices = matched
+                stored = matched
+                evidence_key = "model_prices"
             elif key == "categories":
                 categories = stored or []
                 if (
@@ -503,6 +573,11 @@ def apply_edit(data: Any, key: str, raw: str) -> str | None:
     except ValueError as exc:
         return str(exc)
 
+    if key in {"price", "prices", "model_prices"}:
+        # A typed price is a decision, and it answers the question the parser had
+        # («این قیمت سری‌ها را به کدام مدل وصل کنم؟»). Without this the owner could
+        # get stuck: the text looked tiered, and no manual field could clear the stop.
+        data.pricing_errors = []
     edited = dict(getattr(data, "user_edits", None) or {})
     edited[key] = stored
     data.user_edits = edited
@@ -573,6 +648,11 @@ def apply_locks(data: Any) -> dict[str, Any]:
         )
         if data.categories != before_categories:
             restored["categories"] = data.categories
+    if {"price", "prices", "model_prices"} & set(edits):
+        # The owner typed a price by hand, which answers the question the new text
+        # raised («کدام سری به کدام مدل؟»). A fresh extraction must not put the stop
+        # back on top of a value the owner already decided.
+        data.pricing_errors = []
     return restored
 
 

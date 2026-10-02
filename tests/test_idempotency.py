@@ -20,7 +20,6 @@ import os
 import shutil
 import tempfile
 import unittest
-import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -107,6 +106,15 @@ class TestBatchId(unittest.TestCase):
             self.assertNotEqual(base, other, f"«{key}» نباید شناسه را بی‌تغییر بگذارد")
         other_chat = publish_batch.batch_id(_data().to_dict(), [], chat_id=10)
         self.assertNotEqual(base, other_chat, "چت دیگر یعنی قصدِ دیگر")
+        matrix_a = _data().to_dict()
+        matrix_a["stock_matrix"] = {"A": {"iPhone 13": 7}}
+        matrix_b = _data().to_dict()
+        matrix_b["stock_matrix"] = {"A": {"iPhone 13": 8}}
+        self.assertNotEqual(
+            publish_batch.batch_id(matrix_a, [], chat_id=9),
+            publish_batch.batch_id(matrix_b, [], chat_id=9),
+            "تغییر موجودی یک خانه باید شناسهٔ تلاش را عوض کند",
+        )
 
     def test_cosmetic_fields_do_not_change_the_id(self) -> None:
         """یادداشت‌ها و شواهدِ پارسر بخشی از محصول نیستند؛ شناسه را عوض نکنند."""
@@ -216,10 +224,40 @@ class TestLedgerIntents(unittest.TestCase):
 class TestResumeOnTheShop(unittest.IsolatedAsyncioTestCase):
     """مسیر واقعیِ «پیدا کن و تمامش کن»، روی یک فروشگاه ساختگی."""
 
+    def setUp(self) -> None:
+        from bot.services.woocommerce_direct import clear_category_cache
+
+        stack = contextlib.ExitStack()
+        stack.enter_context(temp_ledger())
+        clear_category_cache()
+        self.addCleanup(stack.close)
+
     async def _create(self, store: _Store, batch: str, report: list[str] | None = None) -> tuple[int, str]:
         with patched_settings(settings_with()):
             return await create_draft(_data().to_dict(), [], report=report if report is not None else [],
                                       batch_id=batch, transport=store.transport)
+
+    async def test_first_publish_skips_the_recovery_search_and_sku_preflight(self) -> None:
+        from bot.services import sku
+
+        store = _Store(products=[])
+        batch = publish_batch.batch_id(_data().to_dict(), [], chat_id=9)
+        sku.remember("IP15", 16)
+        with patched_settings(settings_with()):
+            product_id, _edit_url = await create_draft(
+                _data().to_dict(), [], report=[], batch_id=batch,
+                resume_existing=False, transport=store.transport,
+            )
+        self.assertEqual(4321, product_id)
+        self.assertEqual([], store.product_searches, "تلاش اول نه جستجوی resume دارد نه GET تأیید SKU")
+        self.assertEqual(
+            [
+                ("GET", "/wp-json/wc/v3/products/categories"),
+                ("POST", "/wp-json/wc/v3/products"),
+                ("POST", "/wp-json/wc/v3/products/4321/variations/batch"),
+            ],
+            [(method, path) for method, path, _params, _body in store.requests],
+        )
 
     async def test_half_made_product_is_toppped_up_not_duplicated(self) -> None:
         batch = publish_batch.batch_id(_data().to_dict(), [], chat_id=9)
@@ -332,8 +370,9 @@ class TestFlowGate(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self._restore)
         self.calls: list[dict] = []
 
-        async def fake_create_draft(data, files, *, dry_run=False, report=None, batch_id="", meta=()):
-            self.calls.append({"batch_id": batch_id, "meta": meta, "data": data})
+        async def fake_create_draft(data, files, *, dry_run=False, report=None, batch_id="", meta=(), resume_existing=True):
+            self.calls.append({"batch_id": batch_id, "meta": meta, "data": data,
+                               "resume_existing": resume_existing})
             if report is not None:
                 report.append("[product] محصول ساخته شد: id=4321")
             return 4321, "https://shop.example/wp-admin/post.php?post=4321&action=edit"
@@ -392,6 +431,7 @@ class TestFlowGate(unittest.IsolatedAsyncioTestCase):
         result, _seen, _ctx = await self._confirm()
         self.assertEqual(PF.ConversationHandler.END, result)
         self.assertEqual(1, len(self.calls))
+        self.assertFalse(self.calls[0]["resume_existing"], "تلاش اول نباید GET بازیابی بفرستد")
 
         messages: list[dict] = []
 
@@ -448,6 +488,17 @@ class TestFlowGate(unittest.IsolatedAsyncioTestCase):
         result, _seen, _ctx = await self._confirm()
         self.assertEqual(PF.ConversationHandler.END, result)
         self.assertEqual(1, len(self.calls))
+        self.assertFalse(self.calls[0]["resume_existing"], "فقط dry-run قبلی هیچ محصول نیمه‌کاره‌ای نمی‌سازد")
+
+    async def test_a_dry_card_does_not_hide_an_earlier_live_failure(self) -> None:
+        batch = publish_batch.batch_id(self.data.to_dict(), [self.image], chat_id=9)
+        products_ledger.record(
+            user_id=7, status="failed", title="قاب گوشی اپل", batch_id=batch, error="timeout"
+        )
+        products_ledger.record(user_id=7, status="dry", title="قاب گوشی اپل", batch_id=batch)
+        result, _seen, _ctx = await self._confirm()
+        self.assertEqual(PF.ConversationHandler.END, result)
+        self.assertTrue(self.calls[0]["resume_existing"], "هر تلاش واقعیِ قبلی باید قابل بازیابی بماند")
 
     async def test_a_previous_failure_does_not_block_the_retry(self) -> None:
         """❌ یعنی «انجام نشد»؛ retry باید آزاد باشد، وگرنه دروازه به بن‌بست تبدیل می‌شود."""
@@ -456,6 +507,7 @@ class TestFlowGate(unittest.IsolatedAsyncioTestCase):
         result, _seen, _ctx = await self._confirm()
         self.assertEqual(PF.ConversationHandler.END, result)
         self.assertEqual(1, len(self.calls))
+        self.assertTrue(self.calls[0]["resume_existing"], "تلاش ناموفق می‌تواند محصول نیمه‌کاره داشته باشد")
 
     async def test_one_card_per_attempt_even_when_it_fails(self) -> None:
         """کارت ⏳ باید به ❌ تبدیل شود، نه اینکه یک کارت دوم اضافه شود.
@@ -498,18 +550,6 @@ class TestFlowGate(unittest.IsolatedAsyncioTestCase):
         self.assertRegex(entry["batch_id"], r"^[0-9a-f]{12}$")
         self.assertEqual(4, json.loads(meta[publish_batch.META_SOURCE])["variations"])
         self.assertEqual(9, json.loads(meta[publish_batch.META_SOURCE])["chat_id"])
-
-    async def test_zip_path_carries_the_same_id(self) -> None:
-        """مسیر ZIP هم شناسه را می‌برد؛ افزونهٔ وردپرس با آن از واردکردن دوباره جلوگیری می‌کند."""
-        self._new_session(mode="update")
-        result, _seen, ctx = await self._confirm()
-        self.assertEqual(PF.ConversationHandler.END, result)
-        handle = ctx.bot.documents[0]["document"]
-        with zipfile.ZipFile(Path(handle.name)) as archive:
-            manifest = json.loads(archive.read("product.json"))
-        self.assertRegex(manifest["batch_id"], r"^[0-9a-f]{12}$")
-        self.assertEqual(products_ledger.recent(1)[0]["batch_id"], manifest["batch_id"])
-        self.assertEqual([], self.calls, "مسیر ZIP نباید به REST برود")
 
     async def test_the_override_button_is_a_real_conversation_handler(self) -> None:
         """دکمه‌ای که هندلرش در مکالمه نیست، فقط یک متن کلیک‌نشدنی است.

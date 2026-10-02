@@ -305,8 +305,9 @@ class TestQueueIsCreatedFromTheFlow(QueueTestCase):
             await self._confirm()
         self.assertEqual(0, outbox.pending(), "در حالت آزمایشی چیزی برای تلاش مجدد نیست")
 
-    async def test_the_zip_mode_never_queues_anything(self) -> None:
-        # حالت ZIP یعنی «فایل را خودت آپلود کن»؛ قولِ تلاشِ خودکار ربات در آن دروغ است.
+    async def test_an_update_never_queues_anything(self) -> None:
+        # An update is a diff against the shop: asking again recomputes it, so there is nothing
+        # to replay later — and a queued copy of a stale diff is the one thing that would be wrong.
         PF.sessions[7].mode = "update"
         self._fail_with(WooCommerceAPIError(503, "سایت مشغول است"))
         await self._confirm()
@@ -337,7 +338,8 @@ class TestDrainingTheQueue(QueueTestCase):
         self.addCleanup(setattr, outbox_flow, "create_draft", create_draft)
 
     async def _fake_create_draft(self, data, files, *, report=None, batch_id="", meta=(), **kwargs):
-        self._calls.append({"data": data, "files": list(files), "batch_id": batch_id})
+        self._calls.append({"data": data, "files": list(files), "batch_id": batch_id,
+                            "kwargs": dict(kwargs)})
         if report is not None:
             report.append("[product] محصول ساخته شد: id=4321")
         if isinstance(self.error, Exception):
@@ -368,6 +370,20 @@ class TestDrainingTheQueue(QueueTestCase):
         entry = products_ledger.recent(1)[0]
         self.assertEqual("created", entry["status"])
         self.assertEqual(4321, entry["product_id"])
+
+    async def test_retry_trace_goes_to_the_log_group_and_preserves_resume(self) -> None:
+        self.enqueue(batch="trace1234trace", delay=0.0)
+        log_chat_id = -1001234567890
+        with patched_settings(settings_with(**SHARED, log_chat_id=log_chat_id)):
+            await self._drain()
+
+        traces = [item for item in self.sent if item.get("chat_id") == log_chat_id
+                  and "ردپای انتشار واقعی" in str(item.get("text"))]
+        self.assertEqual(1, len(traces))
+        self.assertIn("[product] محصول ساخته شد: id=4321", str(traces[0]["text"]))
+        self.assertTrue(self._calls[0]["kwargs"]["resume_existing"])
+        self.assertFalse(any("[product]" in str(item.get("text")) for item in self.sent
+                             if item.get("chat_id") != log_chat_id))
 
     async def test_the_message_never_borrows_another_chats_card(self) -> None:
         """کارتِ موفقیت از همان ردیفِ بسته‌شده ساخته می‌شود، نه از «تازه‌ترین تاریخچه»."""

@@ -151,6 +151,31 @@ class TestRetryPolicy(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(201, response.status_code)
         self.assertEqual(2, script.sends)
 
+    async def test_retry_after_is_respected(self) -> None:
+        script = TransportScript(
+            httpx.Response(429, headers={"Retry-After": "7"}, json={"message": "slow down"}),
+            respond(201, {"id": 8}),
+        )
+        with patched_settings(settings_with(**SHARED)), no_sleep() as delays:
+            async with _client(script) as client:
+                response = await client.post("https://shop.example/wp-json/wc/v3/products", json={})
+        self.assertEqual(201, response.status_code)
+        self.assertEqual([7.0], delays, "سرور اگر زمان داد، backoff محلی نباید زودتر درخواست بزند")
+
+    async def test_publish_client_paces_and_serializes_requests(self) -> None:
+        script = TransportScript(respond(200, []), respond(200, []), respond(200, []))
+        with patched_settings(settings_with(**SHARED)), no_sleep() as delays:
+            async with WooClient(
+                transport=script.transport(), attempts=1,
+                min_request_interval=0.2, max_concurrent_requests=1,
+            ) as client:
+                await __import__("asyncio").gather(*(
+                    client.get("https://shop.example/wp-json/wc/v3/products") for _ in range(3)
+                ))
+        self.assertEqual(3, script.sends)
+        self.assertGreaterEqual(len(delays), 2, "درخواست‌های سریع باید gap رعایت کنند")
+        self.assertTrue(all(0 < delay <= 0.2 for delay in delays))
+
     async def test_server_error_on_a_read_is_retried_but_500_is_not(self) -> None:
         script = TransportScript(respond(503), respond(200, []))
         with patched_settings(settings_with(**SHARED)), no_sleep():
