@@ -14,6 +14,7 @@ Three things the production bot needed and did not have:
 from __future__ import annotations
 
 import contextvars
+import os
 import logging
 import re
 from logging.handlers import RotatingFileHandler
@@ -71,6 +72,16 @@ class _RedactingFilter(logging.Filter):
         return True
 
 
+class _RedactingFormatter(logging.Formatter):
+    """Redact the final output, including cached exception and stack text.
+
+    Filtering only LogRecord.msg is insufficient: Formatter appends the
+    traceback later, and may reuse exc_text between several handlers.
+    """
+    def format(self, record: logging.LogRecord) -> str:
+        return redact(super().format(record))
+
+
 def setup_logging(level: str = "INFO", *, to_files: bool = True) -> None:
     root = logging.getLogger()
     for handler in list(root.handlers):
@@ -81,7 +92,7 @@ def setup_logging(level: str = "INFO", *, to_files: bool = True) -> None:
         if isinstance(handler, (RotatingFileHandler, logging.FileHandler)):
             handler.close()
 
-    formatter = logging.Formatter(
+    formatter = _RedactingFormatter(
         "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
     )
     redactor = _RedactingFilter()
@@ -93,10 +104,12 @@ def setup_logging(level: str = "INFO", *, to_files: bool = True) -> None:
 
     if to_files:
         try:
-            LOG_DIR.mkdir(parents=True, exist_ok=True)
+            LOG_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+            LOG_DIR.chmod(0o700)
             file_handler = RotatingFileHandler(
                 LOG_DIR / "bot.log", maxBytes=_MAX_BYTES, backupCount=_BACKUPS, encoding="utf-8"
             )
+            os.chmod(LOG_DIR / "bot.log", 0o600)
             file_handler.setFormatter(formatter)
             file_handler.addFilter(redactor)
             root.addHandler(file_handler)

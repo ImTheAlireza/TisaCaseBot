@@ -25,19 +25,24 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import re
+import tempfile
 import shutil
 import sqlite3
 import threading
 import time
+import uuid
 
 import httpx
 from contextlib import contextmanager
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
 from bot.config import data_dir
+from bot.services.fsutils import fsync_dir, private_dir, private_file
 
 logger = logging.getLogger(__name__)
 
@@ -55,8 +60,13 @@ def is_transient(exc: BaseException) -> bool:
     """Could a later attempt plausibly succeed? This is the gate in front of the queue."""
     from bot.services.woo_client import WooCommerceAPIError      # no cycle: it imports nothing here
 
+    from bot.services.jsonstore import StateWriteError
+
+    if isinstance(exc, StateWriteError):
+        return False
     if isinstance(exc, WooCommerceAPIError):
-        return int(getattr(exc, "status_code", 0) or 0) in TRANSIENT_STATUS_CODES
+        return (int(getattr(exc, "status_code", 0) or 0) in TRANSIENT_STATUS_CODES
+                and getattr(exc, "retry_after", 0.0) < MAX_AGE_SECONDS)
     # httpx's transport failures (ConnectError, ReadTimeout, RemoteProtocolError) are the usual
     # shape of «the shop is unreachable», and they do *not* subclass ConnectionError — naming
     # them is not decoration. The request either never landed or its answer was lost, and the
@@ -121,6 +131,9 @@ class QueuedPublish:
     created_at: float = 0.0
     thread_id: int | None = None
     mode: str = "new"
+    updated_at: float = 0.0
+    generation: str = ""
+    claim_token: str = ""
     #: Images the spool lost (someone cleaned ``data/``, a moved host). The drain must say so
     #: instead of publishing a product whose pictures quietly vanished.
     missing_images: list[Path] = field(default_factory=list)
@@ -132,7 +145,7 @@ class QueuedPublish:
 
 def backoff_seconds(attempts: int) -> int:
     """1m, 2m, 4m … capped — the queue must not become a denial of service on the shop."""
-    return min(BACKOFF_BASE_SECONDS * (2 ** max(0, attempts - 1)), MAX_DELAY_SECONDS)
+    return min(BACKOFF_BASE_SECONDS * (2 ** min(8, max(0, attempts - 1))), MAX_DELAY_SECONDS)
 
 
 def _initialize(conn: sqlite3.Connection) -> None:
@@ -142,15 +155,25 @@ def _initialize(conn: sqlite3.Connection) -> None:
     except sqlite3.Error:                   # pragma: no cover - host dependent
         logger.warning("outbox: WAL is not available here; using the default journal")
     conn.executescript(_SCHEMA)
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(outbox)")}
+    for name, declaration in {
+        "generation": "TEXT NOT NULL DEFAULT ''",
+        "claim_token": "TEXT NOT NULL DEFAULT ''",
+        "lease_until": "REAL NOT NULL DEFAULT 0",
+    }.items():
+        if name not in columns:
+            conn.execute(f"ALTER TABLE outbox ADD COLUMN {name} {declaration}")
 
 
 def _connect() -> sqlite3.Connection:
     path = Path(DB_PATH)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path, timeout=10.0)
+    private_dir(path.parent)
+    conn = sqlite3.connect(path, timeout=0.25)
+    private_file(path)
     conn.row_factory = sqlite3.Row
     try:
-        conn.execute("PRAGMA busy_timeout=10000")
+        conn.execute("PRAGMA busy_timeout=250")
+        conn.execute("PRAGMA synchronous=FULL")
         stat = path.stat()
         identity = (stat.st_dev, stat.st_ino)
         # WAL mode and DDL belong to the database file, not each enqueue/due call.
@@ -160,6 +183,8 @@ def _connect() -> sqlite3.Connection:
                 _initialize(conn)
                 stat = path.stat()
                 _initialized[path] = (stat.st_dev, stat.st_ino)
+                while len(_initialized) > 128:
+                    _initialized.pop(next(iter(_initialized)))
     except Exception:
         conn.close()
         raise
@@ -189,8 +214,8 @@ def _row_to_entry(row: sqlite3.Row) -> QueuedPublish:
         stored = json.loads(row["images"] or "[]")
     except (TypeError, ValueError):
         stored = []
-    wanted = [Path(str(item)) for item in stored if str(item).strip()]
-    present = [path for path in wanted if path.is_file()]
+    wanted = [Path(str(item)) for item in stored if str(item).strip()] if isinstance(stored, list) else []
+    present = [path for path in wanted if path.resolve().is_relative_to(FILES_DIR.resolve()) and path.is_file()]
     return QueuedPublish(
         batch_id=str(row["batch_id"]),
         chat_id=int(row["chat_id"] or 0),
@@ -205,32 +230,91 @@ def _row_to_entry(row: sqlite3.Row) -> QueuedPublish:
         last_error=str(row["last_error"] or ""),
         status=str(row["status"] or STATUS_PENDING),
         created_at=float(row["created_at"] or 0.0),
+        updated_at=float(row["updated_at"] or 0.0),
+        generation=str(row["generation"] or ""), claim_token=str(row["claim_token"] or ""),
     )
 
 
-def spool_images(batch_id: str, paths: Sequence[Path]) -> list[Path]:
-    """Copy the images into the queue directory and return *those* paths.
+def _batch_dir(batch_id: str) -> Path:
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", batch_id):
+        raise ValueError("Invalid outbox batch id")
+    return FILES_DIR / batch_id
 
-    The session workspace is deleted when the flow ends, so the queue owns its own bytes —
-    and a retry that publishes half a product because a temp file vanished is worse than one
-    that never started.
-    """
+
+def spool_images(batch_id: str, paths: Sequence[Path]) -> list[Path]:
+    """All images or nothing; each refresh gets an immutable private generation."""
     if not paths:
         return []
-    target = FILES_DIR / batch_id
-    target.mkdir(parents=True, exist_ok=True)
+    private_dir(FILES_DIR)
+    root = private_dir(_batch_dir(batch_id))
+    target = Path(tempfile.mkdtemp(prefix="spool-", dir=root))
+    target.chmod(0o700)
     kept: list[Path] = []
-    for index, path in enumerate(paths, 1):
+    try:
+        for index, raw in enumerate(paths, 1):
+            path = Path(raw)
+            if not path.is_file() or path.stat().st_size == 0:
+                raise OSError(f"Required image missing/empty: {path}")
+            destination = target / f"{index:02d}_{path.name}"
+            shutil.copy2(path, destination)
+            private_file(destination)
+            if destination.stat().st_size != path.stat().st_size:
+                raise OSError(f"Incomplete image copy: {path}")
+            with destination.open("rb") as handle:
+                os.fsync(handle.fileno())
+            kept.append(destination)
+        fsync_dir(target)
+        fsync_dir(root)
+        return kept
+    except BaseException:
+        shutil.rmtree(target, ignore_errors=True)
         try:
-            if not path.is_file():
-                continue
-            # Re-numbered on purpose: the workspace order is the gallery order, and the
-            # per-colour images keep their name inside the number («01_مشکی.jpg»).
-            shutil.copy2(path, target / f"{index:02d}_{path.name}")
-            kept.append(target / f"{index:02d}_{path.name}")
-        except OSError as exc:
-            logger.warning("outbox: تصویر %s در صف کپی نشد: %s", path, exc)
-    return kept
+            root.rmdir()
+        except OSError:
+            pass
+        raise
+
+
+def _forget_paths(paths: Sequence[Path]) -> None:
+    """Clean only the committed row's files, never a concurrently refreshed spool."""
+    root = FILES_DIR.resolve()
+    parents: set[Path] = set()
+    for raw in paths:
+        path = Path(raw)
+        if not path.resolve().is_relative_to(root):
+            logger.error("outbox: refusing cleanup outside the spool: %s", path)
+            continue
+        try:
+            path.unlink(missing_ok=True)
+            parents.add(path.parent)
+        except OSError:
+            logger.warning("outbox: could not clean %s", path)
+    for parent in parents:
+        while parent != root and parent.is_relative_to(root):
+            try:
+                parent.rmdir()
+            except OSError:
+                break
+            parent = parent.parent
+
+
+def _stored_paths(conn: sqlite3.Connection, batch_id: str, expected_updated_at: float | None = None, expected_generation: str | None = None, claim_token: str | None = None) -> list[Path]:
+    row = conn.execute("SELECT images, updated_at, generation, claim_token FROM outbox WHERE batch_id = ?", (batch_id,)).fetchone()
+    if row is None:
+        if expected_generation is not None or claim_token:
+            raise RuntimeError("Queue item no longer exists; acknowledgement deferred")
+        return []
+    if expected_generation is not None and str(row["generation"]) != expected_generation:
+        raise RuntimeError("Queue generation changed; acknowledgement deferred")
+    if claim_token and str(row["claim_token"]) != claim_token:
+        raise RuntimeError("Queue claim lost; acknowledgement deferred")
+    if expected_updated_at is not None and float(row["updated_at"]) != expected_updated_at:
+        raise RuntimeError("Queue item was refreshed during the attempt; acknowledgement deferred")
+    try:
+        paths = json.loads(row["images"] or "[]")
+    except (TypeError, ValueError):
+        paths = []
+    return [Path(str(path)) for path in paths] if isinstance(paths, list) else []
 
 
 def enqueue(
@@ -252,31 +336,39 @@ def enqueue(
     adding a second one, which is the whole point of a content-addressed id.
     """
     moment = time.time() if now is None else now
+    spooled: list[Path] = []
     try:
+        _batch_dir(batch_id)
         spooled = spool_images(batch_id, images)
         with _db() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            active = conn.execute("SELECT lease_until FROM outbox WHERE batch_id = ?", (batch_id,)).fetchone()
+            if active is not None and float(active[0]) > moment:
+                raise ValueError("An active queue generation cannot be refreshed")
             conn.execute(
                 """
                 INSERT INTO outbox (batch_id, chat_id, thread_id, user_id, mode, payload, images,
-                                    attempts, next_at, last_error, status, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
+                                    attempts, next_at, last_error, status, created_at, updated_at, generation)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(batch_id) DO UPDATE SET
                     payload    = excluded.payload,
                     images     = excluded.images,
                     next_at    = MAX(outbox.next_at, excluded.next_at),
                     last_error = excluded.last_error,
                     status     = excluded.status,
-                    updated_at = excluded.updated_at
+                    updated_at = excluded.updated_at,
+                    generation = excluded.generation, claim_token = '', lease_until = 0
                 """,
                 (
                     batch_id, int(chat_id or 0), thread_id, str(user_id), mode,
-                    json.dumps(payload, ensure_ascii=False),
+                    json.dumps(dict(payload) | {"_queued_image_count": len(images)}, ensure_ascii=False, allow_nan=False),
                     json.dumps([str(path) for path in spooled], ensure_ascii=False),
-                    moment + max(0.0, delay), (error or "")[:400], STATUS_PENDING, moment, moment,
+                    moment + max(0.0, delay), (error or "")[:400], STATUS_PENDING, moment, moment, uuid.uuid4().hex,
                 ),
             )
         return True
-    except (sqlite3.Error, OSError) as exc:
+    except (sqlite3.Error, OSError, ValueError, TypeError) as exc:
+        _forget_paths(spooled)
         logger.error("outbox: نتوانست در صف بنویسد (%s): %s", type(exc).__name__, exc)
         return False
 
@@ -297,63 +389,120 @@ def due(now: float | None = None, *, limit: int = DRAIN_LIMIT) -> list[QueuedPub
     return [_row_to_entry(row) for row in rows]
 
 
+LEASE_SECONDS = 300
+
+
+def claim_due(now: float | None = None) -> QueuedPublish | None:
+    """Atomically claim one row; no network inside the SQL transaction."""
+    moment = time.time() if now is None else now
+    with _db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM outbox WHERE status = ? AND next_at <= ? AND lease_until <= ? "
+            "ORDER BY created_at LIMIT 1", (STATUS_PENDING, moment, moment),
+        ).fetchone()
+        if row is None:
+            return None
+        token = uuid.uuid4().hex
+        conn.execute("UPDATE outbox SET claim_token = ?, lease_until = ? WHERE batch_id = ?",
+                     (token, moment + LEASE_SECONDS, row["batch_id"]))
+        return replace(_row_to_entry(row), claim_token=token)
+
+
+def renew_claim(entry: QueuedPublish, *, now: float | None = None) -> bool:
+    moment = time.time() if now is None else now
+    with _db() as conn:
+        result = conn.execute("UPDATE outbox SET lease_until = ? WHERE batch_id = ? "
+                              "AND generation = ? AND claim_token = ? AND status = ?",
+                              (moment + LEASE_SECONDS, entry.batch_id, entry.generation, entry.claim_token, STATUS_PENDING))
+        return result.rowcount == 1
+
+
+def release_claim(entry: QueuedPublish) -> None:
+    with _db() as conn:
+        conn.execute("UPDATE outbox SET claim_token = '', lease_until = 0 WHERE batch_id = ? "
+                     "AND generation = ? AND claim_token = ?", (entry.batch_id, entry.generation, entry.claim_token))
+
+
 def note_failure(entry: QueuedPublish, error: str, *, now: float | None = None) -> QueuedPublish:
-    """Count the attempt, schedule the next one, or give up (and say so in the row)."""
+    """Acknowledge the retry state durably before deleting any dropped files."""
     moment = time.time() if now is None else now
     attempts = entry.attempts + 1
-    too_old = bool(entry.created_at) and (moment - entry.created_at) > MAX_AGE_SECONDS
-    give_up = attempts >= MAX_ATTEMPTS or too_old
+    give_up = attempts >= MAX_ATTEMPTS or expired(entry, now=moment)
     status = STATUS_DROPPED if give_up else STATUS_PENDING
     next_at = moment + backoff_seconds(attempts)
-    try:
-        with _db() as conn:
-            conn.execute(
-                "UPDATE outbox SET attempts = ?, next_at = ?, last_error = ?, status = ?, updated_at = ? "
-                "WHERE batch_id = ?",
-                (attempts, next_at, (error or "")[:400], status, moment, entry.batch_id),
-            )
-    except (sqlite3.Error, OSError) as exc:                       # the row is what it is
-        logger.error("outbox: ثبت خطا ناموفق بود: %s", exc)
+    with _db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        paths = _stored_paths(conn, entry.batch_id, entry.updated_at or None, entry.generation or None, entry.claim_token or None)
+        conn.execute(
+            "UPDATE outbox SET attempts = ?, next_at = ?, last_error = ?, status = ?, updated_at = ?, claim_token = '', lease_until = 0 WHERE batch_id = ?",
+            (attempts, next_at, (error or "")[:400], status, moment, entry.batch_id),
+        )
     if give_up:
-        forget_files(entry.batch_id)
-    return QueuedPublish(
-        batch_id=entry.batch_id, chat_id=entry.chat_id, user_id=entry.user_id,
-        payload=entry.payload, images=entry.images, attempts=attempts, next_at=next_at,
-        last_error=(error or "")[:400], status=status, created_at=entry.created_at,
-        thread_id=entry.thread_id, mode=entry.mode, missing_images=entry.missing_images,
-    )
+        _forget_paths(paths)
+    return replace(entry, attempts=attempts, next_at=next_at, last_error=(error or "")[:400], status=status, updated_at=moment)
 
 
-def abandon(batch_id: str, error: str, *, now: float | None = None) -> None:
-    """Take the item out of the queue *without* deleting it: a 400 is an outcome too.
-
-    The row keeps ``status='dropped'`` and the reason, so «چرا این محصول ساخته نشد؟» still has
-    an answer weeks later; deleting it would turn a decision into a missing record.
-    """
+def expired(entry: QueuedPublish, *, now: float | None = None) -> bool:
     moment = time.time() if now is None else now
-    try:
-        with _db() as conn:
-            conn.execute(
-                "UPDATE outbox SET status = ?, last_error = ?, updated_at = ? WHERE batch_id = ?",
-                (STATUS_DROPPED, (error or "")[:400], moment, batch_id),
-            )
-    except (sqlite3.Error, OSError) as exc:
-        logger.error("outbox: ثبت خطای تکراری ناموفق بود: %s", exc)
-    forget_files(batch_id)
+    return moment - entry.created_at >= MAX_AGE_SECONDS or entry.attempts >= MAX_ATTEMPTS
 
 
-def succeed(batch_id: str, *, now: float | None = None) -> None:
-    """The product is on the shop: drop the row and the images it was holding."""
-    try:
-        with _db() as conn:
-            conn.execute("DELETE FROM outbox WHERE batch_id = ?", (batch_id,))
-    except (sqlite3.Error, OSError) as exc:
-        logger.error("outbox: پاک‌کردن ردیف ناموفق بود: %s", exc)
-    forget_files(batch_id)
+def abandon(batch_id: str, error: str, *, now: float | None = None, expected_updated_at: float | None = None, expected_generation: str | None = None, claim_token: str | None = None) -> None:
+    """Persist the terminal result first; propagate failed SQL acknowledgement."""
+    moment = time.time() if now is None else now
+    with _db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        paths = _stored_paths(conn, batch_id, expected_updated_at, expected_generation, claim_token)
+        conn.execute(
+            "UPDATE outbox SET status = ?, last_error = ?, updated_at = ? WHERE batch_id = ?",
+            (STATUS_DROPPED, (error or "")[:400], moment, batch_id),
+        )
+    _forget_paths(paths)
+
+
+def succeed(batch_id: str, *, now: float | None = None, expected_updated_at: float | None = None, expected_generation: str | None = None, claim_token: str | None = None) -> None:
+    """Only a committed DELETE acknowledges success and releases that row's files."""
+    with _db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        paths = _stored_paths(conn, batch_id, expected_updated_at, expected_generation, claim_token)
+        conn.execute("DELETE FROM outbox WHERE batch_id = ?", (batch_id,))
+    _forget_paths(paths)
 
 
 def forget_files(batch_id: str) -> None:
-    shutil.rmtree(FILES_DIR / batch_id, ignore_errors=True)
+    """Explicit maintenance helper; normal acknowledgements clean their own generation."""
+    shutil.rmtree(_batch_dir(batch_id), ignore_errors=True)
+
+
+def prune(*, now: float | None = None, retention_days: int = 7) -> int:
+    """Bound terminal history and orphan generations without touching pending bytes."""
+    moment = time.time() if now is None else now
+    with _db() as conn:
+        rows = conn.execute("SELECT images FROM outbox WHERE status = ?", (STATUS_PENDING,)).fetchall()
+        live: set[Path] = set()
+        for row in rows:
+            try:
+                live.update(Path(str(path)).parent.resolve() for path in json.loads(row["images"] or "[]"))
+            except (TypeError, ValueError):
+                pass
+        count = conn.execute("DELETE FROM outbox WHERE status = ? AND updated_at < ?",
+                             (STATUS_DROPPED, moment - max(1, retention_days) * 86400)).rowcount
+    if FILES_DIR.exists():
+        for batch_dir in list(FILES_DIR.iterdir()):
+            if not batch_dir.is_dir() or batch_dir.is_symlink():
+                continue
+            for generation in list(batch_dir.iterdir()):
+                try:
+                    if generation.is_dir() and generation.resolve() not in live and generation.stat().st_mtime < moment - MAX_AGE_SECONDS:
+                        shutil.rmtree(generation)
+                except OSError:
+                    continue
+            try:
+                batch_dir.rmdir()
+            except OSError:
+                pass
+    return count
 
 
 def pending(*, now: float | None = None) -> int:

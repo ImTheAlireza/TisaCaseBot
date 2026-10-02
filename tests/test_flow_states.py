@@ -19,8 +19,10 @@ import os
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 from types import SimpleNamespace
+
+from _product_samples import MASA_POLO_CAPTION, MASA_POLO_INFO, MASA_POLO_MODELS
 
 from telegram.error import BadRequest
 
@@ -112,6 +114,9 @@ def _context(*, can_delete: bool = True, can_react: bool = True):
 
 
 def _query(data, *, text=None, chat_id=7, thread_id=None):
+    session = PF.sessions.get(7)
+    if session and "|" not in data and data.startswith("product:"):
+        data = f"{data}|{session.nonce}.{session.revision:x}"
     sent = []
 
     async def answer(*a, **k):
@@ -514,6 +519,7 @@ NOTE11/11S/12S"""
             with (
                 patch.object(PF, "_download_with_retry", new=download),
                 patch.object(PF, "compress_image", new=compress),
+                patch.object(PF.worker, "run", new=AsyncMock(side_effect=lambda fn, *a, **k: fn(*a))),
                 patch.object(PF, "_telegram_log", new=AsyncMock()),
                 patch.object(PF, "_status", new=AsyncMock()),
                 patch.object(PF, "_extract", new=parse),
@@ -533,6 +539,129 @@ NOTE11/11S/12S"""
             ),
             session.models,
         )
+
+
+@needs_flow
+class TestRepliedProductSources(FlowStateTestCase):
+    """The seller's short reply must carry the original post into extraction."""
+
+    def setUp(self):
+        super().setUp()
+        from _flow_harness import patched_settings, settings_with
+        from bot.services import ai_normalizer
+
+        self.enterContext(patched_settings(settings_with(ai_base_url="", ai_token="", ai_model="")))
+        for name in ("AI_BASE_URL", "AI_TOKEN", "AI_MODEL"):
+            self.enterContext(patch.object(ai_normalizer, name, ""))
+        self.enterContext(patch.object(PF.learning_corpus, "record"))
+        self.enterContext(patch.object(PF.flow_state, "record"))
+        self.enterContext(patch.object(PF, "_telegram_log", new=AsyncMock()))
+        self.enterContext(patch.object(PF.rbac, "is_sudo", return_value=False))
+
+    def reply_update(self, info=MASA_POLO_INFO, *, caption=MASA_POLO_CAPTION, text=None, is_bot=False):
+        update, _sent = _update(info)
+        update.effective_message.reply_to_message = SimpleNamespace(
+            message_id=5,
+            caption=caption,
+            text=text,
+            from_user=SimpleNamespace(is_bot=is_bot),
+        )
+        return update
+
+    def test_reply_imports_the_full_caption_before_the_album_worker_finishes(self):
+        from bot.services.plan import plan_from_dict
+
+        session = PF.ProductSession(mode="new", status_message_id=77)
+        session.files = [Path(f"/tmp/{index}.jpg") for index in range(5)]
+        PF.sessions[7] = session
+        context, calls = _context()
+        # Supplier posts may themselves be sent by a bot; media captions remain usable.
+        update = self.reply_update(is_bot=True)
+        result = asyncio.run(PF.on_text(update, context))
+
+        self.assertEqual(PF.REVIEW, result)
+        self.assertEqual(MASA_POLO_CAPTION, session.model_text)
+        self.assertEqual(MASA_POLO_INFO, session.info_text)
+        self.assertEqual(MASA_POLO_MODELS, session.data.models)
+        self.assertEqual("قاب ماسا پولو سورمه ای", session.data.title)
+        self.assertEqual("info", session.data.evidence["title"].source)
+        self.assertEqual("LP", session.data.sku_prefix)
+        self.assertEqual(728_000, session.data.price)
+        self.assertEqual(["قاب و کاور گوشی و تبلت > آیفون iphone"], session.data.categories)
+        plan = plan_from_dict(session.data.to_dict())
+        self.assertTrue(plan.is_variable)
+        self.assertEqual(15, plan.count)
+        self.assertEqual(5, len(session.files), "reply context must not download or duplicate photos")
+        card = calls["edits"][-1]["text"]
+        self.assertIn("<b>نوع محصول:</b> متغیر", card)
+        self.assertNotIn("مدلی تشخیص داده نشد", card)
+
+    def test_reply_to_a_plain_text_model_post_also_provides_the_source(self):
+        session = PF.ProductSession(mode="new")
+        PF.sessions[7] = session
+        context, _calls = _context()
+        update = self.reply_update(caption=None, text=MASA_POLO_CAPTION)
+        asyncio.run(PF.on_text(update, context))
+        self.assertEqual(MASA_POLO_MODELS, session.data.models)
+        self.assertEqual(MASA_POLO_CAPTION, session.model_text)
+
+    def test_repeated_replies_do_not_duplicate_multiline_captions_and_can_be_undone(self):
+        session = PF.ProductSession(mode="new")
+        PF.sessions[7] = session
+        context, _calls = _context()
+
+        async def run():
+            await PF.on_text(self.reply_update(), context)
+            await PF.on_text(self.reply_update("قیمت 748t"), context)
+
+        asyncio.run(run())
+        self.assertEqual(MASA_POLO_CAPTION, session.model_text)
+        self.assertEqual(748_000, session.data.price)
+        self.assertEqual(MASA_POLO_MODELS, session.data.models)
+        # A later album download must not append the already imported caption again.
+        self.assertEqual(MASA_POLO_CAPTION, PF._append_model_caption(session.model_text, MASA_POLO_CAPTION))
+        PF._restore(session)
+        self.assertEqual(728_000, session.data.price)
+        self.assertEqual(MASA_POLO_CAPTION, session.model_text)
+        PF._restore(session)
+        self.assertEqual("", session.model_text)
+        self.assertEqual("", session.info_text)
+        self.assertIsNone(session.data)
+
+    def test_bot_previews_and_guide_messages_are_not_product_sources(self):
+        for message_id, is_bot in ((77, False), (78, False), (5, True)):
+            with self.subTest(message_id=message_id, is_bot=is_bot):
+                session = PF.ProductSession(mode="new", status_message_id=77, guide_message_id=78)
+                PF.sessions[7] = session
+                context, _calls = _context()
+                update = self.reply_update(caption=None, text="نمونه: iPhone 15\nقیمت 999t", is_bot=is_bot)
+                update.effective_message.reply_to_message.message_id = message_id
+                asyncio.run(PF.on_text(update, context))
+                self.assertEqual("", session.model_text)
+                self.assertEqual([], session.data.models)
+                self.assertEqual(728_000, session.data.price)
+
+    def test_reply_context_is_kept_while_media_is_processing(self):
+        session = PF.ProductSession(mode="new", processing_media=True)
+        PF.sessions[7] = session
+        context, _calls = _context()
+        with patch.object(PF, "_extract", new=AsyncMock()) as extract:
+            result = asyncio.run(PF.on_text(self.reply_update(), context))
+        self.assertEqual(PF.COLLECT, result)
+        extract.assert_not_awaited()
+        self.assertEqual(MASA_POLO_CAPTION, session.model_text)
+        self.assertEqual(MASA_POLO_INFO, session.info_text)
+
+    def test_no_reply_still_allows_a_model_less_product(self):
+        session = PF.ProductSession(mode="new")
+        PF.sessions[7] = session
+        context, calls = _context()
+        update, _sent = _update(MASA_POLO_INFO)
+        asyncio.run(PF.on_text(update, context))
+        self.assertEqual("", session.model_text)
+        self.assertEqual([], session.data.models)
+        self.assertEqual(728_000, session.data.price)
+        self.assertIn("مدلی تشخیص داده نشد", calls["edits"][-1]["text"])
 
 
 @needs_flow
@@ -670,7 +799,7 @@ class TestFlowGuard(FlowStateTestCase):
     def test_every_flow_is_registered(self):
         # «شارژ محصول موجود» shares the builder's conversation but is its own flow to close:
         # an approved diff must not outlive the start of a new product.
-        self.assertEqual(flow_guard.registered(), ["compress", "product", "restock"])
+        self.assertEqual(flow_guard.registered(), ["admin_add", "compress", "parser_test", "product", "restock", "tracking"])
 
     def test_product_closer_reports_and_cleans(self):
         session = PF.ProductSession(mode="new")

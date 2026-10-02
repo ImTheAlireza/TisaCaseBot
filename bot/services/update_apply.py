@@ -25,10 +25,8 @@ difference, and only the rest is sent.
 """
 from __future__ import annotations
 
-import html
 import json
 import logging
-import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -37,7 +35,8 @@ from typing import Any
 import httpx
 
 from bot.config import settings
-from bot.services import product_match, update_plan, woocommerce_direct
+from bot.services import woo_fencing, product_match, update_plan, woocommerce_direct
+from bot.services.woo_contract import human_fields, field_errors, json_body, positive_id, same_values
 from bot.services.color_matrix import is_color_attribute
 from bot.services.woo_client import (
     Audit,
@@ -78,6 +77,7 @@ class ApplyResult:
     #: old variations left in place because something before them was not confirmed
     skipped_deletes: int = 0
     dry_run: bool = False
+    created_ids: set[int] = field(default_factory=set, repr=False)
 
     @property
     def changed(self) -> bool:
@@ -132,6 +132,7 @@ async def apply(plan: update_plan.UpdatePlan, files: Sequence[Path] = (), *,
     async with WooClient(audit=trace, dry_run=dry_run, transport=transport,
                          min_request_interval=woocommerce_direct.PUBLISH_MIN_REQUEST_INTERVAL_SECONDS,
                          max_concurrent_requests=1) as client:
+        await woo_fencing.require(client, base)
         uploads: list[tuple[int, Path]] = []
         if plan.images_new:
             try:
@@ -160,7 +161,13 @@ async def _write_product(client: WooClient, base: str, plan: update_plan.UpdateP
     if not body:
         return True
     try:
-        response = await client.put(f"{base}/{plan.product_id}", json=body)
+        guarded = dict(body) | {"tisa_fence": True, "tisa_expected_fields": {
+            key: value for key, value in plan.expected_fields.items() if key in body
+        }}
+        if "stock_quantity" in body:
+            guarded["tisa_expected_stock"] = {"quantity": plan.product_before.get("stock"),
+                                               "managed": plan.product_before.get("manage_stock", False)}
+        response = await client.put(f"{base}/{plan.product_id}", json=guarded)
     except (WooCommerceAPIError, httpx.HTTPError) as exc:
         result.errors.append(f"نوشتن خود محصول ناموفق بود: {describe_exception(exc)}")
         trace.log(f"[update] PUT products/{plan.product_id} ERROR {exc}")
@@ -171,9 +178,18 @@ async def _write_product(client: WooClient, base: str, plan: update_plan.UpdateP
         result.errors.append(_human(response))
         trace.log(f"[update] product {plan.product_id} FAILED {response.status_code}")
         return False
-    bad = _contradictions(body, _json(response))
+    got = _json(response)
+    bad = field_errors(body, got, expected_id=plan.product_id)
     if bad:
-        result.errors.append("فروشگاه این را نپذیرفت یا برنگرداند: " + "، ".join(bad))
+        # A stripped echo is not a pass, but one GET may prove the requested values.
+        try:
+            reread = await client.get(f"{base}/{plan.product_id}")
+            if reread.is_success:
+                bad = field_errors(body, _json(reread), expected_id=plan.product_id)
+        except (WooCommerceAPIError, httpx.HTTPError):
+            pass
+    if bad:
+        result.errors.append("فروشگاه این را نپذیرفت یا برنگرداند: " + human_fields(bad))
         trace.log(f"[update] product {plan.product_id}: جواب فروشگاه با چیزی که فرستادیم نمی‌خواند ({bad})")
         return False
     result.product_updated = True
@@ -182,50 +198,10 @@ async def _write_product(client: WooClient, base: str, plan: update_plan.UpdateP
     return True
 
 
-def _num(raw: object) -> int | None:
-    try:
-        return int(float(str(raw).replace(",", "")))
-    except (TypeError, ValueError):
-        return None
-
-
-def _norm(text: object) -> str:
-    return re.sub(r"\s+", " ", str(text or "")).strip().casefold()
-
 
 def _contradictions(sent: dict[str, Any], got: Any) -> list[str]:
-    """What the shop's answer disagrees with. An answer that does not carry a field proves nothing,
-    so only fields that came back are compared — but a field that came back different is a no."""
-    if not isinstance(got, dict):
-        return []
-    bad: list[str] = []
-    if ("name" in sent and "name" in got
-            and _norm(html.unescape(str(sent["name"]))) != _norm(html.unescape(str(got["name"])))):
-        bad.append("عنوان")
-    for key, label in (("regular_price", "قیمت"), ("sale_price", "قیمت ویژه"),
-                       ("stock_quantity", "موجودی")):
-        if key in sent and key in got and _num(sent[key]) != _num(got[key]):
-            bad.append(label)
-    if "stock_status" in sent and "stock_status" in got and sent["stock_status"] != got["stock_status"]:
-        bad.append("وضعیت موجودی")
-    if "images" in sent and isinstance(got.get("images"), list):
-        want = [int(image.get("id") or 0) for image in sent["images"]]
-        have = [int(image.get("id") or 0) for image in got["images"] if isinstance(image, dict)]
-        if want != have:
-            bad.append("تصاویر")
-    if "attributes" in sent and isinstance(got.get("attributes"), list):
-        theirs = {_norm(item.get("name")): {_norm(option) for option in item.get("options") or []}
-                  for item in got["attributes"] if isinstance(item, dict)}
-        for item in sent["attributes"]:
-            if not item.get("variation"):
-                continue
-            options = {_norm(option) for option in item.get("options") or []}
-            if theirs.get(_norm(item.get("name"))) != options:
-                bad.append(f"گزینه‌های «{item.get('name')}»")
-    return bad
+    return field_errors(sent, got)
 
-
-# — the variations —
 
 async def _write_variations(client: WooClient, base: str, plan: update_plan.UpdatePlan,
                             uploads: Sequence[tuple[int, Path]], result: ApplyResult,
@@ -239,9 +215,11 @@ async def _write_variations(client: WooClient, base: str, plan: update_plan.Upda
     # (no twin) would look like a complete product that simply has fewer colours.
     for create in sorted(plan.creates, key=lambda row: row.replaces is None):
         color = next((value for name, value in create.combo if is_color_attribute(name)), "")
-        creates.append(create.payload(image_id=by_color.get(color, 0)))
+        creates.append(create.payload(image_id=by_color.get(color, 0)) | {"tisa_fence": True})
     work: list[tuple[str, dict[str, Any]]] = (
-        [("create", row) for row in creates] + [("update", row.payload()) for row in plan.updates])
+        [("create", row) for row in creates] + [("update", row.payload() | {"tisa_fence": True}
+          | ({"tisa_expected_stock": plan.expected_stocks[row.variation_id]}
+             if row.stock is not None and row.variation_id in plan.expected_stocks else {})) for row in plan.updates])
     for start in range(0, len(work), BATCH_SIZE):
         chunk = work[start:start + BATCH_SIZE]
         await _write_chunk(client, base, plan.product_id,
@@ -249,7 +227,7 @@ async def _write_variations(client: WooClient, base: str, plan: update_plan.Upda
                            [row for kind, row in chunk if kind == "update"], result, trace)
     if not plan.deletes:
         return
-    if result.failed or result.unconfirmed:
+    if result.failed or result.unconfirmed or result.errors:
         result.skipped_deletes = len(plan.deletes)
         result.errors.append("واریژن‌های قدیمی حذف نشدند چون ساخت یا به‌روزرسانی کامل تأیید نشد؛ "
                              "دوباره اپدیت را بزن.")
@@ -289,12 +267,34 @@ async def _write_chunk(client: WooClient, base: str, product_id: int, creates: l
         trace.log(f"[update] batch FAILED {response.status_code}")
         return
     data = _json(response)
-    made = [row for row in _rows(data, "create") if _was_made(row)]
-    result.created += len(made)
-    missing = len(creates) - len(made)
-    if missing > 0:
-        reasons = [_row_error(row) for row in _rows(data, "create") if not _was_made(row)]
-        result.failed.append(f"{missing} واریژن تازه ساخته نشد" + (f" ({reasons[0]})" if reasons and reasons[0] else ""))
+    rows = _rows(data, "create")
+    confirmed = 0
+    seen_ids = result.created_ids
+    for index, sent in enumerate(creates):
+        got = rows[index] if index < len(rows) else None
+        try:
+            recovered = await woo_fencing.recover_variation(client, f"{base}/{product_id}/variations", sent, got)
+        except WooCommerceAPIError as exc:
+            result.failed.append(str(exc))
+            continue
+        if recovered is not None:
+            got = recovered
+        variation_id = positive_id(got)
+        if variation_id and variation_id not in seen_ids and not _same_value(sent, got):
+            try:
+                reread = await client.get(f"{base}/{product_id}/variations/{variation_id}")
+                if reread.is_success:
+                    got = _json(reread)
+            except (WooCommerceAPIError, httpx.HTTPError):
+                pass
+        if variation_id and variation_id not in seen_ids and _same_value(sent, got):
+            seen_ids.add(variation_id)
+            confirmed += 1
+        else:
+            result.failed.append(f"ساخت {_name(sent)} تأیید نشد: قیمت/گزینه/موجودی یا پاسخ معتبر نیست")
+    if len(rows) != len(creates):
+        result.errors.append("تعداد پاسخ ساخت واریژن با تعداد درخواست یکی نیست")
+    result.created += confirmed
     echoed = {int(row.get("id") or 0): row for row in _rows(data, "update")}
     for row in updates:
         variation_id = int(row["id"])
@@ -321,7 +321,23 @@ async def _single_create(client: WooClient, base: str, product_id: int, row: dic
         result.failed.append(f"ساخت {_name(row)} ناموفق")
         return
     got = _json(response)
-    if response.is_success and isinstance(got, dict) and int(got.get("id") or 0) > 0:
+    try:
+        recovered = await woo_fencing.recover_variation(client, f"{base}/{product_id}/variations", row, got)
+    except WooCommerceAPIError as exc:
+        result.failed.append(str(exc))
+        return
+    if recovered is not None:
+        got = recovered
+    accepted = response.is_success or recovered is not None
+    if accepted and positive_id(got) and not _same_value(row, got):
+        try:
+            reread = await client.get(f"{base}/{product_id}/variations/{positive_id(got)}")
+            if reread.is_success:
+                got = _json(reread)
+        except (WooCommerceAPIError, httpx.HTTPError):
+            pass
+    if accepted and _same_value(row, got) and positive_id(got) not in result.created_ids:
+        result.created_ids.add(positive_id(got))
         result.created += 1
         trace.log(f"[update] POST products/{product_id}/variations → {got.get('id')}")
         return
@@ -411,7 +427,8 @@ async def _single_delete(client: WooClient, base: str, product_id: int, variatio
         result.errors.append(describe_exception(exc))
         result.failed.append(f"واریژن {variation_id} حذف نشد")
         return
-    if response.is_success:
+    if response.status_code == 404 or (response.is_success and isinstance(_json(response), dict)
+            and (positive_id(_json(response)) == variation_id or _json(response).get("deleted") is True)):
         result.deleted += 1
         trace.log(f"[update] DELETE products/{product_id}/variations/{variation_id}")
         return
@@ -422,11 +439,7 @@ async def _single_delete(client: WooClient, base: str, product_id: int, variatio
 # — reading the shop's answers —
 
 def _json(response: httpx.Response) -> Any:
-    try:
-        return response.json()
-    except ValueError:
-        return None
-
+    return json_body(response)
 
 def _rows(data: Any, key: str) -> list[dict[str, Any]]:
     """The ``create`` / ``update`` / ``delete`` list of a batch answer; some hosts send a bare list."""
@@ -441,7 +454,7 @@ def _rows(data: Any, key: str) -> list[dict[str, Any]]:
 
 def _was_made(row: dict[str, Any]) -> bool:
     """A batch row that carries an id and no error object is a row the shop really handled."""
-    return int(row.get("id") or 0) > 0 and not row.get("error")
+    return positive_id(row) > 0 and not row.get("error")
 
 
 def _row_error(row: dict[str, Any]) -> str:
@@ -451,16 +464,9 @@ def _row_error(row: dict[str, Any]) -> str:
     return ""
 
 
-def _same_value(sent: dict[str, Any], got: dict[str, Any]) -> bool:
-    """Did the shop give back what we asked for? WooCommerce answers prices as strings."""
-    for key in WRITTEN:
-        if key not in sent:
-            continue
-        have = got.get(key)
-        if str(sent[key]) != str(have if have is not None else ""):
-            return False
-    return True
-
+def _same_value(sent: dict[str, Any], got: Any) -> bool:
+    """All requested fields, including attrs/image/status, must be confirmed."""
+    return same_values(sent, got, variation=True)
 
 def _name(row: dict[str, Any]) -> str:
     values = [str(item.get("option")) for item in row.get("attributes") or [] if isinstance(item, dict)]

@@ -24,7 +24,9 @@ from dataclasses import dataclass, field
 from typing import Any
 from collections.abc import Iterable, Sequence
 
+from bot.services.airpods_parser import AIRPODS_ATTRIBUTE, split_device_axes
 from bot.services.color_matrix import (
+    VariationLimitError,
     build_combinations,
     is_model_attribute,
     restrict_combinations,
@@ -60,6 +62,7 @@ class VariationPlan:
     matrix_missing: list[tuple[str, str]] = field(default_factory=list)
     matrix_axis_errors: list[str] = field(default_factory=list)
     matrix_unavailable: int = 0
+    capacity_error: str = ""
 
     @property
     def count(self) -> int:
@@ -115,6 +118,8 @@ class VariationPlan:
         )
 
     def summary(self) -> str:
+        if self.capacity_error:
+            return "⛔ " + self.capacity_error
         if not self.axes:
             # The dropped axes must still be named here: three colour lines that
             # were one color are something the seller can fix, and a card that
@@ -193,18 +198,23 @@ def build_plan(
     * every attribute needs ≥ 2 distinct values after dedupe, otherwise it is
       part of the product name, not a variation axis;
     * an attribute named like the model axis never duplicates it;
+    * phone + AirPods posts use separate «مدل» / «ایرپاد» axes, including
+      singleton device options (an explicitly mixed product stays variable);
+    * AirPods-only posts keep their compatibility options on «مدل»;
     * colours are then restricted to the pairs the seller actually listed.
     """
-    clean_models = clean_values(models)
+    routed_models, routed_attributes = split_device_axes(models, attributes)
+    clean_models = clean_values(routed_models)
+    mixed_airpods = bool(clean_models and routed_attributes.get(AIRPODS_ATTRIBUTE))
     axes: list[tuple[str, list[str]]] = []
     dropped: list[tuple[str, int, int]] = []
     used: set[str] = set()
 
-    if len(clean_models) >= 2:
+    if len(clean_models) >= 2 or mixed_airpods:
         axes.append((model_axis_name, clean_models))
         used.add(model_axis_name.casefold())
 
-    for name, values in (attributes or {}).items():
+    for name, values in routed_attributes.items():
         attribute_name = re.sub(r"\s+", " ", str(name)).strip()
         raw = clean_values(values if isinstance(values, (list, tuple, set)) else [values])
         if not attribute_name or attribute_name.casefold() in used or is_model_attribute(attribute_name):
@@ -212,7 +222,7 @@ def build_plan(
                 dropped.append((attribute_name, len(raw), 0))
             continue
         used.add(attribute_name.casefold())
-        if len(raw) < 2:
+        if len(raw) < (1 if mixed_airpods and attribute_name == AIRPODS_ATTRIBUTE else 2):
             if len(list(values or [])) >= 2:
                 dropped.append((attribute_name, len(list(values or [])), len(raw)))
             continue
@@ -221,9 +231,13 @@ def build_plan(
     clean_restrictions = {
         str(model): clean_values(colors)
         for model, colors in (restrictions or {}).items()
-        if clean_values(colors)
     }
-    combos = build_combinations(axes, clean_restrictions)
+    capacity_error = ""
+    try:
+        combos = build_combinations(axes, clean_restrictions)
+    except VariationLimitError as exc:
+        capacity_error = str(exc)
+        combos = []
     if len(axes) > 1 and len(clean_restrictions) > 1:
         # ``build_combinations`` may fall back to the unfiltered matrix when a
         # naming mismatch makes the restriction unusable; keep the real count.
@@ -289,7 +303,7 @@ def build_plan(
         stock_matrix=matrix,
         matrix_missing=matrix_missing,
         matrix_axis_errors=list(dict.fromkeys(matrix_axis_errors)),
-        matrix_unavailable=matrix_unavailable,
+        matrix_unavailable=matrix_unavailable, capacity_error=capacity_error,
     )
 
 

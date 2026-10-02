@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from bot.services import color_matrix, money, phone_parser
+from bot.services.airpods_parser import AIRPODS_HEADER_RE, extract_airpods_models
 
 CAPTION = "caption"
 FILENAME = "filename"
@@ -384,7 +385,7 @@ def classify_line(line: str) -> tuple[str, ...]:
         return ()
     roles: list[str] = []
     meta = bool(_META_KEY_RE.match(text))
-    if _SECTION_RE.match(text):
+    if _SECTION_RE.match(text) or AIRPODS_HEADER_RE.fullmatch(text):
         # A header line is nothing but a header: «Samsung» must not also be read
         # as a model or as prose, or the first product's section leaks into the
         # count of models.
@@ -398,7 +399,7 @@ def classify_line(line: str) -> tuple[str, ...]:
     # «۱۵ اولترا» is a model line only once the Persian variant words are read;
     # without this it looked like prose and was chosen as the product title.
     folded = phone_parser.fold_variant_words(text)
-    if money.is_modelish(text) or phone_parser.extract_phone_models(folded) or is_bare_model(folded):
+    if money.is_modelish(text) or phone_parser.extract_phone_models(folded) or extract_airpods_models(text) or is_bare_model(folded):
         roles.append(ROLE_MODEL)
     if color_matrix.extract_colors(text, allow_unknown=False):
         roles.append(ROLE_COLORS)

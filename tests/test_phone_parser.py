@@ -18,6 +18,8 @@ import unittest
 os.environ.setdefault("BOT_TOKEN", "123456:TEST")
 os.environ.setdefault("SUDO_IDS", "1")
 
+from _product_samples import MASA_POLO_CAPTION, MASA_POLO_MODELS
+
 from bot.services.phone_parser import (
     extract_iphone_models,
     extract_phone_models,
@@ -132,6 +134,22 @@ class TestRealModelLinesStillWork(unittest.TestCase):
         self.assertEqual(_labels("Apple\n15max"), ["iPhone 15 Pro Max"])
         self.assertEqual(_labels("Apple\n16 پلاس"), ["iPhone 16 Plus"])
         self.assertEqual(_labels("Apple\n15 مینی"), ["iPhone 15 Mini"])
+
+
+class TestMasaPoloCaption(unittest.TestCase):
+    def test_every_compatibility_group_is_preserved(self):
+        labels = [model.label for model in extract_phone_models(MASA_POLO_CAPTION)]
+        self.assertEqual(MASA_POLO_MODELS, labels)
+
+    def test_canonical_list_can_be_parsed_again_without_losing_models(self):
+        canonical = " | ".join(MASA_POLO_MODELS)
+        self.assertEqual(canonical, normalize_caption(canonical))
+
+    def test_repeated_brand_inside_slash_and_pipe_groups(self):
+        self.assertEqual(
+            "iPhone 12/12 Pro | iPhone 17 Pro/18 Pro",
+            normalize_caption("iPhone 12/iPhone 12Pro | iPhone 18Pro/iPhone 17Pro"),
+        )
 
 
 class TestGroupedXiaomiListing(unittest.TestCase):

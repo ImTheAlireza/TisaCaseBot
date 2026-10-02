@@ -27,10 +27,11 @@ small, human-readable, and deleting it costs nothing but history.
 from __future__ import annotations
 
 import time
+import uuid
 from typing import Any
 from collections.abc import Iterable
 
-from bot.services.jsonstore import lock_for, read_json, write_json
+from bot.services.jsonstore import checked_write, lock_for, read_json, write_json
 from bot.config import data_dir
 
 DATA_DIR = data_dir()
@@ -53,8 +54,8 @@ def _load() -> list[dict[str, Any]]:
 
 
 def new_key(user_id: int | str) -> str:
-    """Identifier used by ``products:open:<key>`` — time-based, unique per second."""
-    return f"{int(time.time())}{abs(hash(str(user_id))) % 997:03d}"
+    """Collision-resistant card key; fits Telegram's 64-byte callback limit."""
+    return uuid.uuid4().hex[:24]
 
 
 def record(
@@ -126,7 +127,7 @@ def record(
     with _lock:
         entries = _load()
         entries.insert(0, entry)
-        write_json(FILE, {"version": 1, "entries": entries[:MAX_ENTRIES]})
+        checked_write(FILE, {"version": 1, "entries": entries[:MAX_ENTRIES]}, write_json)
     _count(entry)
     return entry
 
@@ -174,7 +175,7 @@ def update(key: str, **fields: Any) -> dict[str, Any] | None:
                 entry.update({k: v for k, v in fields.items() if v is not None or k == "product_id"})
                 entry["done_ts"] = time.time()
                 entries[index] = entry
-                write_json(FILE, {"version": 1, "entries": entries[:MAX_ENTRIES]})
+                checked_write(FILE, {"version": 1, "entries": entries[:MAX_ENTRIES]}, write_json)
                 _count(entry, previous=previous)
                 return entry
     return None
@@ -209,7 +210,7 @@ def clear() -> int:
     """Forget the history (sudo panel). Returns how many cards were dropped."""
     with _lock:
         count = len(_load())
-        write_json(FILE, {"version": 1, "entries": []})
+        checked_write(FILE, {"version": 1, "entries": []}, write_json)
     return count
 
 

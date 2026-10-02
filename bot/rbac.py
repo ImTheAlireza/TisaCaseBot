@@ -29,11 +29,12 @@ therefore cannot open anything, and the owner sees exactly what is waiting.
 from __future__ import annotations
 
 import logging
+import math
 import secrets
 import time
 
 from bot.config import settings
-from bot.services.jsonstore import lock_for, read_json, write_json
+from bot.services.jsonstore import checked_write, lock_for, read_json, write_json
 from bot.config import data_dir
 
 logger = logging.getLogger(__name__)
@@ -67,7 +68,7 @@ def sudo_ids() -> frozenset[int]:
 
 def _load() -> dict:
     """Return the stored ``{"admins": {id: {...}}}`` dict (empty if missing)."""
-    data = read_json(ROLES_FILE, None)
+    data = read_json(ROLES_FILE, None, recover=False)
     if not isinstance(data, dict):
         return {"admins": {}}
     admins = data.get("admins")
@@ -78,7 +79,7 @@ def _load() -> dict:
 
 def _save(data: dict) -> None:
     with _lock:
-        write_json(ROLES_FILE, data)
+        checked_write(ROLES_FILE, data, write_json)
 
 
 # --- Admins -------------------------------------------------------------------
@@ -98,7 +99,7 @@ def pending_invites() -> dict:
     out: dict[str, dict] = {}
     for uid, record in _load()["admins"].items():
         if isinstance(record, dict) and record.get("pending"):
-            if now - float(record.get("ts", 0)) > INVITE_TTL_SECONDS:
+            if not _invite_current(record, now):
                 continue
             out[str(uid)] = dict(record)
     return out
@@ -133,7 +134,7 @@ def add_admin(user_id: int, *, name: str = "", added_by: int | None = None) -> N
             "added_by": added_by,
             "ts": time.time(),
         }
-        write_json(ROLES_FILE, data)
+        checked_write(ROLES_FILE, data, write_json)
     logger.info("Admin added: user %s (%s) by %s", user_id, name, added_by)
 
 
@@ -151,9 +152,17 @@ def issue_invite(user_id: int, *, name: str = "", added_by: int | None = None) -
             "code": code,
         })
         data["admins"][str(user_id)] = record
-        write_json(ROLES_FILE, data)
+        checked_write(ROLES_FILE, data, write_json)
     logger.info("Admin invite issued for user %s by %s", user_id, added_by)
     return code
+
+
+def _invite_current(record: dict, now: float) -> bool:
+    try:
+        issued = float(record.get("ts", 0))
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(issued) and 0 <= now - issued < INVITE_TTL_SECONDS
 
 
 def confirm_invite(user_id: int, code: str) -> bool:
@@ -166,13 +175,15 @@ def confirm_invite(user_id: int, code: str) -> bool:
         record = data["admins"].get(str(user_id))
         if not isinstance(record, dict) or not record.get("pending"):
             return False
-        if str(record.get("code", "")).upper() != code:
+        if not _invite_current(record, time.time()):
+            return False
+        if not secrets.compare_digest(str(record.get("code", "")).upper(), code):
             return False
         record.pop("pending", None)
         record.pop("code", None)
         record["accepted_at"] = time.time()
         data["admins"][str(user_id)] = record
-        write_json(ROLES_FILE, data)
+        checked_write(ROLES_FILE, data, write_json)
     logger.info("Admin invite accepted by user %s", user_id)
     return True
 
@@ -185,7 +196,7 @@ def cancel_invite(user_id: int) -> bool:
         if not isinstance(record, dict) or not record.get("pending"):
             return False
         data["admins"].pop(str(user_id), None)
-        write_json(ROLES_FILE, data)
+        checked_write(ROLES_FILE, data, write_json)
     logger.info("Admin invite cancelled for user %s", user_id)
     return True
 
@@ -196,7 +207,7 @@ def remove_admin(user_id: int) -> bool:
         data = _load()
         removed = data["admins"].pop(str(user_id), None) is not None
         if removed:
-            write_json(ROLES_FILE, data)
+            checked_write(ROLES_FILE, data, write_json)
     if removed:
         logger.info("Admin removed: user %s", user_id)
     return removed

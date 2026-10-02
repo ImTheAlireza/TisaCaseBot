@@ -8,13 +8,14 @@ from telegram import Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 from bot import rbac
+from bot.services import flow_guard
 from bot.constants import CB, DENIED_TEXT
 from bot.keyboards import main_menu_keyboard, main_menu_text
 
 logger = logging.getLogger(__name__)
 
 
-def _deny(update: Update) -> None:
+async def _deny(update: Update) -> None:
     """Log + reply to a user who is not allowed to use the bot."""
     user = update.effective_user
     if user:
@@ -23,10 +24,10 @@ def _deny(update: Update) -> None:
             user.id, user.username, rbac.role(user.id),
         )
     if update.callback_query:
-        update.callback_query.answer("⛔ دسترسی ندارید.", show_alert=True)
+        await update.callback_query.answer("⛔ دسترسی ندارید.", show_alert=True)
     elif update.effective_message:
         user_id = update.effective_user.id if update.effective_user else "نامشخص"
-        update.effective_message.reply_text(
+        await update.effective_message.reply_text(
             f"{DENIED_TEXT}\n\nشناسه تلگرام شما: {user_id}\n"
             "این عدد باید در SUDO_IDS فایل .env قرار داشته باشد."
         )
@@ -48,9 +49,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
             return
     if not user or not rbac.is_allowed(user.id):
-        _deny(update)
+        await _deny(update)
         return
 
+    flow_guard.close_others("", user.id)
     logger.info("User %s (%s) opened the main menu — role %s",
                 user.id, user.username, rbac.role(user.id))
     await update.effective_message.reply_html(
@@ -63,9 +65,10 @@ async def cb_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     query = update.callback_query
     user = update.effective_user
     if not user or not rbac.is_allowed(user.id):
-        _deny(update)
+        await _deny(update)
         return
 
+    flow_guard.close_others("", user.id)
     await query.answer()
     await query.edit_message_text(
         main_menu_text(user.id, user),

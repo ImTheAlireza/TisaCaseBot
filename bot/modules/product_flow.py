@@ -21,8 +21,9 @@ import importlib.util
 import html
 import json
 import logging
+import secrets
+import uuid
 import re
-import shutil
 import time
 import traceback
 from contextlib import AsyncExitStack, asynccontextmanager
@@ -34,13 +35,18 @@ from typing import Any
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.constants import ChatAction
 from telegram.error import BadRequest, TimedOut, NetworkError
-from telegram.ext import Application, CallbackQueryHandler, ContextTypes, ConversationHandler, CommandHandler, MessageHandler, filters
+from telegram.ext import Application, ContextTypes, ConversationHandler, CommandHandler, MessageHandler, filters
 
 from bot import rbac
 from bot import __version__ as _BOT_VERSION
 from bot.buttons import feature_allowed
+from bot.services.access import guard_feature
+from bot.services import callbacks, worker
+from bot.services.callbacks import SessionCallbackHandler
+from functools import wraps
 from bot.config import settings
 from bot.constants import CB
+from bot.services.conversations import FlowConversationHandler
 from bot.keyboards import main_menu_keyboard, main_menu_text, result_card, result_keyboard
 from bot.modules import outbox_flow, restock_flow
 from bot.services import (
@@ -61,6 +67,12 @@ from bot.services import (
 )
 from bot.services import postmodel as ev, product_journal
 from bot.services.ai_normalizer import ai_client_session, ai_normalize
+from bot.services.airpods_parser import (
+    AIRPODS_ATTRIBUTE,
+    airpods_category_leaves,
+    canonical_airpods_model,
+    split_device_axes,
+)
 from bot.services.category_taxonomy import FORBIDDEN, TAXONOMY, apply_sku_category_policy
 from bot.services.color_matrix import (
     is_color_attribute,
@@ -68,7 +80,7 @@ from bot.services.color_matrix import (
     parse_color_matrix,
     prune_unused_colors,
 )
-from bot.services.phone_parser import normalize_caption, unmatched_model_words
+from bot.services.phone_parser import normalize_product_models, unmatched_model_words
 from bot.services import vocabulary
 from bot.services.plan import plan_from_dict
 from bot.services.stock_matrix import parse_stock_matrix_sources, strip_stock_matrix_sections
@@ -122,6 +134,7 @@ class _DraftSnapshot:
     dismissed: list[str]
     last_extract_hash: str
     color_summary: str
+    media_error: str
 
 
 @dataclass
@@ -159,6 +172,17 @@ class ProductSession:
     #: a half-failed write must not upload (and orphan) the same pictures a second time.
     gallery_applied: bool = False
     processing_media: bool = False
+    media_jobs: int = 0
+    extraction_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    media_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    media_tasks: set[asyncio.Task] = field(default_factory=set, repr=False)
+    closed: bool = False
+    media_sequence: int = 0
+    nonce: str = field(default_factory=lambda: secrets.token_hex(8))
+    revision: int = 0
+    proof_required: bool = False
+    forced_batch_id: str = ""
+    media_error: str = ""
     # Human-readable trace of the detected per-model color matrix (for the log group).
     color_summary: str = ""
     # Everything this session writes on disk lives under ONE directory so that a
@@ -209,6 +233,71 @@ album_tasks: dict[tuple[int, str], asyncio.Task] = {}
 logger = logging.getLogger(__name__)
 
 
+def _feature_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
+    user = update.effective_user
+    session = sessions.get(user.id if user else 0)
+    return "product_restock" if (session and session.mode == "update") or (user and user.id in restock_flow.sessions) else "product_new"
+
+
+def _owned_callback(callback):
+    @wraps(callback)
+    async def owned(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        user = getattr(update, "effective_user", None) or getattr(query, "from_user", None)
+        session = sessions.get(user.id if user else 0) or restock_flow.sessions.get(user.id if user else 0)
+        if query is not None:
+            action, nonce, revision = callbacks.split(query.data)
+            lifetime = action in {"product:cancel", "product:mediaend", "product:addmore", CB.MAIN_MENU}
+            valid = session is not None and nonce == session.nonce and (lifetime or revision == session.revision)
+            if not nonce and session is not None and not session.proof_required:
+                # Old, unsigned cards are only valid for the known current card.
+                message_id = getattr(query.message, "message_id", None)
+                valid = getattr(session, "status_message_id", None) is None or message_id == session.status_message_id
+            if not valid:
+                await query.answer("این دکمه متعلق به پیش‌نمایش قبلی است؛ از کارت تازه استفاده کن.", show_alert=True)
+                return None
+        if isinstance(session, ProductSession) and user and _pending_media(user.id, session):
+            action = callbacks.action(query)
+            if action not in {"product:cancel", "product:mediaend", CB.MAIN_MENU, "product:confirm"}:
+                await query.answer("⏳ دستهٔ عکس هنوز آماده نیست؛ پس از پیش‌نمایش تازه ویرایش کن.")
+                return None
+        return await callback(update, context)
+    return owned
+
+
+def _commit_draft(session: ProductSession, data: ProductData) -> None:
+    if session.closed or (session.user_id and sessions.get(session.user_id) is not session):
+        raise asyncio.CancelledError
+    session.revision += 1
+    session.data = data
+
+
+def _bound(session: ProductSession, markup: InlineKeyboardMarkup | None) -> InlineKeyboardMarkup | None:
+    session.proof_required = True
+    return callbacks.bind(markup, session.nonce, session.revision)
+
+
+def _pending_media(user_id: int, session: ProductSession) -> bool:
+    return bool(session.processing_media or session.media_jobs
+                or any(key[0] == user_id and values for key, values in album_buffers.items())
+                or any(key[0] == user_id and not task.done() for key, task in album_tasks.items()))
+
+
+def _live(user_id: int, session: ProductSession) -> bool:
+    return not session.closed and sessions.get(user_id) is session
+
+
+async def _gather_owned(jobs) -> list:
+    tasks = [asyncio.create_task(job) for job in jobs]
+    try:
+        return list(await asyncio.gather(*tasks))
+    finally:
+        for task in tasks:
+            if not task.done() and not task.cancelling():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
 async def _edit_message_if_changed(target: Any, *args: Any, **kwargs: Any) -> bool:
     """Treat Telegram's idempotent "message is not modified" response as a no-op.
 
@@ -216,6 +305,10 @@ async def _edit_message_if_changed(target: Any, *args: Any, **kwargs: Any) -> bo
     still contains the same validation text). That is not an operational failure; other
     Telegram errors remain visible to the caller.
     """
+    actor = getattr(getattr(target, "from_user", None), "id", None)
+    session = sessions.get(actor or 0)
+    if session and "reply_markup" in kwargs:
+        kwargs["reply_markup"] = _bound(session, kwargs["reply_markup"])
     try:
         await target.edit_message_text(*args, **kwargs)
         return True
@@ -362,6 +455,9 @@ async def _render_card(
     the card in place — it is already under the finger, and re-posting on every
     tap would only add traffic.
     """
+    if session.closed or (session.user_id and not _live(user_id, session)):
+        return None
+    reply_markup = _bound(session, reply_markup)
     bot = getattr(context, "bot", None)
     if bot is None:
         raise RuntimeError("product card cannot be rendered without a Telegram bot")
@@ -689,6 +785,8 @@ def _record_result(
     return products_ledger.record(user_id=user_id, batch_id=batch_id, key=key, **fields)  # type: ignore[arg-type]
 
 
+@guard_feature(_feature_key, on_denial=lambda uid: _cleanup(uid), checker=lambda uid, key: feature_allowed(uid, key))
+@_owned_callback
 async def show_preview(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
@@ -783,9 +881,33 @@ def _append_model_caption(existing: str, incoming: str) -> str:
         return old
     if not old:
         return new
-    if any(block.strip().casefold() == new.casefold() for block in old.split("\n\n")):
+    # A caption may itself contain blank lines. Splitting on \n\n loses its
+    # boundaries and re-adds it when a reply or the album worker sees it again.
+    # Compare complete lines so «iPhone 17» is not confused with «iPhone 17 Pro».
+    if f"\n{new.casefold()}\n" in f"\n{old.casefold()}\n":
         return old
     return f"{old}\n\n{new}"
+
+
+def _replied_model_caption(message: Message, session: ProductSession) -> str:
+    """Read the original post, not Telegram's possibly truncated reply quote.
+
+    Keep it in the caption source: the seller's current information message
+    must retain title/SKU/price precedence. Bot preview/guide text is output,
+    never input; supplier media captions can still be sent by another bot.
+    """
+    reply = getattr(message, "reply_to_message", None)
+    if reply is None:
+        return ""
+    reply_id = getattr(reply, "message_id", None)
+    if reply_id is not None and reply_id in {session.status_message_id, session.guide_message_id}:
+        return ""
+    caption = (getattr(reply, "caption", None) or "").strip()
+    if caption:
+        return caption
+    if getattr(getattr(reply, "from_user", None), "is_bot", False):
+        return ""
+    return (getattr(reply, "text", None) or "").strip()
 
 
 def _category_tree_lines(categories: Sequence[str]) -> list[str]:
@@ -1319,7 +1441,7 @@ def _extract_fingerprint(session: ProductSession) -> str:
 
 def _model_identity_set(value: str) -> set[str]:
     """Compare model identities independent of order and harmless spelling normalization."""
-    normalized = normalize_caption(value or "")
+    normalized = normalize_product_models(value or "")
     source = normalized or (value or "")
     return {part.strip().casefold() for part in source.split(" | ") if part.strip()}
 
@@ -1432,6 +1554,8 @@ def _remember(session: ProductSession) -> None:
     follows replaces lists inside the draft, and a shallow reference would then
     "restore" the very value the seller wants gone.
     """
+    session.revision += 1
+    session.forced_batch_id = ""
     session.history.append(
         _DraftSnapshot(
             data=copy.deepcopy(session.data),
@@ -1443,6 +1567,7 @@ def _remember(session: ProductSession) -> None:
             dismissed=list(session.dismissed),
             last_extract_hash=session.last_extract_hash,
             color_summary=session.color_summary,
+            media_error=session.media_error,
         )
     )
     del session.history[:-_UNDO_DEPTH]
@@ -1453,6 +1578,9 @@ def _restore(session: ProductSession) -> _DraftSnapshot | None:
     if not session.history:
         return None
     snapshot = session.history.pop()
+    session.media_error = snapshot.media_error
+    session.revision += 1
+    session.forced_batch_id = ""
     session.data = snapshot.data
     session.info_text = snapshot.info_text
     session.model_text = snapshot.model_text
@@ -1465,6 +1593,8 @@ def _restore(session: ProductSession) -> _DraftSnapshot | None:
     return snapshot
 
 
+@guard_feature(_feature_key, on_denial=lambda uid: _cleanup(uid), checker=lambda uid, key: feature_allowed(uid, key))
+@_owned_callback
 async def undo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """«↩️ برگرداندن به حالت قبل»: put the last draft back, exactly as it was.
 
@@ -1495,7 +1625,7 @@ async def undo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             user_id,
             session,
             "↩️ به حالت قبل برگشت. متن اطلاعات محصول را بفرست.",
-            reply_markup=_collect_keyboard(),
+            reply_markup=_bound(session, _collect_keyboard()),
         )
         await query.answer("↩️ به حالت قبل برگشت")
         return COLLECT
@@ -1507,7 +1637,18 @@ async def undo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return REVIEW
 
 
-async def _extract(session: ProductSession, *, learn: bool = True) -> ProductData:
+async def _extract(session: ProductSession, **kwargs) -> ProductData:
+    async with session.extraction_lock:
+        for _ in range(3):
+            before = (session.info_text, session.model_text, tuple(session.suppressed_colors))
+            data = await _extract_once(session, **kwargs)
+            if before == (session.info_text, session.model_text, tuple(session.suppressed_colors)):
+                return data
+            session.last_extract_hash = ""
+        raise ValueError("متن چند بار حین استخراج عوض شد؛ ارسال را متوقف کن و پیش‌نمایش تازه بگیر")
+
+
+async def _extract_once(session: ProductSession, *, learn: bool = True) -> ProductData:
     session.ai_diagnostics.clear()
     # ``learn=False`` is the parser-test sandbox: reading a sample must not add it
     # to the replay corpus of real products (see bot/services/learning_corpus.py).
@@ -1525,12 +1666,13 @@ async def _extract(session: ProductSession, *, learn: bool = True) -> ProductDat
     info_text = vocabulary.apply(session.info_text)
     stock_matrix = parse_stock_matrix_sources([("info", info_text), ("caption", caption_text)])
     model_source = strip_stock_matrix_sections(model_source)
-    deterministic = normalize_caption(model_source)
+    deterministic = normalize_product_models(model_source)
     if stock_matrix.models:
         deterministic = " | ".join(stock_matrix.models)
     # The old OPTION bot's AI normalizer is now the primary phone detector.
-    # Accessory families such as AirPods are handled separately because the
-    # phone normalizer deliberately rejects them. An empty caption/info block
+    # The same model request now includes AirPods compatibility models. The
+    # deterministic AirPods parser also protects them when AI is unavailable.
+    # An empty caption/info block
     # has nothing for AI to normalize, so do not spend a network round trip.
     # Product details may be split between the media caption and later
     # Telegram messages. The extractor must receive both texts in one request
@@ -1589,10 +1731,11 @@ async def _extract(session: ProductSession, *, learn: bool = True) -> ProductDat
             # explicitly asked to send price/title/features afterwards. Calling the
             # full extractor here used to make a second network AI round trip whose
             # result was never shown, then repeat it when PRODUCT INFO arrived.
-            session.data = ProductData(models=models)
+            primary, device_attributes = split_device_axes(models)
+            _commit_draft(session, ProductData(models=primary, attributes=device_attributes))
         else:
             extract_kwargs = {"client": ai_client} if ai_client is not None else {}
-            session.data = await extract_product(
+            extracted = await extract_product(
                 combined_text,
                 models,
                 TAXONOMY,
@@ -1602,6 +1745,7 @@ async def _extract(session: ProductSession, *, learn: bool = True) -> ProductDat
                 diagnostic=session.ai_diagnostics.append,
                 **extract_kwargs,
             )
+            _commit_draft(session, extracted)
     if stock_matrix.found and session.data is not None and session.data.models:
         session.models = list(session.data.models)
     if ai_model_guess and session.data.models:
@@ -1615,6 +1759,10 @@ async def _extract(session: ProductSession, *, learn: bool = True) -> ProductDat
         session.data.notes.append("فهرست مدل‌ها با برداشت هوش مصنوعی تغییر کرده؛ لطفاً بررسی کن")
     session.data.user_edits = carried_edits
     draft_edits.apply_locks(session.data)
+    session.data.models, session.data.attributes = split_device_axes(
+        session.data.models, session.data.attributes
+    )
+    session.models = list(session.data.models)
     # A value the owner already confirmed stays confirmed after a re-extraction:
     # the parser may read it from the AI again, but the shop has been told it is
     # right, and re-asking every time would train nobody but impatience.
@@ -1678,21 +1826,19 @@ async def _extract(session: ProductSession, *, learn: bool = True) -> ProductDat
         if " > " in category:
             parent_name = category.split(" > ", 1)[0].strip()
             normalized_categories = [x for x in normalized_categories if x != parent_name]
-    accessory_models = [x for x in session.models if x.casefold().startswith("airpods ")]
+    accessory_models = [model for model in session.models if canonical_airpods_model(model)]
+    accessory_models.extend(session.data.attributes.get(AIRPODS_ATTRIBUTE, []))
     if accessory_models:
         airpods_root = "لوازم جانبی ایرپاد > Apple AirPods"
-        normalized_categories = [airpods_root]
-        airpods_children = {
-            "1/2": "Airpods 1/2", "3": "Airpods 3", "4": "Airpods 4",
-            "pro": "Airpods Pro", "pro2": "Airpods Pro 2", "pro3": "Airpods Pro 3",
-        }
-        for model in accessory_models:
-            compact = re.sub(r"\s+", "", model.casefold())
-            for key, leaf in airpods_children.items():
-                if key in compact:
-                    path = airpods_root + " > " + leaf
-                    if path not in normalized_categories:
-                        normalized_categories.append(path)
+        # Mixed posts retain the phone-brand paths; AirPods-only posts do not
+        # inherit a phone category guessed by the AI.
+        phone_models = [model for model in session.models if not canonical_airpods_model(model)]
+        if not phone_models:
+            normalized_categories = []
+        normalized_categories.append(airpods_root)
+        normalized_categories.extend(
+            airpods_root + " > " + leaf for leaf in airpods_category_leaves(accessory_models)
+        )
     normalized_categories = apply_sku_category_policy(
         normalized_categories, session.data.sku_prefix
     )
@@ -1738,7 +1884,8 @@ def _apply_color_matrix(session: ProductSession, source_text: str) -> None:
         session.color_summary = "موجودی ماتریسی: طرح × دستهٔ گوشی"
         return
     matrix = parse_color_matrix(source_text)
-    restrictions = matrix.restrictions_for(session.models)
+    device_models = [*session.models, *data.attributes.get(AIRPODS_ATTRIBUTE, [])]
+    restrictions = matrix.restrictions_for(device_models)
     for label, colors in (data.model_colors or {}).items():
         if colors and label not in restrictions:
             restrictions[label] = list(colors)
@@ -1750,7 +1897,7 @@ def _apply_color_matrix(session: ProductSession, source_text: str) -> None:
 
     color_name = next((name for name in data.attributes if is_color_attribute(name)), "رنگ")
     options = matrix.all_colors(extra=data.attributes.get(color_name, []))
-    options = prune_unused_colors(options, session.models, restrictions)
+    options = prune_unused_colors(options, device_models, restrictions)
     if len(options) < 2:
         return
     # Keep the original attribute position and merge duplicate color axes
@@ -1814,12 +1961,29 @@ async def _prepare_files(user_id: int, messages: list[Message], context: Context
         # user «خطا در پردازش عکس‌ها» after they pressed «❌ لغو» was not.
         logger.info("album flushed after the session ended (user %s) — ignored", user_id)
         return
+    session.user_id = user_id
+    session.media_jobs += 1
     session.processing_media = True
+    task = asyncio.current_task()
+    if task is not None:
+        session.media_tasks.add(task)
     try:
-        async with _typing_indicator(context, user_id, session):
-            await _prepare_files_impl(user_id, messages, context)
+        async with session.media_lock:
+            if not _live(user_id, session):
+                return
+            async with _typing_indicator(context, user_id, session):
+                try:
+                    await _prepare_files_impl(user_id, messages, context)
+                except Exception as exc:
+                    session.media_error = str(exc)
+                    session.revision += 1
+                    raise
     finally:
-        session.processing_media = False
+        session.media_jobs -= 1
+        session.processing_media = session.media_jobs > 0
+        if task is not None:
+            session.media_tasks.discard(task)
+
 
 
 async def _prepare_files_impl(user_id: int, messages: list[Message], context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1830,10 +1994,12 @@ async def _prepare_files_impl(user_id: int, messages: list[Message], context: Co
     # same product instead of orphaning the first download set on disk.
     root = session.workspace or workspace.new_dir(TEMP_DIR, user_id)
     session.workspace = root
+    workspace.protect(root)
+    session.media_sequence += 1
+    batch_sequence = session.media_sequence
     await _telegram_log(context, f"[product:{user_id}] شروع پردازش رسانه؛ تعداد پیام‌ها: {len(messages)}")
     await _telegram_log(context, f"[product:{user_id}] کپشن کامل رسانه:\n{_caption(messages) or '<بدون کپشن>'}")
     await _status(context, user_id, session, "📥 مرحله ۱ از ۴: دریافت عکس‌ها از تلگرام...")
-    previous_files = list(session.files)
     media_items = [(m, _media(m)) for m in sorted(messages, key=lambda x: x.message_id)]
     media_items = [(m, item) for m, item in media_items if item]
     semaphore = asyncio.Semaphore(3)
@@ -1841,7 +2007,7 @@ async def _prepare_files_impl(user_id: int, messages: list[Message], context: Co
     async def download_one(index, item):
         _message, media = item
         file_id, original = media
-        target = root / f"{index:02d}_{_safe(original, 'image.jpg')}"
+        target = root / f"{batch_sequence:04d}_{index:02d}_{_safe(original, 'image.jpg')}"
         async with semaphore:
             await _download_with_retry(context, file_id, target)
         size = target.stat().st_size if target.exists() else 0
@@ -1849,13 +2015,13 @@ async def _prepare_files_impl(user_id: int, messages: list[Message], context: Co
         return target, original, size
 
     await _status(context, user_id, session, f"📥 مرحله ۱ از ۴: دریافت هم‌زمان {len(media_items)} عکس...")
-    downloaded = await asyncio.gather(*(download_one(i, item) for i, item in enumerate(media_items, 1)))
+    downloaded = await _gather_owned(download_one(i, item) for i, item in enumerate(media_items, 1))
     await _status(context, user_id, session, f"🗜️ مرحله ۲ از ۴: فشرده‌سازی هم‌زمان {len(downloaded)} عکس...")
 
     async def compress_one(index, item):
         target, _original, original_size = item
         async with semaphore:
-            compressed = await asyncio.to_thread(compress_image, target, root / "compressed")
+            compressed = await worker.run(compress_image, target, root / "compressed", timeout=settings.process_timeout_seconds)
         compressed_size = compressed.stat().st_size if compressed.exists() else 0
         saving = compressed_size_savings(original_size, compressed_size)
         await _telegram_log(
@@ -1865,13 +2031,15 @@ async def _prepare_files_impl(user_id: int, messages: list[Message], context: Co
         )
         return compressed
 
-    new_files = list(await asyncio.gather(*(compress_one(i, item) for i, item in enumerate(downloaded, 1))))
+    new_files = await _gather_owned(compress_one(i, item) for i, item in enumerate(downloaded, 1))
+    if not _live(user_id, session):
+        return
     # From here the batch really joins the draft (images and caption), so this is
     # the point «↩️ برگرداندن» has to be able to put things back to.
     _remember(session)
     # A second batch (or a late album photo) must ADD images, never silently
     # replace the ones already collected for this product.
-    session.files = previous_files + new_files
+    session.files.extend(new_files)
     session.gallery_applied = False       # a new photo is a new gallery to write
     session.model_text = _append_model_caption(session.model_text, _caption(messages))
     extraction_ms = 0.0
@@ -1916,6 +2084,8 @@ async def _prepare_files_impl(user_id: int, messages: list[Message], context: Co
     combined_text = "\n".join(part for part in (session.model_text, session.info_text) if part.strip())
     await _telegram_log(context, f"[product:{user_id}] متن ترکیبی کپشن و اطلاعات:\n{combined_text or '<خالی>'}")
     await _telegram_log(context, f"[product:{user_id}] داده استخراج‌شده:\n{json.dumps(session.data.to_dict() if session.data else {}, ensure_ascii=False, indent=2)}")
+    if not _live(user_id, session):
+        return
     flow_state.record(user_id, chat_id=session.chat_id or user_id, mode=session.mode,
                       images=len(session.files), step="در انتظار تأیید")
     await _status(context, user_id, session, "✅ مرحله ۴ از ۴: اطلاعات آماده شد؛ در انتظار بررسی شما...")
@@ -1954,7 +2124,7 @@ async def _prepare_files_impl(user_id: int, messages: list[Message], context: Co
                 user_id,
                 session,
                 "✅ عکس‌ها دریافت و فشرده شدند. حالا متن اطلاعات محصول را بفرست.",
-                reply_markup=_collect_keyboard(),
+                reply_markup=_bound(session, _collect_keyboard()),
                 move_to_bottom=not painter.painted,
             )
             painter.painted = True
@@ -1963,23 +2133,29 @@ async def _prepare_files_impl(user_id: int, messages: list[Message], context: Co
 
 
 async def _flush_album(key: tuple[int, str], context: ContextTypes.DEFAULT_TYPE) -> None:
-    await asyncio.sleep(settings.album_wait_seconds)
-    messages = album_buffers.pop(key, [])
-    album_tasks.pop(key, None)
-    if messages:
-        try:
-            await _prepare_files(key[0], messages, context)
-        except Exception as exc:
-            details = traceback.format_exc()
-            await _telegram_log(context, f"[product:{key[0]}] خطا در پردازش آلبوم: {type(exc).__name__}: {exc}\n{details}")
-            session = sessions.get(key[0])
-            if session is not None:
-                # No new message and no card change: just a transient ⚡ on the last photo.
-                await _report_failure(
-                    context, key[0], session,
-                    f"پردازش این عکس‌ها کامل نشد ({type(exc).__name__})؛ دوباره بفرست.",
-                    message=messages[-1],
-                )
+    current = asyncio.current_task()
+    session = sessions.get(key[0])
+    try:
+        await asyncio.sleep(settings.album_wait_seconds)
+        messages = album_buffers.pop(key, [])
+        if messages and session is not None and _live(key[0], session):
+            try:
+                await _prepare_files(key[0], messages, context)
+            except Exception as exc:
+                details = traceback.format_exc()
+                await _telegram_log(context, f"[product:{key[0]}] خطا در پردازش آلبوم: {type(exc).__name__}: {exc}\n{details}")
+                if _live(key[0], session):
+                    # No new message and no card change: just a transient ⚡ on the last photo.
+                    await _report_failure(
+                        context, key[0], session,
+                        f"پردازش این عکس‌ها کامل نشد ({type(exc).__name__})؛ دوباره بفرست.",
+                        message=messages[-1],
+                    )
+    finally:
+        if album_tasks.get(key) is current:
+            album_tasks.pop(key, None)
+        if album_buffers.get(key) and session is not None and _live(key[0], session) and key not in album_tasks:
+            album_tasks[key] = asyncio.create_task(_flush_album(key, context))
 
 
 async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1995,7 +2171,7 @@ async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     # the same settings, an empty draft. Registering it as an *entry point* (not
     # a plain handler) is what makes the flow's own states catch the messages
     # after the tap — an ordinary handler would leave the user talking to nobody.
-    data = query.data or ""
+    data = callbacks.action(query)
     updating = data == CB.PHONE_RESTOCK or data.endswith(":update")
     key = "product_restock" if updating else "product_new"
     if not user or not feature_allowed(user.id, key):
@@ -2003,13 +2179,13 @@ async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return ConversationHandler.END
     await query.answer()
     chat_id = query.message.chat_id if query.message else user.id
-    flow_state.record(user.id, chat_id=chat_id, mode="restock" if updating else "new",
-                      step="منتظر SKU/عنوان" if updating else "منتظر تصاویر")
     # Starting a new product must never inherit the previous product's images,
     # text or half-finished AI state — and its temp files must really go away.
     _cleanup(user.id)
     # …nor should another flow stay open behind it: one active flow per user.
     closed = flow_guard.close_others("product", user.id)
+    flow_state.record(user.id, chat_id=chat_id, mode="restock" if updating else "new",
+                      step="منتظر SKU/عنوان" if updating else "منتظر تصاویر")
     if updating:
         # The shop's own catalogue first: no ProductSession, no images, until a product is picked.
         return await restock_flow.start(update, context, closed=closed,
@@ -2030,17 +2206,17 @@ async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if data.startswith("product:next"):
         # Keep the completed result card intact; the guide follows it.
         prompt_message = await query.message.reply_text(
-            prompt, reply_markup=_collect_keyboard()
+            prompt, reply_markup=_bound(session, _collect_keyboard())
         )
         session.guide_message_id = getattr(prompt_message, "message_id", None)
     elif query.message is not None:
         session.guide_message_id = query.message.message_id
         await _edit_message_if_changed(
-            query, prompt, reply_markup=_collect_keyboard()
+            query, prompt, reply_markup=_bound(session, _collect_keyboard())
         )
     else:
         guide = await context.bot.send_message(
-            text=prompt, reply_markup=_collect_keyboard(), **_target(session, user.id)
+            text=prompt, reply_markup=_bound(session, _collect_keyboard()), **_target(session, user.id)
         )
         session.guide_message_id = getattr(guide, "message_id", None)
     return COLLECT
@@ -2110,14 +2286,15 @@ async def begin_update(update: Update, context: ContextTypes.DEFAULT_TYPE,
     prompt = _update_guide(product)
     if message is not None:
         session.guide_message_id = message.message_id
-        await _edit_message_if_changed(query, prompt, reply_markup=_collect_keyboard())
+        await _edit_message_if_changed(query, prompt, reply_markup=_bound(session, _collect_keyboard()))
     else:
         guide = await context.bot.send_message(
-            text=prompt, reply_markup=_collect_keyboard(), **_target(session, user.id))
+            text=prompt, reply_markup=_bound(session, _collect_keyboard()), **_target(session, user.id))
         session.guide_message_id = getattr(guide, "message_id", None)
     return COLLECT
 
 
+@guard_feature(_feature_key, on_denial=lambda uid: _cleanup(uid), checker=lambda uid, key: feature_allowed(uid, key))
 async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
     message = update.effective_message
@@ -2153,6 +2330,7 @@ async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return REVIEW if session.data is not None else COLLECT
 
 
+@guard_feature(_feature_key, on_denial=lambda uid: _cleanup(uid), checker=lambda uid, key: feature_allowed(uid, key))
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Append every free-text message and refresh the single persistent card."""
     user = update.effective_user
@@ -2172,7 +2350,17 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     # The misread this can undo: the seller corrects one line, the parser
     # re-reads everything, and the preview comes back worse. Snapshot first.
     _remember(session)
+    previous_model_text = session.model_text
+    session.model_text = _append_model_caption(
+        session.model_text, _replied_model_caption(message, session)
+    )
     session.info_text = (session.info_text + "\n" + incoming).strip()
+    if session.model_text != previous_model_text:
+        await _telegram_log(
+            context,
+            f"[product:{user.id}] متن کامل پیام ریپلای‌شده به کپشن مدل‌ها اضافه شد:\n"
+            + session.model_text,
+        )
     await _telegram_log(context, f"[product:{user.id}] متن جدید دریافت و به اطلاعات محصول اضافه شد:\n{incoming}")
 
     # Text may arrive while an album is still being downloaded/compressed. Keep
@@ -2195,7 +2383,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             user.id,
             session,
             "✅ متن اطلاعات ذخیره شد؛ عکس‌ها در حال آماده‌سازی‌اند و پیش‌نمایش پس از پایان به‌روز می‌شود.",
-            reply_markup=_collect_keyboard(),
+            reply_markup=_bound(session, _collect_keyboard()),
             move_to_bottom=True,
         )
         return COLLECT
@@ -2217,6 +2405,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         session.defer_details = False
         session.on_stage = None
     extraction_ms = (time.perf_counter() - extraction_started) * 1000
+    if session.closed or (session.user_id and sessions.get(session.user_id) is not session):
+        raise asyncio.CancelledError
+    session.revision += 1
     session.data = data
     session.last_extract_hash = _extract_fingerprint(session)
     await _log_ai_diagnostics(context, session)
@@ -2278,6 +2469,9 @@ async def _refresh_preview(
         data.models = prev_models
         if hasattr(data, "notes") and isinstance(data.notes, list):
             data.notes.append("⚠️ مدل‌های تأییدشدهٔ قبلی حفظ شدند.")
+    if session.closed or (session.user_id and sessions.get(session.user_id) is not session):
+        raise asyncio.CancelledError
+    session.revision += 1
     session.data = data
     flow_state.record(
         user_id,
@@ -2295,7 +2489,7 @@ async def _refresh_preview(
     )
 
 
-def _queue_for_retry(
+async def _queue_for_retry(
     exc: BaseException, *, user_id: int, session: ProductSession, data: ProductData,
     batch: str, error: str, ledger_key: str | None,
 ) -> bool:
@@ -2310,10 +2504,10 @@ def _queue_for_retry(
     if settings.woo_dry_run or session.mode != "new" or not outbox.is_transient(exc):
         return False
     try:
-        return outbox_flow.enqueue_after_failure(
+        return await asyncio.to_thread(outbox_flow.enqueue_after_failure,
             user_id=user_id, chat_id=session.chat_id or user_id, thread_id=session.thread_id,
             mode=session.mode, data=data, files=session.files, batch_id=batch,
-            ledger_key=ledger_key or "", error=error,
+            ledger_key=ledger_key or "", error=error, retry_after=getattr(exc, "retry_after", 0.0),
         )
     except Exception as inner:                                   # the publish already failed; be plain
         logger.warning("outbox: نتوانست صف را بنویسد: %s", inner)
@@ -2324,6 +2518,9 @@ def _queued_note(queued: bool) -> str:
     return "\n🐇 در صفِ تلاش مجدد است؛ نتیجه را همین‌جا می‌فرستم." if queued else ""
 
 
+
+@guard_feature(_feature_key, on_denial=lambda uid: _cleanup(uid), checker=lambda uid, key: feature_allowed(uid, key))
+@_owned_callback
 async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     user = update.effective_user
@@ -2331,7 +2528,14 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not session or not session.data:
         await query.answer("اول عکس و اطلاعات محصول را بفرست.", show_alert=True)
         return REVIEW
-    data = session.data
+    if session.media_error:
+        await query.answer("یک دستهٔ عکس ناموفق بود؛ آن را دوباره بفرست یا با «برگردان» حذفش کن.", show_alert=True)
+        return REVIEW
+    if _pending_media(user.id, session):
+        await query.answer("⏳ عکس/آلبوم تازه هنوز آماده نشده؛ پس از نمایش پیش‌نمایش تازه تأیید کن.", show_alert=True)
+        return REVIEW
+    data = copy.deepcopy(session.data)
+    approved_files = list(session.files)
     if session.mode == "update":
         return await _confirm_update(context, query, user, session)
     data.categories = _canonical_category_paths(
@@ -2342,7 +2546,7 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     issues = validate_draft(
         data.to_dict(),
         mode=session.mode,
-        image_count=len(session.files),
+        image_count=len(approved_files),
         price_min=settings.price_min,
         price_max=settings.price_max,
         require_models=settings.require_models,
@@ -2359,7 +2563,14 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     # ♻️ idempotency (plan 4.3): the same content from the same chat is ONE product.
     # The key is derived from the payload (see bot/services/publish_batch.py), so a
     # retry after a crash finds its own earlier attempt instead of doubling it.
-    batch = publish_batch.batch_id(data.to_dict(), session.files, chat_id=session.chat_id or user.id)
+    try:
+        base_batch = await asyncio.to_thread(publish_batch.batch_id, data.to_dict(), list(approved_files), chat_id=session.chat_id or user.id)
+    except OSError:
+        await query.answer("تصاویر پیش‌نمایش در دسترس نیستند؛ دوباره بفرست.", show_alert=True)
+        return REVIEW
+    if session.force_publish and not session.forced_batch_id:
+        session.forced_batch_id = uuid.uuid4().hex[:24]
+    batch = session.forced_batch_id or base_batch
     batch_history = products_ledger.batch_history(batch)
     prior = batch_history[0] if batch_history else None
     has_live_attempt = any(
@@ -2371,8 +2582,8 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await query.answer("♻️ این بسته پیش‌تر ساخته شده است", show_alert=True)
         await context.bot.send_message(
             text=_already_published_note(prior),
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
-                "🔁 با این حال دوباره بساز", callback_data="product:force")]]),
+            reply_markup=_bound(session, InlineKeyboardMarkup([[InlineKeyboardButton(
+                "🔁 با این حال دوباره بساز", callback_data="product:force")]])),
             **_target(session, user.id),  # type: ignore[arg-type]
         )
         return REVIEW
@@ -2462,14 +2673,14 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             _record_result(user.id, session, data, status="pending", key=intent_key, batch_id=batch)
             async with _typing_indicator(context, user.id, session):
                 product_id, edit_url = await create_draft(
-                    data.to_dict(), session.files, dry_run=settings.woo_dry_run, report=report,
+                    data.to_dict(), approved_files, dry_run=settings.woo_dry_run, report=report,
                     batch_id=batch,
                     # Any retained live attempt keeps recovery enabled. A dry-run card may
                     # follow an older real failure, so inspect this batch's full local history.
                     resume_existing=has_live_attempt,
                     meta=publish_batch.source_meta(
                         batch, chat_id=session.chat_id or user.id, thread_id=session.thread_id,
-                        images=len(session.files), variations=data.variation_count,
+                        images=len(approved_files), variations=data.variation_count,
                         bot_version=_BOT_VERSION,
                     ),
                 )
@@ -2539,7 +2750,7 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 ) if audit_lines else ""),
             )
             reason = f"HTTP {exc.status_code}: {exc}"
-            queued = _queue_for_retry(exc, user_id=user.id, session=session, data=data,
+            queued = await _queue_for_retry(exc, user_id=user.id, session=session, data=data,
                                       batch=batch, error=reason, ledger_key=intent_key)
             message = f"❌ ساخت مستقیم محصول ناموفق بود (HTTP {exc.status_code}):\n{exc}" + _queued_note(queued)
             _record_result(user.id, session, data, status="queued" if queued else "failed",
@@ -2567,7 +2778,7 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 ) if audit_lines else "")
                 + f"\n\n{details}",
             )
-            queued = _queue_for_retry(exc, user_id=user.id, session=session, data=data,
+            queued = await _queue_for_retry(exc, user_id=user.id, session=session, data=data,
                                       batch=batch, error=reason, ledger_key=intent_key)
             _record_result(user.id, session, data, status="queued" if queued else "failed",
                            key=intent_key, batch_id=batch, error=reason)
@@ -2599,6 +2810,12 @@ async def _confirm_update(context: ContextTypes.DEFAULT_TYPE, query: Any, user: 
     Errors never open a new message: a gate that fails answers with a toast, and a write that
     fails shows its reason as a line on the same card, with the diff that is still to do.
     """
+    if session.media_error:
+        await query.answer("یک دستهٔ عکس ناموفق بود؛ آن را دوباره بفرست یا با «برگردان» حذفش کن.", show_alert=True)
+        return REVIEW
+    if _pending_media(user.id, session):
+        await query.answer("⏳ آلبوم تازه هنوز آماده نیست؛ پیش‌نمایش تازه را تأیید کن.", show_alert=True)
+        return REVIEW
     data = session.data
     target = session.target
     if data is None or target is None:
@@ -2618,6 +2835,11 @@ async def _confirm_update(context: ContextTypes.DEFAULT_TYPE, query: Any, user: 
         await query.answer("هیچ تفاوتی با محصول فعلی نیست؛ قیمت، موجودی، مدل یا عکس تازه بفرست.",
                            show_alert=True)
         return REVIEW
+    if not user or not feature_allowed(user.id, "product_restock"):
+        await query.answer("⛔ دسترسی اپدیت برداشته شده است.", show_alert=True)
+        if user:
+            _cleanup(user.id)
+        return ConversationHandler.END
     if session.submitting:
         await query.answer("⏳ همین حالا یک اپدیت در جریان است؛ لطفاً صبر کن.", show_alert=True)
         return REVIEW
@@ -2748,6 +2970,8 @@ async def _update_stays_open(context: ContextTypes.DEFAULT_TYPE, query: Any, use
     return REVIEW
 
 
+@guard_feature(_feature_key, on_denial=lambda uid: _cleanup(uid), checker=lambda uid, key: feature_allowed(uid, key))
+@_owned_callback
 async def force_publish(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """«🔁 با این حال دوباره بساز» — the way out of the idempotency gate.
 
@@ -2765,30 +2989,58 @@ async def force_publish(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     return await confirm(update, context)
 
 
-def _cleanup(user_id: int) -> None:
-    """Forget the session and remove everything it put on disk.
+_cleanup_tasks: set[asyncio.Task] = set()
 
-    Deleting ``path.parent`` used to remove only ``<root>/compressed`` and leave
-    every original download behind, so a handful of abandoned flows were enough
-    to fill /tmp on the shared host. Pending album tasks are cancelled here too:
-    a task that wakes up after the session is gone used to answer the user with
-    a KeyError traceback.
-    """
+
+async def _finish_cleanup(session: ProductSession, tasks: list[asyncio.Task]) -> None:
+    await asyncio.gather(*tasks, return_exceptions=True)
+    if session.workspace is not None:
+        await asyncio.to_thread(workspace.remove, session.workspace)
+
+
+def _cleanup(user_id: int, *, expected: ProductSession | None = None, preserve_marker: bool = False) -> None:
+    current = sessions.get(user_id)
+    if expected is not None and current is not expected:
+        return
     restock_flow.cleanup(user_id)
     session = sessions.pop(user_id, None)
+    tasks: set[asyncio.Task] = set(session.media_tasks) if session else set()
     for key in [key for key in album_buffers if key[0] == user_id]:
         album_buffers.pop(key, None)
+    for key in [key for key in album_tasks if key[0] == user_id]:
         task = album_tasks.pop(key, None)
-        if task is not None and not task.done():
+        if isinstance(task, asyncio.Task) and not task.done():
+            tasks.add(task)
+        elif task is not None and not task.done():
             task.cancel()
     if session is None:
+        for task in tasks:
+            if not task.done() and not task.cancelling():
+                task.cancel()
         return
-    flow_state.clear(user_id)
-    if session.workspace is not None:
-        shutil.rmtree(session.workspace, ignore_errors=True)
+    session.closed = True
+    session.on_stage = None
+    if not preserve_marker:
+        flow_state.clear(user_id)
+    for task in tasks:
+        if not task.done() and not task.cancelling():
+            task.cancel()
+    if tasks:
+        cleanup = asyncio.create_task(_finish_cleanup(session, list(tasks)))
+        _cleanup_tasks.add(cleanup)
+        cleanup.add_done_callback(_cleanup_tasks.discard)
+    elif session.workspace is not None:
+        workspace.remove(session.workspace)
     else:
         for path in session.files:
-            shutil.rmtree(path.parent, ignore_errors=True)
+            workspace.remove(path.parent)
+
+
+async def shutdown() -> None:
+    for user_id in list(sessions):
+        _cleanup(user_id, preserve_marker=True)
+    if _cleanup_tasks:
+        await asyncio.gather(*list(_cleanup_tasks), return_exceptions=True)
 
 
 def sweep_temp_dir(max_age_hours: float | None = None) -> int:
@@ -2797,6 +3049,7 @@ def sweep_temp_dir(max_age_hours: float | None = None) -> int:
     return workspace.sweep(TEMP_DIR, hours, label="product workspace")
 
 
+@_owned_callback
 async def cb_back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """«⬅️ بازگشت به منو» inside the flow — end it, do not just render the menu.
 
@@ -2853,6 +3106,8 @@ async def sweep(context: ContextTypes.DEFAULT_TYPE) -> None:
     await asyncio.to_thread(sweep_temp_dir)
 
 
+@guard_feature(_feature_key, on_denial=lambda uid: _cleanup(uid), checker=lambda uid, key: feature_allowed(uid, key))
+@_owned_callback
 async def edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Open the field picker by editing the persistent card in place."""
     query = update.callback_query
@@ -2870,12 +3125,16 @@ async def edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return REVIEW
 
 
+@guard_feature(_feature_key, on_denial=lambda uid: _cleanup(uid), checker=lambda uid, key: feature_allowed(uid, key))
+@_owned_callback
 async def edit_free(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """The free-text edit path is now the ordinary automatic append behavior."""
     await update.callback_query.answer("متن تازه را بفرست؛ خودکار به اطلاعات اضافه می‌شود.")
     return REVIEW
 
 
+@guard_feature(_feature_key, on_denial=lambda uid: _cleanup(uid), checker=lambda uid, key: feature_allowed(uid, key))
+@_owned_callback
 async def open_color_sources(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Which message stated which colors, with a one-tap way to unmix them."""
     query = update.callback_query
@@ -2897,6 +3156,8 @@ async def open_color_sources(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return REVIEW
 
 
+@guard_feature(_feature_key, on_denial=lambda uid: _cleanup(uid), checker=lambda uid, key: feature_allowed(uid, key))
+@_owned_callback
 async def toggle_color_source(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     session = _session_of(query.from_user.id if query.from_user else 0, context)
@@ -2905,7 +3166,7 @@ async def toggle_color_source(update: Update, context: ContextTypes.DEFAULT_TYPE
         return REVIEW
     await query.answer()
     _remember(session)                 # the split is one tap away from being wrong
-    index = int(query.data.rsplit(":", 1)[1])
+    index = int(callbacks.action(query).rsplit(":", 1)[1])
     label = session.color_sources[index]
     if label in session.suppressed_colors:
         session.suppressed_colors.remove(label)
@@ -2915,6 +3176,8 @@ async def toggle_color_source(update: Update, context: ContextTypes.DEFAULT_TYPE
     return REVIEW
 
 
+@guard_feature(_feature_key, on_denial=lambda uid: _cleanup(uid), checker=lambda uid, key: feature_allowed(uid, key))
+@_owned_callback
 async def accept_suggestion(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """One tap: fix this product AND teach the shop dictionary the typo."""
     query = update.callback_query
@@ -2922,7 +3185,7 @@ async def accept_suggestion(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     session = _session_of(query.from_user.id if query.from_user else 0, context)
     if session is None or session.data is None:
         return REVIEW
-    index = int(query.data.rsplit(":", 1)[1])
+    index = int(callbacks.action(query).rsplit(":", 1)[1])
     items = getattr(session.data, "suggestions", None) or []
     if index >= len(items):
         return REVIEW
@@ -2934,6 +3197,8 @@ async def accept_suggestion(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     return REVIEW
 
 
+@guard_feature(_feature_key, on_denial=lambda uid: _cleanup(uid), checker=lambda uid, key: feature_allowed(uid, key))
+@_owned_callback
 async def confirm_guessed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """«بله، درست است»: the inferred values become the owner's own statement.
 
@@ -2968,13 +3233,15 @@ async def confirm_guessed(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     return REVIEW
 
 
+@guard_feature(_feature_key, on_denial=lambda uid: _cleanup(uid), checker=lambda uid, key: feature_allowed(uid, key))
+@_owned_callback
 async def dismiss_suggestion(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
     session = _session_of(query.from_user.id if query.from_user else 0, context)
     if session is None or session.data is None:
         return REVIEW
-    index = int(query.data.rsplit(":", 1)[-1])
+    index = int(callbacks.action(query).rsplit(":", 1)[-1])
     items = getattr(session.data, "suggestions", None) or []
     _remember(session)
     if index < len(items):
@@ -2983,6 +3250,8 @@ async def dismiss_suggestion(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return REVIEW
 
 
+@guard_feature(_feature_key, on_denial=lambda uid: _cleanup(uid), checker=lambda uid, key: feature_allowed(uid, key))
+@_owned_callback
 async def back_from_picker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
@@ -2995,13 +3264,15 @@ async def back_from_picker(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     return REVIEW
 
 
+@guard_feature(_feature_key, on_denial=lambda uid: _cleanup(uid), checker=lambda uid, key: feature_allowed(uid, key))
+@_owned_callback
 async def pick_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
     session = _session_of(query.from_user.id if query.from_user else 0, context)
     if session is None or session.data is None:
         return WAITING
-    index = int(query.data.rsplit(":", 1)[1])
+    index = int(callbacks.action(query).rsplit(":", 1)[1])
     if index >= len(session.field_keys):
         # An old keyboard: stay where the user is, do not drop them to collecting.
         return REVIEW
@@ -3019,6 +3290,8 @@ async def pick_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return EDITING_FIELD
 
 
+@guard_feature(_feature_key, on_denial=lambda uid: _cleanup(uid), checker=lambda uid, key: feature_allowed(uid, key))
+@_owned_callback
 async def delete_attribute_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Remove a variation attribute directly from its picker row."""
     query = update.callback_query
@@ -3027,7 +3300,7 @@ async def delete_attribute_field(update: Update, context: ContextTypes.DEFAULT_T
         await query.answer("پیش‌نمایش منقضی شده است.", show_alert=True)
         return REVIEW
     try:
-        index = int(query.data.rsplit(":", 1)[1])
+        index = int(callbacks.action(query).rsplit(":", 1)[1])
         key = session.field_keys[index]
     except (ValueError, IndexError):
         await query.answer("این گزینه منقضی شده است.", show_alert=True)
@@ -3050,6 +3323,8 @@ async def delete_attribute_field(update: Update, context: ContextTypes.DEFAULT_T
     return REVIEW
 
 
+@guard_feature(_feature_key, on_denial=lambda uid: _cleanup(uid), checker=lambda uid, key: feature_allowed(uid, key))
+@_owned_callback
 async def cancel_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
@@ -3064,6 +3339,7 @@ async def cancel_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     return REVIEW
 
 
+@guard_feature(_feature_key, on_denial=lambda uid: _cleanup(uid), checker=lambda uid, key: feature_allowed(uid, key))
 async def field_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Apply one explicit field edit and keep the response on the same card."""
     user = update.effective_user
@@ -3118,6 +3394,8 @@ def _collect_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="product:cancel")]])
 
 
+@guard_feature(_feature_key, on_denial=lambda uid: _cleanup(uid), checker=lambda uid, key: feature_allowed(uid, key))
+@_owned_callback
 async def finish_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Compatibility response for old cards; new ones no longer carry this button.
 
@@ -3148,6 +3426,8 @@ async def finish_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         task = album_tasks.pop(key, None)
         if task is not None and not task.done():
             task.cancel()
+            if isinstance(task, asyncio.Task):
+                await asyncio.gather(task, return_exceptions=True)
         buffered = album_buffers.pop(key, [])
         if buffered:
             await _prepare_files(user_id, buffered, context)
@@ -3162,7 +3442,7 @@ async def finish_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             user_id,
             session,
             "✅ عکس‌ها آماده‌اند. حالا متن اطلاعات محصول را بفرست (قیمت، عنوان، پیشوند SKU…).",
-            reply_markup=_collect_keyboard(),
+            reply_markup=_bound(session, _collect_keyboard()),
         )
         return COLLECT
     await _render_card(
@@ -3172,6 +3452,8 @@ async def finish_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     return REVIEW
 
 
+@guard_feature(_feature_key, on_denial=lambda uid: _cleanup(uid), checker=lambda uid, key: feature_allowed(uid, key))
+@_owned_callback
 async def add_more(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """No mode switch is needed: review accepts more photos and text directly."""
     query = update.callback_query
@@ -3183,17 +3465,22 @@ async def add_more(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return REVIEW
 
 
+@guard_feature(_feature_key, on_denial=lambda uid: _cleanup(uid), checker=lambda uid, key: feature_allowed(uid, key))
 async def on_review_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Review-screen text follows the same automatic append-and-refresh path."""
     return await on_text(update, context)
 
 
+@guard_feature(_feature_key, on_denial=lambda uid: _cleanup(uid), checker=lambda uid, key: feature_allowed(uid, key))
+@_owned_callback
 async def accept_proposal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Compatibility response for proposal buttons left on old Telegram cards."""
     await update.callback_query.answer("متن‌های تازه اکنون خودکار به اطلاعات محصول اضافه می‌شوند.")
     return REVIEW
 
 
+@guard_feature(_feature_key, on_denial=lambda uid: _cleanup(uid), checker=lambda uid, key: feature_allowed(uid, key))
+@_owned_callback
 async def reject_proposal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Compatibility response for proposal buttons left on old Telegram cards."""
     await update.callback_query.answer("برای افزودن متن تازه دیگر تأیید جداگانه لازم نیست.")
@@ -3218,6 +3505,7 @@ async def exit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     return ConversationHandler.END
 
 
+@_owned_callback
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
     await update.callback_query.answer()
@@ -3278,46 +3566,47 @@ def register(app: Application) -> None:
     # preview from a background task and cannot move the state itself, so a
     # review keyboard may appear while the flow is still COLLECT.
     review_callbacks = [
-        CallbackQueryHandler(confirm, pattern=r"^product:confirm$"),
-        CallbackQueryHandler(force_publish, pattern=r"^product:force$"),
-        CallbackQueryHandler(edit, pattern=r"^product:edit$"),
-        CallbackQueryHandler(edit_free, pattern=r"^product:edit:free$"),
-        CallbackQueryHandler(open_color_sources, pattern=r"^product:colorsrc$"),
-        CallbackQueryHandler(toggle_color_source, pattern=r"^product:colorsrc:\d+$"),
-        CallbackQueryHandler(accept_suggestion, pattern=r"^product:sug:\d+$"),
-        CallbackQueryHandler(dismiss_suggestion, pattern=r"^product:sug:no:\d+$"),
-        CallbackQueryHandler(confirm_guessed, pattern=f"^{CB.PRODUCT_CONFIRM_GUESSED}$"),
-        CallbackQueryHandler(delete_attribute_field, pattern=r"^product:field:delete:\d+$"),
-        CallbackQueryHandler(pick_field, pattern=r"^product:field:\d+$"),
-        CallbackQueryHandler(back_from_picker, pattern=r"^product:fields:back$"),
-        CallbackQueryHandler(show_preview, pattern=r"^product:preview$"),
-        CallbackQueryHandler(cb_back_to_menu, pattern=f"^{CB.MAIN_MENU}$"),
-        CallbackQueryHandler(cancel, pattern=r"^product:cancel$"),
-        CallbackQueryHandler(undo, pattern=r"^product:undo$"),
+        SessionCallbackHandler(confirm, pattern=r"^product:confirm$"),
+        SessionCallbackHandler(force_publish, pattern=r"^product:force$"),
+        SessionCallbackHandler(edit, pattern=r"^product:edit$"),
+        SessionCallbackHandler(edit_free, pattern=r"^product:edit:free$"),
+        SessionCallbackHandler(open_color_sources, pattern=r"^product:colorsrc$"),
+        SessionCallbackHandler(toggle_color_source, pattern=r"^product:colorsrc:\d+$"),
+        SessionCallbackHandler(accept_suggestion, pattern=r"^product:sug:\d+$"),
+        SessionCallbackHandler(dismiss_suggestion, pattern=r"^product:sug:no:\d+$"),
+        SessionCallbackHandler(confirm_guessed, pattern=f"^{CB.PRODUCT_CONFIRM_GUESSED}$"),
+        SessionCallbackHandler(delete_attribute_field, pattern=r"^product:field:delete:\d+$"),
+        SessionCallbackHandler(pick_field, pattern=r"^product:field:\d+$"),
+        SessionCallbackHandler(back_from_picker, pattern=r"^product:fields:back$"),
+        SessionCallbackHandler(show_preview, pattern=r"^product:preview$"),
+        SessionCallbackHandler(cb_back_to_menu, pattern=f"^{CB.MAIN_MENU}$"),
+        SessionCallbackHandler(cancel, pattern=r"^product:cancel$"),
+        SessionCallbackHandler(undo, pattern=r"^product:undo$"),
     ]
-    conv = ConversationHandler(
+    conv = FlowConversationHandler(
+        flow="product",
         entry_points=[
-            CallbackQueryHandler(entry, pattern=f"^({CB.PHONE_POST}|{CB.PHONE_NEW}|{CB.PHONE_RESTOCK})$"),
-            CallbackQueryHandler(entry, pattern=r"^product:next:(new|update)$"),
+            SessionCallbackHandler(entry, pattern=f"^({CB.PHONE_POST}|{CB.PHONE_NEW}|{CB.PHONE_RESTOCK})$"),
+            SessionCallbackHandler(entry, pattern=r"^product:next:(new|update)$"),
         ],
         states={COLLECT: [
             MessageHandler(filters.PHOTO | filters.Document.IMAGE, on_media),
             MessageHandler(filters.TEXT & ~filters.COMMAND, on_text),
-            CallbackQueryHandler(finish_media, pattern=r"^product:mediaend$"),
+            SessionCallbackHandler(finish_media, pattern=r"^product:mediaend$"),
             *review_callbacks,
         ],
         REVIEW: [
             MessageHandler(filters.PHOTO | filters.Document.IMAGE, on_media),
             MessageHandler(filters.TEXT & ~filters.COMMAND, on_review_text),
-            CallbackQueryHandler(add_more, pattern=r"^product:addmore$"),
-            CallbackQueryHandler(accept_proposal, pattern=r"^product:prop:yes$"),
-            CallbackQueryHandler(reject_proposal, pattern=r"^product:prop:no$"),
+            SessionCallbackHandler(add_more, pattern=r"^product:addmore$"),
+            SessionCallbackHandler(accept_proposal, pattern=r"^product:prop:yes$"),
+            SessionCallbackHandler(reject_proposal, pattern=r"^product:prop:no$"),
             *review_callbacks,
         ],
         EDITING_FIELD: [
             MessageHandler(filters.TEXT & ~filters.COMMAND, field_value),
-            CallbackQueryHandler(cancel_field, pattern=r"^product:field:cancel$"),
-            CallbackQueryHandler(cancel_field, pattern=r"^product:fields:back$"),
+            SessionCallbackHandler(cancel_field, pattern=r"^product:field:cancel$"),
+            SessionCallbackHandler(cancel_field, pattern=r"^product:fields:back$"),
         ],
         # «اپدیت محصول موجود» starts as a second path through this one conversation (see
         # bot/modules/restock_flow.py). Sharing the ConversationHandler is what makes the
@@ -3329,11 +3618,11 @@ def register(app: Application) -> None:
         # the message and the callback form are covered.
         ConversationHandler.TIMEOUT: [
             MessageHandler(filters.ALL, on_timeout),
-            CallbackQueryHandler(on_timeout),
+            SessionCallbackHandler(on_timeout),
         ],
         },
         fallbacks=[
-            CallbackQueryHandler(cancel, pattern=r"^product:cancel$"),
+            SessionCallbackHandler(cancel, pattern=r"^product:cancel$"),
             CommandHandler(["cancel", "start", "menu"], exit_command),
         ],
         name="product_builder",

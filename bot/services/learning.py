@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import copy
 import re
 import threading
 import time
@@ -277,7 +278,7 @@ _CACHE_KEY: tuple[str, float] | None = None
 
 
 def load() -> Memory:
-    """The current memory, shared and cached. Mutate it, then call ``_write``."""
+    """An isolated snapshot; only a durable ``_write`` changes the shared cache."""
     global _CACHE, _CACHE_KEY
     try:
         mtime = LEARNED_FILE.stat().st_mtime if LEARNED_FILE.exists() else -1.0
@@ -287,7 +288,7 @@ def load() -> Memory:
     if _CACHE is None or key != _CACHE_KEY:
         _CACHE = _read_disk()
         _CACHE_KEY = key
-    return _CACHE
+    return copy.deepcopy(_CACHE)
 
 
 def _write(memory: Memory) -> None:
@@ -299,16 +300,20 @@ def _write(memory: Memory) -> None:
     last write are lost by a crash — nothing that changes behaviour.
     """
     global _CACHE, _CACHE_KEY
-    from bot.services.jsonstore import write_json
+    from bot.services.jsonstore import checked_write, write_json
 
     _flush_examples(memory)
-    if not write_json(LEARNED_FILE, memory.to_json()):
-        return
+    try:
+        checked_write(LEARNED_FILE, memory.to_json(), write_json)
+    except OSError:
+        _CACHE = None
+        _CACHE_KEY = None
+        raise
     try:
         mtime = LEARNED_FILE.stat().st_mtime
     except OSError:
         mtime = -1.0
-    _CACHE = memory
+    _CACHE = copy.deepcopy(memory)
     _CACHE_KEY = (str(LEARNED_FILE), mtime)
 
 

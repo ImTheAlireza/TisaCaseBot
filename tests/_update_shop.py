@@ -133,6 +133,8 @@ class UpdateShop:
     # — the shop —
     def handle(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
+        if path.endswith("/tisa-health"):
+            return httpx.Response(200, json={"contract": 1, "batch_fencing": True, "variation_fencing": True, "parent_cas": True, "stock_cas": True})
         method = request.method.upper()
         params = dict(request.url.params)
         text = request.content.decode("utf-8", "ignore") if request.content else ""

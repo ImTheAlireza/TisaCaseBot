@@ -37,7 +37,10 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from bot.services import pricing
+from bot.services.airpods_parser import AIRPODS_ATTRIBUTE, is_airpods_attribute, split_device_axes
 from bot.services.color_matrix import (
+    VariationLimitError,
+    attribute_signature,
     build_combinations,
     color_key,
     is_color_attribute,
@@ -47,7 +50,7 @@ from bot.services.color_matrix import (
 from bot.services.plan import clean_values
 from bot.services.product_match import ShopProduct, ShopVariation, status_text
 
-MODEL, COLOR, OTHER = "model", "color", "other"
+MODEL, COLOR, OTHER, AIRPODS = "model", "color", "other", "airpods"
 
 #: More deletions than this (or more than half of the variations) earns a warning: it is the
 #: shape of «I sent two models and the product lost forty».
@@ -70,13 +73,15 @@ def _kind(name: str) -> str:
         return MODEL
     if is_color_attribute(name):
         return COLOR
+    if is_airpods_attribute(name):
+        return AIRPODS
     return OTHER
 
 
 def _key(kind: str, value: object) -> str:
     """Two spellings of one option compare equal here — «iPhone 15 ProMax» and «۱۵ پرو مکس»."""
     text = _norm(value)
-    if kind == MODEL:
+    if kind in (MODEL, AIRPODS):
         return model_signature(text) or text.casefold()
     if kind == COLOR:
         return color_key(text) or text.casefold()
@@ -149,9 +154,9 @@ def shop_axes(product: ShopProduct) -> list[Axis]:
 
 
 def _value_for(variation: ShopVariation, axis: Axis) -> str:
-    wanted = _norm(axis.name).casefold()
+    wanted = attribute_signature(axis.name)
     for name, value in variation.attributes:
-        if _norm(name).casefold() == wanted:
+        if attribute_signature(name) == wanted or (axis.kind == AIRPODS and is_airpods_attribute(name)):
             return value
     if axis.kind == MODEL:
         return variation.model
@@ -196,6 +201,7 @@ class Draft:
             options = clean_values(values if isinstance(values, (list, tuple, set)) else [values])
             if options and not is_model_attribute(str(name)):
                 attributes[_norm(name)] = options
+        models, attributes = split_device_axes(clean_values(data.get("models") or []), attributes)
         restrictions: dict[str, list[str]] = {}
         for model, colors in (data.get("model_colors") or {}).items():
             if isinstance(colors, (list, tuple)) and clean_values(colors):
@@ -211,7 +217,7 @@ class Draft:
             wholesale=bool(data.get("wholesale_price") or data.get("wholesale_model_prices")),
             stock=None if raw_stock in (None, "") else int(raw_stock),
             stock_status=str(data.get("stock_status") or "").strip(),
-            models=clean_values(data.get("models") or []),
+            models=models,
             attributes=attributes,
             restrictions=restrictions,
             stock_matrix=bool(data.get("stock_matrix") or data.get("stock_matrix_errors")),
@@ -381,6 +387,8 @@ class UpdatePlan:
     #: ``PUT products/<id>`` fields for a simple product (price, sale, stock); strings for money
     product_fields: dict[str, Any] = field(default_factory=dict)
     product_before: dict[str, Any] = field(default_factory=dict)
+    expected_fields: dict[str, Any] = field(default_factory=dict)
+    expected_stocks: dict[int, dict[str, Any]] = field(default_factory=dict)
     #: the full ``attributes`` array to send, or ``None`` when no axis changes
     attributes: list[dict[str, Any]] | None = None
     axis_changes: list[AxisChange] = field(default_factory=list)
@@ -701,6 +709,19 @@ def build(product: ShopProduct, data: Mapping[str, Any], *, image_count: int = 0
         plan.warnings.append(
             f"پیشوند SKU نوشته‌شده ({draft.sku_prefix}) با SKU محصول انتخاب‌شده ({product.sku}) "
             "فرق دارد؛ محصول درست را انتخاب کرده‌ای؟ (SKU عوض نمی‌شود)")
+    plan.expected_fields = {
+        "name": product.title, "attributes": product.attributes,
+        "images": [{"id": identity} for identity in product.image_ids],
+        "regular_price": str(product.regular_price), "sale_price": str(product.sale_price),
+        "stock_status": product.stock_status,
+    }
+    plan.expected_stocks = {
+        row.variation_id: {"quantity": row.stock, "managed": row.manage_stock}
+        for row in product.variations
+    }
+    if plan.is_variable and product.manage_stock and draft.stock is not None:
+        plan.errors.append("این محصول موجودی مشترک روی والد دارد؛ قبل از تغییر موجودی واریژن‌ها، مدیریت موجودی را در پیشخوان بررسی کن")
+        return plan
     if plan.is_variable:
         _plan_variable(plan, product, draft, baseline)
     else:
@@ -858,7 +879,7 @@ def _plan_variable(plan: UpdatePlan, product: ShopProduct, draft: Draft,
             stock=quantity, status=status, order=order, image_id=picture, post_status=published,
             replaces=old, carried=tuple(carried))
 
-    combos, rebuild = _grid_to_build(plan, product, axes, new_axes, draft, stated, baseline)
+    combos, _rebuild = _grid_to_build(plan, product, axes, new_axes, draft, stated, baseline)
     if combos is None:
         # The lists are the shop's own: no structure moves, only what the draft states is written.
         for variation in product.variations:
@@ -871,33 +892,23 @@ def _plan_variable(plan: UpdatePlan, product: ShopProduct, draft: Draft,
         by_key: dict[tuple[str, ...], list[ShopVariation]] = {}
         for variation in product.variations:
             by_key.setdefault(_variation_key(variation, new_axes), []).append(variation)
-        if rebuild:
-            # A list the seller sent is different from the shop's: every variation goes and the
-            # whole grid is made again. A combination that existed hands over what it held.
-            plan.regenerate = bool(product.variations)
-            plan.deletes = list(product.variations)
-            for order, combo in enumerate(combos):
-                bucket = by_key.get(_combo_key(combo, new_axes))
-                plan.creates.append(create_for(order, combo, bucket[0] if bucket else None))
-        else:
-            # The lists were already written (by an attempt that stopped half-way) and the shop
-            # disagrees with them: finish that job, keeping what is already right.
-            fresh: list[tuple[int, dict[str, str]]] = []
-            for order, combo in enumerate(combos):
-                bucket = by_key.get(_combo_key(combo, new_axes))
-                if bucket:
-                    # Twins (the old variation and the copy the interrupted rebuild made): keep the
-                    # newest, which already holds what was written, and let the old one go.
-                    change = update_for(bucket.pop())
-                    if change is None:
-                        plan.kept += 1
-                    else:
-                        plan.updates.append(change)
+        fresh: list[tuple[int, dict[str, str]]] = []
+        for order, combo in enumerate(combos):
+            bucket = by_key.get(_combo_key(combo, new_axes))
+            if bucket:
+                # Prefer the original, oldest ID. It owns the SKU, custom metadata,
+                # shipping/tax/backorder settings and historical order references.
+                bucket.sort(key=lambda row: row.variation_id, reverse=True)
+                change = update_for(bucket.pop())
+                if change is None:
+                    plan.kept += 1
                 else:
-                    fresh.append((order, combo))
-            left = {id(variation) for bucket in by_key.values() for variation in bucket}
-            plan.deletes = [variation for variation in product.variations if id(variation) in left]
-            plan.creates = [create_for(order, combo, None) for order, combo in fresh]
+                    plan.updates.append(change)
+            else:
+                fresh.append((order, combo))
+        left = {id(variation) for bucket in by_key.values() for variation in bucket}
+        plan.deletes = [variation for variation in product.variations if id(variation) in left]
+        plan.creates = [create_for(order, combo, None) for order, combo in fresh]
     plan.warnings += _variable_warnings(plan, product, draft, inherited_from)
     if price_gaps:
         sample = "، ".join(price_gaps[:3])
@@ -932,7 +943,14 @@ def _grid_to_build(plan: UpdatePlan, product: ShopProduct, old_axes: Sequence[Ax
     origin = baseline if baseline is not None and baseline.variations_complete and baseline.variations \
         else product
     restrictions = draft.restrictions or _inherited_restrictions(origin, shop_axes(origin), axes, draft)
-    combos = build_combinations([(axis.name, list(axis.options)) for axis in axes], restrictions)
+    try:
+        combos = build_combinations([(axis.name, list(axis.options)) for axis in axes], restrictions)
+    except VariationLimitError as exc:
+        plan.errors.append(str(exc))
+        return [], False
+    if not combos:
+        plan.errors.append("هیچ ترکیب سازگار مدل/رنگ باقی نمانده؛ محدودیت رنگ‌ها را اصلاح کن")
+        return [], False
     wanted = Counter(_combo_key(combo, axes) for combo in combos)
     have = Counter(_variation_key(variation, axes) for variation in product.variations)
     if wanted == have:
@@ -1053,7 +1071,7 @@ def _target_axes(plan: UpdatePlan, product: ShopProduct, axes: Sequence[Axis],
 
     def find(kind: str, name: str) -> int | None:
         for index, axis in enumerate(result):
-            if axis.kind == kind and (kind != OTHER or _norm(axis.name).casefold() == _norm(name).casefold()):
+            if axis.kind == kind and (kind != OTHER or attribute_signature(axis.name) == attribute_signature(name)):
                 return index
         return None
 
@@ -1082,7 +1100,7 @@ def _target_axes(plan: UpdatePlan, product: ShopProduct, axes: Sequence[Axis],
         index = find(MODEL, "")
         if index is not None:
             replace(index, draft.models)
-        elif len(draft.models) >= 2:
+        elif len(draft.models) >= 2 or draft.attributes.get(AIRPODS_ATTRIBUTE):
             attach(Axis("مدل", MODEL, tuple(draft.models)), first=True)
         else:
             plan.notes.append("فقط یک مدل نوشته شده؛ یک مدل تنها محور مدل نمی‌سازد و نادیده گرفته شد.")

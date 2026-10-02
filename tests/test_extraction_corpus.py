@@ -22,6 +22,8 @@ import unittest
 from dataclasses import replace
 from unittest.mock import patch
 
+from _product_samples import MASA_POLO_CAPTION, MASA_POLO_INFO, MASA_POLO_MODELS
+
 os.environ.setdefault("BOT_TOKEN", "123456:TEST")
 os.environ.setdefault("SUDO_IDS", "1234567")
 
@@ -276,6 +278,29 @@ class TestExtractionCorpus(unittest.TestCase):
             data.notes,
         )
 
+    def test_masa_polo_title_price_and_compatibility_groups(self) -> None:
+        self.check(
+            MASA_POLO_CAPTION,
+            MASA_POLO_INFO,
+            title="قاب ماسا پولو سورمه ای",
+            sku_prefix="LP",
+            price=728_000,
+            prices={},
+            models=MASA_POLO_MODELS,
+            attributes={},
+            model_colors={},
+            categories=[],
+            stock=None,
+            stock_status="",
+            sale_price=0,
+            variation_count=15,
+        )
+
+    def test_color_only_info_does_not_replace_the_caption_title(self) -> None:
+        got = run("قاب ماسا پولو\niPhone 17", "LP\nرنگ: مشکی | سفید\n728t")
+        self.assertEqual("قاب ماسا پولو", got["title"])
+        self.assertEqual(["مشکی", "سفید"], got["attributes"]["رنگ"])
+
     def test_group_prices_survive_the_noise_lines(self) -> None:
         """P0-2/P0-3/P0-4: وزن، تاریخ و کد ملی قیمت نیستند؛ دو گروه در یک خط، دو قیمت."""
         self.check(
@@ -389,7 +414,7 @@ class TestExtractionCorpus(unittest.TestCase):
             sku_prefix="AP",
             price=450_000,
             prices={},
-            models=["Airpods Pro3", "Airpods 1/2"],
+            models=["AirPods Pro 3", "AirPods 1/2"],
             attributes={},
             model_colors={},
             categories=[],
@@ -458,23 +483,23 @@ class TestAccessoryBlockLines(unittest.TestCase):
 
     def test_every_bare_value_line_is_kept(self) -> None:
         self.assertEqual(
-            ["Airpods Pro3", "Airpods 1/2"],
+            ["AirPods Pro 3", "AirPods 1/2"],
             extract_accessory_models("Airpods:\nPro3\n1/2\nقیمت 450000"),
             r"چند مدل زیر یک سرصفحه: قبلاً فقط اولی می‌ماند (\s* خطِ بعد را می‌بلعید)",
         )
 
     def test_a_value_on_the_same_line_still_works(self) -> None:
-        self.assertEqual(["Airpods Pro3"], extract_accessory_models("Airpods: Pro3\nقیمت 450000"))
+        self.assertEqual(["AirPods Pro 3"], extract_accessory_models("Airpods: Pro3\nقیمت 450000"))
 
     def test_the_block_stops_at_the_first_non_value_line(self) -> None:
         self.assertEqual(
-            ["Airpods 1/2", "Airpods Pro/Pro2"],
+            ["AirPods 1/2", "AirPods Pro/Pro 2"],
             extract_accessory_models("Airpods:\n1/2\nPro/Pro2\nرنگ: مشکی"),
         )
 
     def test_inline_notation_is_read_directly(self) -> None:
-        self.assertEqual(["airpods 1/2"], extract_accessory_models("airpods 1/2"))
-        self.assertEqual(["Airpods Pro3"], extract_accessory_models("Airpods Pro3"))
+        self.assertEqual(["AirPods 1/2"], extract_accessory_models("airpods 1/2"))
+        self.assertEqual(["AirPods Pro 3"], extract_accessory_models("Airpods Pro3"))
 
 
 if __name__ == "__main__":  # pragma: no cover

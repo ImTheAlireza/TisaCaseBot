@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import mimetypes
 import re
 import time
 from urllib.parse import quote
@@ -13,8 +14,12 @@ from collections.abc import Sequence
 import httpx
 
 from bot.config import settings
-from bot.services import metrics, pricing, publish_batch
-from bot.services.color_matrix import build_combinations, color_key
+from bot.services import metrics, pricing, publish_batch, publish_lease
+from bot.services import woo_fencing
+from bot.services.image_tags import colors_for_file
+from bot.services.color_matrix import is_color_attribute
+from bot.services.woo_contract import human_fields, field_errors, json_body, positive_id
+from bot.services.color_matrix import build_combinations
 from bot.services.plan import VariationPlan, plan_from_dict
 from bot.services.sku import (
     MAX_GHOST_SPAN,
@@ -148,13 +153,59 @@ def _model_color_restrictions(data: dict[str, Any]) -> dict[str, list[str]]:
     return out
 
 
+def _media_type(path: Path, head: bytes) -> str:
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if head.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if head[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if head.startswith(b"RIFF") and head[8:12] == b"WEBP":
+        return "image/webp"
+    if head.startswith(b"BM"):
+        return "image/bmp"
+    if head[:4] in (b"II*\x00", b"MM\x00*"):
+        return "image/tiff"
+    return mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+
+
+async def _verify_write(
+    client: WooClient, endpoint: str, sent: dict[str, Any], response: httpx.Response,
+    *, variation: bool = False, expected_id: int | None = None,
+) -> dict[str, Any]:
+    check(response)
+    got = json_body(response)
+    identity = expected_id or positive_id(got)
+    errors = field_errors(sent, got, expected_id=expected_id, variation=variation)
+    if errors and identity:
+        reread = await client.get(f"{endpoint}/{identity}")
+        if reread.is_success:
+            got = json_body(reread)
+            errors = field_errors(sent, got, expected_id=identity, variation=variation)
+    if errors:
+        raise WooCommerceAPIError(502, "نوشتن تأیید نشد؛ پاسخ فروشگاه ناقص/متفاوت بود: " + human_fields(errors))
+    return got
+
+
+async def _delete_confirmed(client: WooClient, endpoint: str, *, basic: bool = False) -> bool:
+    response = await client.delete(endpoint, params={"force": "true"}, basic=basic)
+    if response.status_code in (404, 410):
+        return True
+    body = json_body(response)
+    if not response.is_success or not isinstance(body, dict) or body.get("error"):
+        return False
+    identity = int(endpoint.rsplit("/", 1)[-1])
+    return body.get("deleted") is True or positive_id(body) == identity
+
+
 async def _upload_media(client: WooClient, path: Path, audit: Sink) -> int:
     # HTTP headers are ASCII, so the seller's own file name goes out percent-encoded in the
     # RFC 5987 field; an ASCII ``filename=`` stays as the fallback for servers that ignore it.
     # Sending the raw name used to raise UnicodeEncodeError inside publish — for a document
     # called «قاب‌مشکی.jpg» that meant a red card with nothing wrong in the product.
     ascii_name = path.name.encode("ascii", "ignore").decode().strip() or "image.jpg"
-    image_bytes = path.read_bytes()
+    image_bytes = await asyncio.to_thread(path.read_bytes)
+    content_type = _media_type(path, image_bytes[:32])
     audit.log(f"[media:start] آپلود {path.name}؛ حجم {len(image_bytes):,} بایت")
     try:
         response = await client.post(
@@ -162,7 +213,7 @@ async def _upload_media(client: WooClient, path: Path, audit: Sink) -> int:
             content=image_bytes,
             basic=True,
             headers={
-                "Content-Type": "image/jpeg",
+                "Content-Type": content_type,
                 "Content-Disposition": (
                     f'attachment; filename="{ascii_name}"; '
                     f"filename*=UTF-8''{quote(path.name)}"
@@ -175,7 +226,9 @@ async def _upload_media(client: WooClient, path: Path, audit: Sink) -> int:
     if not response.is_success:
         audit.log(f"[media] آپلود {path.name} ناموفق: HTTP {response.status_code}: {error_message(response)} | body={body_snippet(response)}")
     check(response)
-    media_id = int(response.json()["id"])
+    media_id = positive_id(json_body(response))
+    if not media_id:
+        raise WooCommerceAPIError(502, "آپلود تصویر تأیید نشد؛ پاسخ JSON با media id مثبت انتظار می‌رفت.")
     metrics.incr_shop("images_uploaded")
     audit.log(f"[media] آپلود شد: {path.name} → media id {media_id}")
     return media_id
@@ -188,29 +241,30 @@ async def _upload_media_many(client: WooClient, paths: list[Path], audit: Sink) 
     («01_مشکی.jpg») has already done the mapping work: the variation of that colour gets
     that picture. Serial uploads also avoid a burst of WordPress media writes on shared hosts.
     """
-    if not paths:
-        return []
-    semaphore = asyncio.Semaphore(1)
-
-    async def upload(path: Path) -> tuple[int, Path]:
-        async with semaphore:
-            return await _upload_media(client, path, audit), path
-
-    return list(await asyncio.gather(*(upload(path) for path in paths)))
+    uploads: list[tuple[int, Path]] = []
+    try:
+        for path in paths:
+            uploads.append((await _upload_media(client, path, audit), path))
+        return uploads
+    except BaseException:
+        # No parent exists yet. Only these positively identified, unattached
+        # uploads are safe to remove; an ambiguous upload cannot be guessed.
+        for media_id, _path in uploads:
+            try:
+                deleted = await _delete_confirmed(client, f"{media_base()}/{media_id}", basic=True)
+                audit.log(f"[media:cleanup] media {media_id}: {'حذف تأیید شد' if deleted else 'حذف تأیید نشد'}")
+            except Exception as exc:
+                audit.log(f"[media:cleanup] media {media_id}: {describe_exception(exc)}")
+        raise
 
 
 def _images_by_color(uploads: list[tuple[int, Path]], colors: Sequence[str]) -> dict[str, int]:
     """``colour -> media id`` for files whose name says that colour. Nothing else."""
     out: dict[str, int] = {}
-    for color in colors:
-        wanted = color_key(str(color))
-        if not wanted:
-            continue
-        for media_id, path in uploads:
-            stem = color_key(re.sub(r"^\d+[\s._-]*", "", Path(path).stem))
-            if stem and (stem == wanted or wanted in stem):
-                out[str(color)] = media_id
-                break
+    for media_id, path in uploads:
+        for color in colors_for_file(path, colors):
+            out.setdefault(color, media_id)
+
     return out
 
 
@@ -251,7 +305,8 @@ async def _create_without_sku_then_set(
             f"{error_message(response)} | body={body_snippet(response)})."
         )
         return None
-    product_id = int(response.json()["id"])
+    product = await _verify_write(client, base, no_sku_payload, response)
+    product_id = positive_id(product)
     audit.log(f"[sku] دور زدن قفل SKU: محصول بدون SKU ساخته شد (id={product_id})؛ اکنون SKU را ثبت می‌کنیم.")
     response = await client.put(f"{base}/{product_id}", json=payload)
     if not response.is_success:
@@ -259,15 +314,17 @@ async def _create_without_sku_then_set(
             f"[sku] ثبت SKU با به‌روزرسانی ناموفق بود (HTTP {response.status_code}: "
             f"{error_message(response)} | body={body_snippet(response)})."
         )
+        if any(row.get("key") == publish_batch.META_BATCH for row in payload.get("meta_data", [])):
+            raise WooCommerceAPIError(409, f"پیش‌نویس {product_id} بدون SKU باقی ماند؛ ابتدا SKU را در سایت بررسی کن (محصول مشترک حذف نشد)")
         try:
-            await client.delete(
-                f"{base}/{product_id}",
-                params={"force": "true"}
-            )
-            audit.log(f"[sku] پیش‌نویس موقت بدون SKU حذف شد (id={product_id}).")
-        except Exception:
-            audit.log(f"[sku] حذف پیش‌نویس موقت بدون SKU ناموفق بود (id={product_id}).")
+            deleted = await _delete_confirmed(client, f"{base}/{product_id}")
+            audit.log(f"[sku] حذف پیش‌نویس موقت {product_id}: {deleted}")
+            if not deleted:
+                raise WooCommerceAPIError(502, "پیش‌نویس بدون SKU باقی مانده است؛ ساخت دیگری مجاز نیست.")
+        except Exception as exc:
+            raise WooCommerceAPIError(502, f"حذف پیش‌نویس موقت {product_id} تأیید نشد؛ ساخت متوقف شد.") from exc
         return None
+    await _verify_write(client, base, payload, response, expected_id=product_id)
     audit.log(f"[sku] SKU «{sku}» با به‌روزرسانی روی محصول {product_id} ثبت شد.")
     return response
 
@@ -308,7 +365,11 @@ async def _create_with_sku_retry(
             payload["sku"] = candidate
             last_sku = candidate
         response = await client.post(base, json=payload)
+        existing_id = woo_fencing.conflict_id(json_body(response), "tisa_batch_exists", "existing_product_id")
+        if existing_id:
+            raise woo_fencing.ExistingBatch(existing_id)
         if response.is_success:
+            await _verify_write(client, base, payload, response)
             if prefix:
                 remember_sku(prefix, candidate_num)
             audit.log(f"[attempt {attempt}] POST موفق با SKU «{candidate}» → HTTP {response.status_code}")
@@ -418,9 +479,12 @@ async def _create_variations_individually(
                     f"[variation] ساخت variation ناموفق: HTTP {response.status_code}: "
                     f"{error_message(response)} | body={body_snippet(response)}"
                 )
-            check(response)
+            recovered = await woo_fencing.recover_variation(client, f"{base}/{product_id}/variations", payload, json_body(response))
+            if recovered is None:
+                await _verify_write(client, f"{base}/{product_id}/variations", payload, response, variation=True)
 
-    await asyncio.gather(*(one(payload) for payload in payloads))
+    for payload in payloads:
+        await one(payload)
     audit.log(f"[variation] {len(payloads)} variation ساخته شد (تکی موازی).")
 
 
@@ -434,48 +498,48 @@ async def _find_resumable(
     hit. A hit is therefore this exact publish — not merely a similar product — which is
     the only property that makes resuming safe instead of lucky.
     """
-    if not batch_id or not (title or "").strip():
+    if not batch_id:
         return None
     params: dict[str, Any] = {
-        "search": title, "status": "any",
-        "per_page": 20, "orderby": "date", "order": "desc",
+        "tisa_batch_id": batch_id, "status": "any",
+        "per_page": 100, "orderby": "date", "order": "desc",
     }
-    response = await client.get(base, params=params)
-    if response.status_code == 400:
-        # Some stores reject status=any on products. Losing the hunt is acceptable
-        # (we publish normally); failing the whole publish for it is not.
-        params.pop("status", None)
+    for page in range(1, 51):
+        params["page"] = page
         response = await client.get(base, params=params)
-    if not response.is_success:
-        audit.log(
-            f"[resume] جستجوی تلاش‌های قبلی ممکن نشد (HTTP {response.status_code})؛ "
-            "مسیر عادی ادامه می‌یابد."
-        )
-        return None
-    try:
-        items = response.json() or []
-    except ValueError:
-        return None
-    for item in items if isinstance(items, list) else []:
-        if isinstance(item, dict) and publish_batch.meta_batch_of(item) == batch_id:
-            return item
-    audit.log(
-        f"[resume] {len(items) if isinstance(items, list) else 0} محصول هم‌عنوان پیدا شد "
-        f"ولی هیچ‌کدام برچسب تلاش {batch_id} را نداشت."
-    )
-    return None
+        if response.status_code == 400 and "status" in params:
+            params.pop("status")
+            response = await client.get(base, params=params)
+        check(response)
+        items = json_body(response)
+        if not isinstance(items, list) or any(not positive_id(row) or row.get("error") for row in items):
+            raise WooCommerceAPIError(502, "جستجوی تلاش قبلی پاسخ معتبر نداد؛ برای جلوگیری از محصول تکراری ساخت متوقف شد.")
+        matches = [row for row in items if publish_batch.meta_batch_of(row) == batch_id]
+        if len(matches) > 1:
+            raise WooCommerceAPIError(409, "چند محصول با شناسهٔ این تلاش وجود دارد؛ انتخاب خودکار ایمن نیست.")
+        if matches:
+            return matches[0]
+        total_pages = _total_pages(response)
+        if (total_pages is not None and page >= total_pages) or (total_pages is None and len(items) < 100):
+            audit.log(f"[resume] {page} صفحه بررسی شد؛ تلاش {batch_id} قبلاً ساخته نشده است.")
+            return None
+    raise WooCommerceAPIError(503, "جستجوی تلاش قبلی از سقف ایمن گذشت؛ نبودن محصول ثابت نشد و ساخت انجام نشد.")
+
+
+def _total_pages(response: httpx.Response) -> int | None:
+    raw = response.headers.get("X-WP-TotalPages", "")
+    return int(raw) if re.fullmatch(r"[0-9]+", raw) else None
 
 
 async def _existing_combos(
     client: WooClient, base: str, product_id: int, audit: Sink
-) -> list[dict[str, str]] | None:
-    """Every attribute combination the product already has (``None`` = unreadable).
+) -> list[dict[str, Any]]:
+    """Every variation the product already has (``None`` = unreadable).
 
-    ``None`` means “we cannot know”, and the caller must then create everything — that is
-    the old behaviour. Raising on a real error is deliberate: double variations are not a
+    Unknown or malformed reads stop the publish. Raising on a real error is deliberate: double variations are not a
     cosmetic problem, they are a product whose price/stock is now ambiguous.
     """
-    found: list[dict[str, str]] = []
+    found: list[dict[str, Any]] = []
     page = 1
     while True:
         params: dict[str, Any] = {"per_page": 100, "page": page, "status": "any"}
@@ -488,30 +552,22 @@ async def _existing_combos(
                 f"{base}/{product_id}/variations", params=params
             )
         if response.status_code in (404, 405, 501):
-            audit.log("[resume] endpoint واریژن‌ها در این فروشگاه در دسترس نیست؛ همه ترکیب‌ها ساخته می‌شوند.")
-            return None
+            raise WooCommerceAPIError(response.status_code, "واریژن‌های قبلی قابل‌خواندن نیستند؛ ساخت دوباره ممنوع است.")
         if not response.is_success:
             raise WooCommerceAPIError(
                 response.status_code,
                 "خواندن واریژن‌های موجود ناموفق بود؛ ساخت دوبارهٔ آن‌ها قیمت/موجودی محصول را "
                 "دوپاره می‌کند، پس کار متوقف شد (محصول پاک نشد).",
             )
-        try:
-            items = response.json() or []
-        except ValueError:
-            items = []
-        for item in items if isinstance(items, list) else []:
-            if not isinstance(item, dict):
-                continue
-            found.append(
-                {
-                    str(attr.get("name")): str(attr.get("option"))
-                    for attr in (item.get("attributes") or [])
-                    if isinstance(attr, dict)
-                }
-            )
-        if not isinstance(items, list) or len(items) < 100:
+        items = json_body(response)
+        if not isinstance(items, list) or any(not positive_id(row) or not isinstance(row.get("attributes"), list) for row in items):
+            raise WooCommerceAPIError(502, "پاسخ واریژن‌های موجود ناقص است؛ ساخت دوباره ممنوع است.")
+        found.extend(items)
+        total_pages = _total_pages(response)
+        if (total_pages is not None and page >= total_pages) or (total_pages is None and len(items) < 100):
             break
+        if page >= 100:
+            raise WooCommerceAPIError(503, "خواندن واریژن‌ها از سقف ایمن گذشت؛ ساخت متوقف شد.")
         page += 1
     return found
 
@@ -526,7 +582,7 @@ async def _create_variations(
     audit: Sink,
     restrictions: dict[str, list[str]] | None = None,
     combos: list[dict[str, str]] | None = None,
-    existing_combos: list[dict[str, str]] | None = None,
+    existing_combos: list[dict[str, Any]] | None = None,
     sale_price: int = 0,
     stock: int | None = None,
     stock_status: str = "",
@@ -555,18 +611,6 @@ async def _create_variations(
             f"[variation] ماتریس رنگ هر مدل اعمال شد: {len(combos)} ترکیب معتبر "
             f"از {len(full)} ترکیب کامل ({len(restrictions)} مدل محدود شد)."
         )
-    if existing_combos:
-        # A resumed publish must top up, not duplicate: the store keeps every POST.
-        had = len(combos)
-        combos = [combo for combo in combos if combo not in existing_combos]
-        if had != len(combos):
-            audit.log(
-                f"[resume] {had - len(combos)} واریژن از تلاش قبلی موجود بود؛ ساخته نشد "
-                f"(باقی‌مانده: {len(combos)})."
-            )
-        if not combos:
-            audit.log("[resume] همه واریژن‌ها از قبل ساخته شده بودند؛ چیزی اضافه نشد.")
-            return
     images_by_color = images_by_color or {}
     payloads: list[dict[str, Any]] = []
     for index, combo in enumerate(combos):
@@ -580,6 +624,7 @@ async def _create_variations(
             "visible": True,
             "menu_order": index,
             "attributes": [{"name": name, "option": value} for name, value in combo.items()],
+            "tisa_fence": True,
         }
         if sale_price:
             variation["sale_price"] = str(sale_price)
@@ -602,12 +647,24 @@ async def _create_variations(
         image_id = images_by_color.get(str(combo.get("رنگ") or ""))
         if image_id:
             variation["image"] = {"id": image_id}
+        if existing_combos is not None:
+            wanted_attrs = variation["attributes"]
+            matches = [row for row in existing_combos
+                       if not field_errors({"attributes": wanted_attrs}, row, variation=True)]
+            if len(matches) > 1:
+                raise WooCommerceAPIError(409, "ترکیب واریژن تکراری در محصول قبلی هست؛ تکمیل خودکار متوقف شد.")
+            if matches:
+                errors = field_errors(variation, matches[0], variation=True)
+                if errors:
+                    raise WooCommerceAPIError(409, "واریژن قبلی با پیش‌نمایش جور نیست: " + "، ".join(errors))
+                continue
         payloads.append(variation)
 
     endpoint = f"{base}/{product_id}/variations/batch"
     created = 0
     failed = 0
     total_chunks = (len(payloads) + 99) // 100
+    seen_ids: set[int] = set()
     for start in range(0, len(payloads), 100):
         chunk = payloads[start:start + 100]
         audit.log(
@@ -631,35 +688,50 @@ async def _create_variations(
                 "برای جلوگیری از درخواست/ساخت تکراری، ساخت تکی شروع نمی‌شود."
             )
             check(response)
-        body = response.json()
-        items = body.get("create", []) if isinstance(body, dict) else []
-        for item in items:
-            if isinstance(item, dict) and "id" in item:
-                created += 1
-            else:
-                failed += 1
-                audit.log(f"[variation] بچ: یک variation ساخته نشد: {item}")
-    audit.log(f"[variation] {created} variation ساخته شد (بچ)؛ ناموفق: {failed}")
-    if failed:
-        raise WooCommerceAPIError(400, f"ساخت {failed} variation از طریق بچ ناموفق بود.")
+        body = json_body(response)
+        items = body.get("create") if isinstance(body, dict) else None
+        if not isinstance(items, list) or len(items) != len(chunk):
+            raise WooCommerceAPIError(502, "پاسخ بچ کوتاه/نامعتبر است؛ ساخت واریژن‌ها تأیید نشد (POST تکرار نمی‌شود).")
+        for sent, got in zip(chunk, items, strict=True):
+            recovered = await woo_fencing.recover_variation(client, f"{base}/{product_id}/variations", sent, got)
+            if recovered is not None:
+                got = recovered
+            identity = positive_id(got)
+            if not identity or identity in seen_ids or not isinstance(got, dict) or got.get("error"):
+                raise WooCommerceAPIError(502, "بچ یک واریژن را رد کرد یا id معتبر/یکتا نداد؛ ساخت کامل تأیید نشد.")
+            if field_errors(sent, got, variation=True):
+                reread = await client.get(f"{base}/{product_id}/variations/{identity}")
+                got = json_body(reread) if reread.is_success else None
+                if field_errors(sent, got, expected_id=identity, variation=True):
+                    raise WooCommerceAPIError(502, "قیمت/گزینه/موجودی واریژن با مقدار تأییدشده یکی نیست.")
+            seen_ids.add(identity)
+            created += 1
+    audit.log(f"[variation] {created} variation ساخته و تأیید شد (بچ)؛ ناموفق: {failed}")
 
 
 async def _rollback(
     client: WooClient, base: str, product_id: int, media_ids: list[int], audit: Sink
 ) -> None:
-    """Best-effort delete of a product we failed to finish, plus its uploads."""
+    """Delete attached media only after deletion of our own parent was confirmed."""
     try:
-        await client.delete(f"{base}/{product_id}", params={"force": "true"})
-        audit.log(f"[rollback] محصول {product_id} حذف شد.")
+        deleted = await _delete_confirmed(client, f"{base}/{product_id}")
     except Exception as exc:
-        audit.log(f"[rollback] حذف محصول {product_id} ناموفق بود: {exc}")
+        audit.log(f"[rollback] حذف محصول {product_id} ناموفق بود: {describe_exception(exc)}")
+        return
+    if not deleted:
+        audit.log(f"[rollback] حذف محصول {product_id} تأیید نشد؛ تصاویرش حفظ شدند.")
+        return
+    audit.log(f"[rollback] محصول {product_id} حذف شد (تأییدشده).")
+    removed = 0
     for media_id in media_ids or []:
         try:
-            await client.delete(f"{media_base()}/{media_id}", params={"force": "true"}, basic=True)
+            if await _delete_confirmed(client, f"{media_base()}/{media_id}", basic=True):
+                removed += 1
+            else:
+                audit.log(f"[rollback] حذف media {media_id} تأیید نشد.")
         except Exception as exc:
-            audit.log(f"[rollback] حذف media {media_id} ناموفق بود: {exc}")
-    if media_ids:
-        audit.log(f"[rollback] {len(media_ids)} تصویر آپلودشده پاک‌سازی شد.")
+            audit.log(f"[rollback] حذف media {media_id} ناموفق بود: {describe_exception(exc)}")
+    audit.log(f"[rollback] حذف {removed} از {len(media_ids)} تصویر تأیید شد.")
 
 
 async def _resolve_categories(client: WooClient, base: str, categories: list[str], audit: Sink) -> list[dict[str, int]]:
@@ -670,6 +742,12 @@ async def _resolve_categories(client: WooClient, base: str, categories: list[str
     # for ten minutes so adjacent product entries do not repeat the same taxonomy reads.
     # Dry-run IDs are synthetic and must never enter the real-shop cache.
     cacheable = not bool(getattr(client, "dry_run", False))
+    now = time.monotonic()
+    for key, (saved_at, _identifier) in list(_CATEGORY_ID_CACHE.items()):
+        if now - saved_at > _CATEGORY_CACHE_TTL_SECONDS:
+            _CATEGORY_ID_CACHE.pop(key, None)
+    while len(_CATEGORY_ID_CACHE) > 1024:
+        _CATEGORY_ID_CACHE.pop(next(iter(_CATEGORY_ID_CACHE)))
     resolved: dict[tuple[int, str], int | None] = {}
     for raw_path in categories:
         parts = [part.strip() for part in str(raw_path).replace("&gt;", ">").split(">") if part.strip()]
@@ -679,7 +757,7 @@ async def _resolve_categories(client: WooClient, base: str, categories: list[str
             if cache_key in resolved:
                 category_id = resolved[cache_key]
                 if category_id is None:
-                    continue
+                    break
                 if category_id not in seen_ids:
                     category_ids.append({"id": category_id})
                     seen_ids.add(category_id)
@@ -702,17 +780,16 @@ async def _resolve_categories(client: WooClient, base: str, categories: list[str
                 if not response.is_success:
                     resolved[cache_key] = None
                     audit.log(f"[cat] جستجوی دستهٔ «{part}» ناموفق: HTTP {response.status_code}")
-                    continue
-                items = response.json()
+                    break
+                items = json_body(response)
                 matches = [
                     item for item in items if isinstance(item, dict)
                     and str(item.get("name", "")).casefold() == part.casefold()
                 ] if isinstance(items, list) else []
                 exact = next(
-                    (item for item in matches if parent_id and int(item.get("parent", 0)) == parent_id),
+                    (item for item in matches if int(item.get("parent", 0)) == parent_id and positive_id(item)),
                     None,
                 )
-                exact = exact or (matches[0] if matches else None)
                 if exact:
                     category_id = int(exact["id"])
                     if cacheable:
@@ -720,7 +797,7 @@ async def _resolve_categories(client: WooClient, base: str, categories: list[str
                 else:
                     resolved[cache_key] = None
                     audit.log(f"[cat] دستهٔ «{part}» در فروشگاه پیدا نشد؛ نادیده گرفته شد.")
-                    continue
+                    break
 
             resolved[cache_key] = category_id
             if category_id not in seen_ids:
@@ -731,7 +808,25 @@ async def _resolve_categories(client: WooClient, base: str, categories: list[str
     return category_ids
 
 
-async def create_draft(
+def _reuse_parent_images(parent: dict[str, Any], data: dict[str, Any], attrs: list[dict[str, Any]],
+                        image_paths: list[Path], batch: str) -> dict[str, int]:
+    expected = {"name": data["title"], "type": "variable" if attrs else "simple", "status": "draft", "attributes": attrs}
+    if field_errors(expected, parent) or not any(isinstance(row, dict) and row.get("key") == publish_batch.META_BATCH
+                                              and row.get("value") == batch for row in parent.get("meta_data", [])):
+        raise WooCommerceAPIError(409, "محصول بستهٔ قبلی پس از پیش‌نمایش تغییر کرده؛ بدون دستکاری/ساخت تکراری متوقف شد")
+    images = parent.get("images")
+    if not isinstance(images, list) or len(images) != len(image_paths) or any(not positive_id(row) for row in images):
+        raise WooCommerceAPIError(409, "گالری محصول قبلی با بسته یکسان نیست؛ تصاویر ناقص منتشر نمی‌شوند")
+    metadata = {row.get("key"): row.get("value") for row in parent.get("meta_data", []) if isinstance(row, dict)}
+    ids = [positive_id(row) for row in images]
+    if "tisa_gallery_ids" in metadata and metadata["tisa_gallery_ids"] != ids:
+        raise WooCommerceAPIError(409, "گالری بسته در سایت جابه‌جا/عوض شده؛ تأیید تازه لازم است")
+    colors = [str(value) for attribute in attrs if is_color_attribute(attribute.get("name", ""))
+              for value in attribute.get("options", [])]
+    return _images_by_color(list(zip(ids, image_paths, strict=True)), colors)
+
+
+async def _create_draft_unlocked(
     data: dict[str, Any],
     image_paths: list[Path],
     *,
@@ -851,6 +946,7 @@ async def create_draft(
             min_request_interval=PUBLISH_MIN_REQUEST_INTERVAL_SECONDS,
             max_concurrent_requests=1,
         ) as client:
+            await woo_fencing.require(client, base)
             resumed: dict[str, Any] | None = None
             # A resumed attempt uploads nothing, so it has no new media ids to attach: the
             # variations it still lacks are created without a per-colour image, and saying
@@ -869,6 +965,7 @@ async def create_draft(
                 media_ids: list[int] = []
                 category_ids: list[dict[str, int]] = []
                 sku = str(resumed.get("sku") or "")
+                images_by_color = _reuse_parent_images(resumed, data, attrs, image_paths, batch_id)
                 audit.log(
                     f"[resume] محصول {product_id} از تلاش قبلی (batch {batch_id}) پیدا شد؛ "
                     "عنوان، تصویر و دسته‌ها دست‌نخورده می‌مانند و فقط واریژن‌های جاافتاده ساخته می‌شوند."
@@ -900,9 +997,9 @@ async def create_draft(
                 }
                 if sku:
                     payload["sku"] = sku
-                if common_price:
+                if common_price and not attrs:
                     payload["regular_price"] = str(common_price)
-                if sale_price:
+                if sale_price and not attrs:
                     # Never replaces regular_price: the strikethrough price has to survive
                     # the day the sale is removed, and it does if we only add a sale.
                     payload["sale_price"] = str(sale_price)
@@ -931,6 +1028,7 @@ async def create_draft(
                 meta_rows = list(data.get("meta") or []) + list(meta)
                 if batch_id:
                     meta_rows.append({"key": publish_batch.META_BATCH, "value": batch_id})
+                    meta_rows.append({"key": "tisa_gallery_ids", "value": media_ids})
                 if meta_rows:
                     payload["meta_data"] = meta_rows
                 if stock is not None:
@@ -951,9 +1049,22 @@ async def create_draft(
                     )
                 audit.log(f"[payload] {payload}")
 
-                response = await _create_with_sku_retry(client, base, payload, prefix, sku, audit)
-                product = response.json()
-                product_id = int(product["id"])
+                try:
+                    response = await _create_with_sku_retry(client, base, payload, prefix, sku, audit)
+                    product = json_body(response)
+                except woo_fencing.ExistingBatch as conflict:
+                    response = await client.get(f"{base}/{conflict.product_id}")
+                    check(response)
+                    product = json_body(response)
+                    images_by_color = _reuse_parent_images(product, data, attrs, image_paths, batch_id)
+                    resumed = product
+                    # Our competing POST was fenced before attachment. These are
+                    # only this attempt's newly uploaded, unattached files.
+                    await _rollback(client, base, 0, media_ids, audit)
+                    media_ids = []
+                product_id = positive_id(product)
+                if not product_id:
+                    raise WooCommerceAPIError(502, "ساخت محصول id معتبر برنگرداند؛ نتیجه نامعلوم است.")
                 audit.log(f"[product] محصول ساخته شد: id={product_id}, sku={product.get('sku')}")
 
             try:
@@ -972,7 +1083,7 @@ async def create_draft(
                 # colour cannot be ordered, and nobody knows which ones are
                 # missing. Remove it (and its media) and report the real error —
                 # but never a product we did not create in this attempt.
-                if resumed is not None:
+                if resumed is not None or batch_id:
                     audit.log(
                         f"[rollback] انجام نشد: محصول {product_id} از تلاش قبلی است و "
                         "ممکن است کسی رویش کار کرده باشد. "
@@ -1016,3 +1127,16 @@ async def create_draft(
             pass
         logger.exception("create_draft failed unexpectedly")
         raise
+
+
+async def create_draft(
+    data: dict[str, Any], image_paths: list[Path], *, dry_run: bool = False,
+    report: list[str] | None = None, batch_id: str = "", resume_existing: bool = True,
+    meta: Sequence[dict[str, str]] = (), transport: httpx.BaseTransport | None = None,
+) -> tuple[int, str]:
+    """Serialize identical live attempts across tasks/processes on the state volume."""
+    async with publish_lease.hold(products_base(), batch_id if not dry_run else ""):
+        return await _create_draft_unlocked(
+            data, image_paths, dry_run=dry_run, report=report, batch_id=batch_id,
+            resume_existing=bool(batch_id) or resume_existing, meta=meta, transport=transport,
+        )

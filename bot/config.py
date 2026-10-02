@@ -9,6 +9,7 @@ logged, so ``LOG_LEVEL=DEBUG`` or the ``📊 وضعیت`` screen can surface it.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 from dataclasses import dataclass, field
@@ -65,7 +66,10 @@ def _as_float(name: str, default: float) -> tuple[float, str | None]:
     if not raw:
         return default, None
     try:
-        return float(raw), None
+        value = float(raw)
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError("must be positive and finite")
+        return value, None
     except ValueError:
         return default, f"{name}={raw!r} یک عدد نیست؛ پیش‌فرض {default} استفاده شد."
 
@@ -232,7 +236,7 @@ class Settings:
         note(problem)
         price_max, problem = _as_int("PRICE_MAX", 500_000_000)
         note(problem)
-        if price_max <= price_min:
+        if price_min <= 0 or price_max <= price_min:
             note("PRICE_MAX باید بزرگ‌تر از PRICE_MIN باشد؛ به پیش‌فرض برگشت.")
             price_min, price_max = 1_000, 500_000_000
 
@@ -252,12 +256,19 @@ class Settings:
         note(problem)
         if flow_timeout < 60:
             flow_timeout = 60
+            note("FLOW_TIMEOUT_SECONDS باید حداقل ۶۰ باشد؛ روی ۶۰ تنظیم شد.")
         temp_ttl, problem = _as_int("TEMP_TTL_HOURS", 12)
         note(problem)
+        if temp_ttl <= 0:
+            temp_ttl = 12
+            note("TEMP_TTL_HOURS باید مثبت باشد؛ پیش‌فرض ۱۲ استفاده شد.")
         max_file_mb, problem = _as_float("MAX_FILE_MB", 25.0)
         note(problem)
         max_rows, problem = _as_int("MAX_ROWS", 200_000)
         note(problem)
+        if max_rows <= 0:
+            max_rows = 200_000
+            note("MAX_ROWS باید مثبت باشد؛ پیش‌فرض ۲۰۰٬۰۰۰ استفاده شد.")
         process_timeout, problem = _as_float("PROCESS_TIMEOUT_SECONDS", 120.0)
         note(problem)
 
@@ -319,7 +330,7 @@ def _as_int_list(name: str, default: set[int]) -> tuple[frozenset[int], str | No
     values: set[int] = set()
     for part in raw.split(","):
         part = part.strip()
-        if part.isdigit() and 4 <= int(part) <= 40:
+        if re.fullmatch(r"[0-9]+", part) and 4 <= int(part) <= 40:
             values.add(int(part))
         elif part:
             return frozenset(default), f"{name}: «{part}» طول معتبری ندارد؛ پیش‌فرض {sorted(default)}."

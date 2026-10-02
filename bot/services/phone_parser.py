@@ -15,6 +15,8 @@ import re
 import unicodedata
 from dataclasses import dataclass
 
+from bot.services.airpods_parser import AIRPODS_BRAND_RE, AIRPODS_START_RE, extract_airpods_models
+
 # ---------------------------------------------------------------------------
 # Text cleaning
 # ---------------------------------------------------------------------------
@@ -78,7 +80,11 @@ _VARIANT_FOLD: tuple[tuple[str, str], ...] = (
     ("پروپلاس", "pro plus"),
 )
 _VARIANT_RE = re.compile(
-    "|".join(re.escape(word) for word, _ in _VARIANT_FOLD), re.IGNORECASE
+    "|".join(
+        # «ایر» is an iPhone variant only as its own word, not inside «ایرپاد».
+        r"(?<![^\W\d_])ایر(?![^\W\d_])" if word == "ایر" else re.escape(word)
+        for word, _ in _VARIANT_FOLD
+    ), re.IGNORECASE
 )
 _VARIANT_MAP = dict(_VARIANT_FOLD)
 
@@ -246,6 +252,10 @@ def extract_iphone_models(text: str) -> list[PhoneModel]:
             continue
         low = line.lower()
 
+        # AirPods is a separate family, even under an earlier Apple heading.
+        # Its bare «1/2» and «Pro2» rows must never become iPhone generations.
+        if AIRPODS_START_RE.match(line):
+            in_apple = False
         # Section/context markers.
         if not _iphone_tail(line) and _IPHONE_BRAND_RE.search(low):
             in_apple = True
@@ -270,6 +280,9 @@ def extract_iphone_models(text: str) -> list[PhoneModel]:
         # Usually one line contains one group: iphone 17promax or iphone 7/8.
         # A defensive split on pipes/commas/semicolons handles several groups.
         for group in re.split(r"\s*[|,;]\s*", tail):
+            accessory = AIRPODS_BRAND_RE.search(group)
+            if accessory:
+                group = group[:accessory.start()].rstrip(" +")
             parts = [p.strip() for p in re.split(r"\s*/\s*", group) if p.strip()]
             models: list[PhoneModel] = []
             for part in parts:
@@ -278,8 +291,13 @@ def extract_iphone_models(text: str) -> list[PhoneModel]:
                 # an Apple section «1098» used to match the 2-digit prefix «10» and
                 # invent an iPhone 10, adding a whole extra model (and its
                 # variations) to the product.
+                # The brand can repeat after a pipe or slash, including when
+                # re-parsing our own canonical «iPhone … | iPhone …» list. Losing
+                # that prefix used to drop models or split compatibility groups
+                # during the AI normalizer's deterministic-candidate safety check.
                 m = re.match(
-                    r"(?i)(x(?:s\s*max|s|r)?|\d{1,2})(?!\d)"
+                    rf"(?i)(?:{_IPHONE_BRAND}\s*)?"
+                    r"(x(?:s\s*max|s|r)?|\d{1,2})(?!\d)"
                     r"(?:\s*(?:pro\s*max|promax|max|mini|air|pro|plus|\+))?",
                     part,
                 )
@@ -332,6 +350,8 @@ def extract_samsung_models(text: str) -> list[PhoneModel]:
         line = raw_line.strip()
         if not line:
             continue
+        if AIRPODS_START_RE.match(line):
+            samsung_context = xiaomi_context = False
         if _SAMSUNG_HEADER_RE.fullmatch(line):
             samsung_context = True
             xiaomi_context = False
@@ -482,6 +502,8 @@ def extract_xiaomi_models(text: str) -> list[PhoneModel]:
         line = raw_line.strip()
         if not line:
             continue
+        if AIRPODS_START_RE.match(line):
+            xiaomi_context = False
         if _XIAOMI_HEADER_RE.fullmatch(line):
             xiaomi_context = True
             continue
@@ -622,6 +644,13 @@ def normalize_caption(text: str) -> str:
     return " | ".join(item.label for item in extract_phone_models(text))
 
 
+def normalize_product_models(text: str) -> str:
+    """The model-normalizer input/output includes phones AND AirPods."""
+    labels = [item.label for item in extract_phone_models(text)]
+    labels.extend(extract_airpods_models(text))
+    return " | ".join(dict.fromkeys(labels))
+
+
 __all__ = [
     "PhoneModel",
     "extract_iphone_models",
@@ -630,6 +659,7 @@ __all__ = [
     "extract_xiaomi_models",
     "fold_variant_words",
     "normalize_caption",
+    "normalize_product_models",
     "remove_emojis",
     "unmatched_model_words",
 ]

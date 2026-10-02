@@ -80,8 +80,8 @@ BASE: dict[str, dict[str, Any]] = {
     # belong in the same table instead of a special case in the parser.
     "airpods": {
         "label": "AirPods",
-        "words": ["airpods", "ایرپاد", "ایرپادز", "هندزفری اپل"],
-        "variants": ["pro", "pro 2", "pro 3", "max", "4", "3"],
+        "words": ["airpods", "airpod", "air pods", "ایرپاد", "ايرپاد", "ایرپادز", "هندزفری اپل"],
+        "variants": ["1", "2", "1/2", "3", "4", "pro", "pro 2", "pro2", "pro 3", "pro3", "max"],
     },
     "watch": {
         "label": "Watch",

@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import re
 import time
 from datetime import UTC, datetime
@@ -116,7 +117,25 @@ class WooCommerceAPIError(RuntimeError):
     def __init__(self, status_code: int, message: str, diagnostics: Sequence[str] | None = None):
         self.status_code = status_code
         self.diagnostics = list(diagnostics or [])
-        super().__init__(message)
+        self.retry_after: float = 0.0
+        super().__init__(redact(message))
+
+
+def retry_after(response: httpx.Response) -> float | None:
+    raw = response.headers.get("Retry-After", "").strip()
+    if not raw:
+        return None
+    try:
+        seconds = float(raw)
+    except ValueError:
+        try:
+            value = parsedate_to_datetime(raw)
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=UTC)
+            seconds = (value - datetime.now(UTC)).total_seconds()
+        except (TypeError, ValueError, OverflowError):
+            return None
+    return max(0.0, seconds) if math.isfinite(seconds) else None
 
 
 def auth_params(key: str | None = None, secret: str | None = None) -> dict[str, str]:
@@ -230,7 +249,9 @@ def check(response: httpx.Response) -> httpx.Response:
     """Raise a readable :class:`WooCommerceAPIError` instead of httpx's URL-leaking one."""
     if response.is_success:
         return response
-    raise WooCommerceAPIError(response.status_code, error_message(response))
+    error = WooCommerceAPIError(response.status_code, error_message(response))
+    error.retry_after = retry_after(response) or 0.0
+    raise error
 
 
 class WooClient:
@@ -353,7 +374,8 @@ class WooClient:
                         f"[http:start] #{request_id} {method} {path} "
                         f"(تلاش {attempt + 1}/{self.attempts}؛ مهلت هر فاز={self.timeout_seconds:g}s)"
                     )
-                    response = await self._client.request(method, str(url), **merged)
+                    async with asyncio.timeout(max(1.0, self.timeout_seconds * 2)):
+                        response = await self._client.request(method, str(url), **merged)
             except httpx.TransportError as exc:
                 elapsed_ms = (time.perf_counter() - started) * 1000
                 retry = not last_try and self._retry_network(exc)
@@ -399,6 +421,8 @@ class WooClient:
 
     @staticmethod
     def _retry_status(method: str, response: httpx.Response) -> bool:
+        if (retry_after(response) or 0) > 30:
+            return False  # Do not retry EARLIER than a long server deferral. Queue it instead.
         if response.status_code in RETRY_ALWAYS:
             return True
         # 429 is the rate limiter saying "not processed"; a 5xx on a write may mean
@@ -407,22 +431,8 @@ class WooClient:
 
     @staticmethod
     def _retry_delay(response: httpx.Response, attempt: int) -> float:
-        """Use exponential backoff, but never retry earlier than the server requested."""
-        fallback = float(2**attempt)
-        raw = response.headers.get("Retry-After", "").strip()
-        if not raw:
-            return fallback
-        try:
-            requested = max(0.0, float(raw))
-        except ValueError:
-            try:
-                retry_at = parsedate_to_datetime(raw)
-                if retry_at.tzinfo is None:
-                    retry_at = retry_at.replace(tzinfo=UTC)
-                requested = max(0.0, (retry_at - datetime.now(UTC)).total_seconds())
-            except (TypeError, ValueError, OverflowError):
-                return fallback
-        return max(fallback, requested)
+        fallback = float(2 ** min(max(attempt, 0), 5))
+        return min(30.0, max(fallback, retry_after(response) or 0.0))
 
     async def get(self, url: str, **kwargs: Any) -> httpx.Response:
         return await self.request("GET", url, **kwargs)
@@ -581,9 +591,9 @@ def dry_run_transport(audit: Sink) -> httpx.MockTransport:
             except ValueError:
                 sent = {}
             created = []
-            for _chunk in sent.get("create") or []:
+            for chunk in sent.get("create") or []:
                 ids["variation"] += 1
-                created.append({"id": ids["variation"]})
+                created.append(dict(chunk) | {"id": ids["variation"]})
             # `update` is echoed back with the values we asked for: the restock writer
             # verifies its own write from this response, and a rehearsal that skips it would
             # be rehearsing half the path.
@@ -598,7 +608,7 @@ def dry_run_transport(audit: Sink) -> httpx.MockTransport:
             return httpx.Response(201, json={"create": created, "update": echoed, "delete": removed})
         if method == "POST" and "/variations" in path:
             ids["variation"] += 1
-            return httpx.Response(201, json={"id": ids["variation"]})
+            return httpx.Response(201, json=(json.loads(body) if body else {}) | {"id": ids["variation"]})
         if method == "POST" and path.endswith("/products"):
             ids["product"] += 1
             sku_value = ""
@@ -606,9 +616,9 @@ def dry_run_transport(audit: Sink) -> httpx.MockTransport:
                 sku_value = str(json.loads(body).get("sku") or "")
             except ValueError:
                 pass
-            return httpx.Response(201, json={"id": ids["product"], "sku": sku_value})
+            return httpx.Response(201, json=(json.loads(body) if body else {}) | {"id": ids["product"], "sku": sku_value})
         if method in ("PUT", "PATCH"):
-            return httpx.Response(200, json={})
+            return httpx.Response(200, json=(json.loads(body) if body else {}) | {"id": int(path.rsplit("/", 1)[-1])})
         if method == "DELETE":
             return httpx.Response(200, json={"deleted": True, "previous": {"status": "trash"}})
         return httpx.Response(200, json={})

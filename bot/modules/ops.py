@@ -246,7 +246,8 @@ async def _check_woocommerce() -> Check:
     if not (settings.woocommerce_url and settings.woocommerce_key and settings.woocommerce_secret):
         return Check("WooCommerce", "bad", "سه‌تاییِ WooCommerce در .env کامل نیست",
                      "WOOCOMMERCE_URL / _KEY / _SECRET.")
-    result = await ping_woocommerce()
+    result = await ping_woocommerce(settings.woocommerce_url, settings.woocommerce_key,
+                                    settings.woocommerce_secret, settings.woocommerce_version)
     if result.ok:
         return Check("WooCommerce", "ok", f"HTTP {result.status_code} · {result.elapsed_ms:.0f} ms")
     return Check("WooCommerce", "bad", f"{result.status_code or '—'} · {result.message}",
@@ -254,6 +255,8 @@ async def _check_woocommerce() -> Check:
 
 
 async def _check_wordpress() -> Check:
+    if settings.woo_dry_run:
+        return Check("رسانهٔ وردپرس", "warn", "🧪 در dry-run آپلود/حذف زنده انجام نمی‌شود؛ تست رسانه اجرا نشد.")
     if not (settings.wordpress_url and settings.wordpress_username and settings.wordpress_app_password):
         return Check("رسانهٔ وردپرس", "bad", "WORDPRESS_URL/_USERNAME/_APP_PASSWORD کامل نیست",
                      "Application Password از صفحهٔ کاربران وردپرس ساخته می‌شود.")

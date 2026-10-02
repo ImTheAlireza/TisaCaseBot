@@ -34,6 +34,12 @@ from bot.services.category_taxonomy import (
 )
 from bot.services.color_matrix import color_key
 from bot.services.phone_parser import extract_phone_models, fold_variant_words
+from bot.services.airpods_parser import (
+    AIRPODS_ATTRIBUTE,
+    canonical_airpods_model,
+    is_airpods_attribute,
+    split_device_axes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -242,7 +248,8 @@ def parse_colors(text: str) -> list[str]:
 
 
 def parse_models(text: str) -> list[str]:
-    items = _split_items(text)
+    # Slashes inside iPhone/AirPods compatibility labels are not list separators.
+    items = _split_items(text, paths=True)
     if not items:
         return []
     seen: set[str] = set()
@@ -252,18 +259,20 @@ def parse_models(text: str) -> list[str]:
         # the rest verbatim: the owner may name a model the parser does not know,
         # and their word beats our absence of a rule.
         folded = fold_variant_words(item)
-        parsed = extract_phone_models(folded)
-        if not parsed:
+        accessory = canonical_airpods_model(item)
+        parsed = extract_phone_models(folded) if not accessory else []
+        if not parsed and not accessory:
             # A bare «13 پرو مکس» under no header: the same reading rule the
             # caption parser uses (an Apple section) canonicalises it instead of
             # storing a label no variation will ever match.
             parsed = extract_phone_models(f"Apple\n{folded}")
-        label = parsed[0].label if len(parsed) == 1 else item
-        key = re.sub(r"\s+", " ", label).casefold()
-        if key in seen:
-            raise ValueError(f"«{label}» دو بار نوشته شده؛ یکی را حذف کن.")
-        seen.add(key)
-        out.append(label)
+        labels = [accessory] if accessory else [model.label for model in parsed] or [item]
+        for label in labels:
+            key = re.sub(r"\s+", " ", label).casefold()
+            if key in seen:
+                raise ValueError(f"«{label}» دو بار نوشته شده؛ یکی را حذف کن.")
+            seen.add(key)
+            out.append(label)
     if not out:
         raise ValueError("هیچ مدلی نفهمیدم؛ هر مدل را در یک خط بنویس (مثلاً «13 پرو مکس»).")
     return out
@@ -334,6 +343,23 @@ def parse_attribute(text: str) -> list[str]:
     if len(items) < 2:
         raise ValueError("حداقل دو مقدار بنویس یا ویژگی را حذف کن.")
     return items
+
+
+def parse_airpods_attribute(text: str) -> list[str]:
+    """An explicit device axis may have one option; slashes stay inside labels."""
+    if _is_clear(text):
+        return []
+    out: list[str] = []
+    for item in _split_items(text, paths=True):
+        model = canonical_airpods_model(item) or canonical_airpods_model("AirPods " + item)
+        if not model:
+            raise ValueError(f"مدل ایرپاد «{item}» شناخته نشد؛ مثلاً «AirPod 1/2» یا «AirPod pro2» بنویس.")
+        if model in out:
+            raise ValueError(f"«{model}» دو بار نوشته شده؛ یکی را حذف کن.")
+        out.append(model)
+    if not out:
+        raise ValueError("حداقل یک مدل ایرپاد بنویس یا ویژگی را حذف کن.")
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -513,7 +539,12 @@ def apply_edit(data: Any, key: str, raw: str) -> str | None:
     try:
         if key.startswith("attr:"):
             name = key.split(":", 1)[1]
-            values = parse_attribute(raw)
+            if is_airpods_attribute(name):
+                name = AIRPODS_ATTRIBUTE
+                key = "attr:" + name
+                values = parse_airpods_attribute(raw)
+            else:
+                values = parse_attribute(raw)
             attributes = dict(getattr(data, "attributes", None) or {})
             if values:
                 attributes[name] = values
@@ -572,6 +603,9 @@ def apply_edit(data: Any, key: str, raw: str) -> str | None:
                 evidence_key = key
     except ValueError as exc:
         return str(exc)
+
+    if key == "models" or key == "attr:" + AIRPODS_ATTRIBUTE:
+        data.models, data.attributes = split_device_axes(data.models, data.attributes)
 
     if key in {"price", "prices", "model_prices"}:
         # A typed price is a decision, and it answers the question the parser had

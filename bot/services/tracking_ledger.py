@@ -21,6 +21,7 @@ import hashlib
 import logging
 import threading
 import time
+import json
 from pathlib import Path
 from typing import Any
 
@@ -143,8 +144,12 @@ def probe() -> tuple[int, str]:
         raw = FILE.read_text(encoding="utf-8")
     except OSError as exc:
         return 0, f"دفتر فایل‌های ردیابی خوانده نشد: {exc}"
+    try:
+        payload = json.loads(raw)
+    except (ValueError, TypeError):
+        payload = None
     entries = _load()
-    if raw.strip() and not entries:
+    if not isinstance(payload, dict) or not isinstance(payload.get("entries"), list):
         return 0, f"{FILE} قابل‌خواندن نیست؛ هشدار «این فایل قبلاً پردازش شده» از کار می‌افتد."
     return len(entries), ""
 

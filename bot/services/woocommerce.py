@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 import httpx
 
+from bot.services.woo_contract import positive_id
 from bot.services.woo_client import Audit, WooClient, body_snippet, describe_exception, products_base
 
 logger = logging.getLogger(__name__)
@@ -48,7 +49,12 @@ async def ping_woocommerce(
         ) as client:
             response = await client.get(products_base(url, version), params={"per_page": 1})
         elapsed = (time.perf_counter() - started) * 1000
-        if response.is_success:
+        try:
+            body = response.json()
+        except ValueError:
+            body = None
+        valid = isinstance(body, list) and all(positive_id(row) > 0 for row in body)
+        if response.is_success and valid:
             logger.info("WooCommerce ping trace: %s", audit.text())
             return WooCommerceResult(True, response.status_code, "Connected", elapsed)
         # The response body is useful for distinguishing WooCommerce permissions
@@ -59,7 +65,9 @@ async def ping_woocommerce(
         # client helper rather than sliced by hand.
         logger.warning("WooCommerce response body: %s", body_snippet(response, 800))
         logger.warning("WooCommerce ping trace: %s", audit.text())
-        if response.status_code == 401:
+        if response.is_success:
+            message = "پاسخ WooCommerce معتبر نیست (JSON فهرست محصولات انتظار می‌رفت)."
+        elif response.status_code == 401:
             message = "Authentication failed (check the consumer key and secret)."
         elif response.status_code == 403:
             message = "Forbidden (check key permissions, security plugins, or WAF/Cloudflare rules)."

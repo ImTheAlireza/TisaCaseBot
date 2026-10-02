@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 import re
 
-from bot.services.jsonstore import lock_for, read_json, write_json
+from bot.services.jsonstore import checked_write, lock_for, read_json, write_json
 from bot.config import data_dir
 
 logger = logging.getLogger(__name__)
@@ -95,7 +95,7 @@ def set_rule(source: str, target: str) -> None:
     rules_map = {str(k): str(v) for k, v in (existing or {}).items()}
     rules_map[source] = target
     with _lock:
-        write_json(VOCAB_FILE, {"version": 1, "rules": rules_map})
+        checked_write(VOCAB_FILE, {"version": 1, "rules": rules_map}, write_json)
     invalidate()
 
 
@@ -107,7 +107,7 @@ def remove_rule(source: str) -> bool:
         return False
     rules_map.pop(source)
     with _lock:
-        write_json(VOCAB_FILE, {"version": 1, "rules": rules_map})
+        checked_write(VOCAB_FILE, {"version": 1, "rules": rules_map}, write_json)
     invalidate()
     return True
 

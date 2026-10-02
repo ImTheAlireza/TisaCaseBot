@@ -31,7 +31,6 @@ import asyncio
 import html
 import io
 import logging
-import shutil
 from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -48,8 +47,10 @@ from telegram.ext import (
 from bot.buttons import feature_allowed
 from bot.config import settings
 from bot.constants import CB
+from bot.services.conversations import FlowConversationHandler
 from bot.keyboards import main_menu_keyboard, main_menu_text
-from bot.services import metrics, processor, tracking_ledger, workspace
+from bot.services import flow_guard, metrics, processor, tracking_ledger, worker, workspace
+from bot.services.access import guard_feature
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,18 @@ ALLOWED_EXTS = {".xlsx", ".csv", ".pdf"}
 #: Where a download waits between messages (swept, like the product flow's workspace).
 TEMP_DIR = Path("/tmp/tisaposttowp-tracking")
 PENDING_KEY = "tisa_tracking_pending"
+_active_contexts: dict[int, ContextTypes.DEFAULT_TYPE] = {}
+
+
+def close_for(user_id: int) -> bool:
+    context = _active_contexts.pop(user_id, None)
+    if context is None:
+        return False
+    _release(context)
+    return True
+
+
+flow_guard.register("tracking", "تبدیل کد رهگیری", close_for)
 
 #: «trk:pick:<field>:<column index>» — the answer to a column question.
 PICK_PREFIX = "trk:pick:"
@@ -122,7 +135,7 @@ def _release(context: ContextTypes.DEFAULT_TYPE) -> None:
         context.chat_data.pop(PENDING_KEY, None)
     directory = state.get("dir")
     if directory:
-        shutil.rmtree(str(directory), ignore_errors=True)
+        workspace.remove(Path(str(directory)))
 
 
 # --- Flow steps ---------------------------------------------------------------
@@ -137,12 +150,16 @@ async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await query.answer("⛔ دسترسی ندارید.", show_alert=True)
         return ConversationHandler.END
 
+    flow_guard.close_others("tracking", user.id)
+    close_for(user.id)
+    _active_contexts[user.id] = context
     await query.answer()
     logger.info("User %s entered tracking-converter flow", user.id)
     await query.edit_message_text(INSTRUCTIONS, reply_markup=_cancel_keyboard(), parse_mode="HTML")
     return ASK_FILE
 
 
+@guard_feature("tracking", on_denial=close_for, checker=lambda uid, key: feature_allowed(uid, key))
 async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """A document arrived while we're waiting — process it, or ask what it means."""
     msg = update.effective_message
@@ -162,6 +179,7 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 
     status = await msg.reply_text("⏳ در حال پردازش…")
     directory = workspace.new_dir(TEMP_DIR, user_id)
+    workspace.protect(directory)
     tmp = directory / f"input{ext}"
     _hold(context, dir=str(directory), path=str(tmp), fname=fname, user_id=user_id)
     try:
@@ -179,6 +197,8 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
             _release(context)
             return ASK_FILE
         await tg_file.download_to_drive(str(tmp))
+        if tmp.stat().st_size > settings.max_file_mb * 1024 * 1024:
+            raise processor.RowLimitError("حجم واقعی فایل دانلودشده از MAX_FILE_MB بیشتر است")
     except Exception as exc:
         # Only the download is wrapped: `_run` answers a bad file with a message of its
         # own, and a failed *send* must not be reported as «خطا در پردازش».
@@ -200,17 +220,15 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 
 
 async def _run(path: Path, fname: str, layout: processor.Layout | None = None):
-    """Process in a worker thread with a time ceiling, so the bot never blocks.
+    """Process in a bounded, killable worker; the time ceiling stops actual work.
 
     Returns the :class:`~bot.services.processor.Report`, or a ready-to-send message
     when the file itself is unusable (too many rows / unreadable) — the caller only
     has to choose where to send it.
     """
     try:
-        return await asyncio.wait_for(
-            asyncio.to_thread(processor.process_file, str(path), fname, layout=layout),
-            timeout=settings.process_timeout_seconds,
-        )
+        return await worker.run(processor.process_file, str(path), fname, layout=layout,
+                                timeout=settings.process_timeout_seconds)
     except TimeoutError:
         return (
             f"⏱️ پردازش فایل بیشتر از {settings.process_timeout_seconds:g} ثانیه طول کشید. "
@@ -351,6 +369,7 @@ async def _finish(msg, status, context: ContextTypes.DEFAULT_TYPE, report) -> in
     return ASK_FILE
 
 
+@guard_feature("tracking", on_denial=close_for, checker=lambda uid, key: feature_allowed(uid, key))
 async def on_pick_column(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """An answer to «کدام ستون؟» → re-read the same file with that column."""
     query = update.callback_query
@@ -403,6 +422,7 @@ async def _ask_about_repeat(msg, earlier: dict) -> int:
     return DUPLICATE_FILE
 
 
+@guard_feature("tracking", on_denial=close_for, checker=lambda uid, key: feature_allowed(uid, key))
 async def on_retry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """«🔁 دوباره پردازشش کن» → the file on disk is processed again, on purpose."""
     query = update.callback_query
@@ -420,6 +440,7 @@ async def on_retry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return await _finish(query.message, status, context, report)
 
 
+@guard_feature("tracking", on_denial=close_for, checker=lambda uid, key: feature_allowed(uid, key))
 async def on_send_another(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """«📤 فایل دیگری بفرست» → drop this one, stay in the flow."""
     query = update.callback_query
@@ -429,6 +450,7 @@ async def on_send_another(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     return ASK_FILE
 
 
+@guard_feature("tracking", on_denial=close_for, checker=lambda uid, key: feature_allowed(uid, key))
 async def on_wrong_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Text/photo/etc. while waiting for a file — nudge."""
     await update.effective_message.reply_text(
@@ -446,6 +468,8 @@ async def cb_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     user = update.effective_user
     await query.answer()
+    if user:
+        close_for(user.id)
     _release(context)
     await query.edit_message_text(
         main_menu_text(user.id if user else None, user),
@@ -458,6 +482,8 @@ async def cb_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def cmd_exit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """/cancel, /start or /menu during the flow → end it, show main menu."""
     user = update.effective_user
+    if user:
+        close_for(user.id)
     _release(context)
     await update.effective_message.reply_html(
         main_menu_text(user.id if user else None, user),
@@ -491,7 +517,8 @@ async def sweep(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def register(app: Application) -> None:
-    conv = ConversationHandler(
+    conv = FlowConversationHandler(
+        flow="tracking",
         entry_points=[CallbackQueryHandler(entry, pattern=f"^{CB.TRACKING_CONVERT}$")],
         states={
             ASK_FILE: [

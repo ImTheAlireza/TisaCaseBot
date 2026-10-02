@@ -8,7 +8,10 @@ from telegram import BotCommand, Chat, Update
 from telegram.ext import Application, ApplicationBuilder
 from telegram.request import HTTPXRequest
 
+from bot import rbac
 from bot.config import settings
+from bot.services import flow_guard
+from bot.services.update_processor import PerUserUpdateProcessor, lock_for_user
 from bot.modules import register_all
 from bot.modules.outbox_flow import start as start_outbox
 from bot.modules.product_flow import notify_interrupted_flows
@@ -51,6 +54,11 @@ class PrivateOnlyApplication(Application):
     """
 
     async def process_update(self, update: object) -> None:
+        user = update.effective_user if isinstance(update, Update) else None
+        async with lock_for_user(user.id if user else 0):
+            await self._dispatch_update(update)
+
+    async def _dispatch_update(self, update: object) -> None:
         if isinstance(update, Update):
             user = update.effective_user
             set_current_user(user.id if user else None)
@@ -62,6 +70,16 @@ class PrivateOnlyApplication(Application):
                 chat.id,
             )
             return
+        if isinstance(update, Update):
+            user = update.effective_user
+            message = update.effective_message
+            # /start must stay reachable so a pending invite can be redeemed.
+            is_start = bool(message and message.text and message.text.split(maxsplit=1)[0].split("@")[0] == "/start")
+            if user and not rbac.is_allowed(user.id) and not is_start:
+                flow_guard.close_others("", user.id)
+                from bot.modules.start import _deny
+                await _deny(update)
+                return
         await super().process_update(update)
 
 
@@ -80,6 +98,12 @@ async def _post_init(app: Application) -> None:
     # A publish the shop refused (429/5xx) waits in data/outbox.sqlite3 and is retried by
     # itself — including the ones left over from before this restart.
     await start_outbox(app)
+
+
+async def _post_stop(app: Application) -> None:
+    from bot.modules import image_compress, product_flow
+    await product_flow.shutdown()
+    await image_compress.shutdown()
 
 
 def build_application() -> Application:
@@ -108,7 +132,9 @@ def build_application() -> Application:
         .request(api_request)
         .get_updates_request(polling_request)
         .application_class(PrivateOnlyApplication)
+        .concurrent_updates(PerUserUpdateProcessor(8))
         .post_init(_post_init)
+        .post_stop(_post_stop)
         .build()
     )
     register_all(app)

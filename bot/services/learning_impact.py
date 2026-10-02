@@ -163,7 +163,7 @@ def _project_terms(rule: Rule, entries: list[dict[str, Any]]) -> Impact:
             for name, values in (entry.get("model_colors") or {}).items()
         }
         before_count = plan.plan_from_dict(
-            {"models": models, "attributes": attributes, "model_colors": restrictions}
+            {**entry, "models": models, "attributes": attributes, "model_colors": restrictions}
         ).count
         after_restrictions = {
             _mapped([name], wrong, right)[0]: _mapped(values, wrong, right)
@@ -171,6 +171,12 @@ def _project_terms(rule: Rule, entries: list[dict[str, Any]]) -> Impact:
         }
         after_count = plan.plan_from_dict(
             {
+                **entry,
+                "stock_matrix": {
+                    _mapped([design], wrong, right)[0]: {
+                        _mapped([model], wrong, right)[0]: quantity for model, quantity in values.items()
+                    } for design, values in (entry.get("stock_matrix") or {}).items()
+                },
                 "models": after_models,
                 "attributes": after_attrs,
                 "model_colors": after_restrictions,

@@ -25,7 +25,11 @@ def check_config() -> int:
     """
     # Imported here rather than at the top: `--version` and `--check-config` have to work on a
     # host that has no .env yet — that is exactly when someone reaches for them.
-    from bot.config import data_dir, settings
+    try:
+        from bot.config import data_dir, settings
+    except RuntimeError as exc:
+        print(f"⚠️ config: {exc}", file=sys.stderr)
+        return 1
 
     problems = list(settings.problems)
     print(f"BOT_TOKEN: {'set' if settings.bot_token else 'MISSING'}")
@@ -96,7 +100,11 @@ def main() -> None:
     if args.check_config:
         sys.exit(check_config())
 
-    from bot.config import settings        # late, for the same reason as above
+    try:
+        from bot.config import settings  # late: --version works without .env
+    except RuntimeError as exc:
+        print(f"⚠️ config: {exc}", file=sys.stderr)
+        sys.exit(1)
 
     setup_logging(settings.log_level)
     if settings.problems:
