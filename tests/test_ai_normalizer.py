@@ -18,6 +18,7 @@ os.environ.setdefault("BOT_TOKEN", "123456:TEST")
 os.environ.setdefault("SUDO_IDS", "1234567")
 
 import _flow_harness as h
+from _product_samples import MASA_POLO_CAPTION, MASA_POLO_MODELS
 
 try:
     import httpx
@@ -93,14 +94,14 @@ class TestPureHelpers(unittest.TestCase):
             "Xiaomi 13",  # اینجا خودِ Xiaomi نام محصول است: باید بماند
             "  iPhone 15 Pro , ",  # فاصله و ویرگول حاشیه‌ای
             "iPhone 15 Pro",  # تکراری (casefold) حذف می‌شود
-            "AirPods Pro 2",  # لوازم جانبی به لیست مدل گوشی راه ندارد
+            "AirPods Pro 2",  # ایرپاد حالا یک مدل معتبر محصول است؛ خانواده‌اش جدا می‌ماند
             "A16/A26",  # shorthandهای slashدار باید از parser و به‌صورت جداگانه بیایند
             "Redmi Note 9 Pro/9S",
             "iPhone 7/8",  # گروه سازگاری آیفون همچنان یک گزینه است
             42,  # ورودیِ غیررشته‌ای نادیده گرفته می‌شود
         ]
         self.assertEqual(
-            ["Galaxy S24", "Redmi Note 12 4G", "Xiaomi 13", "iPhone 15 Pro", "iPhone 7/8"],
+            ["Galaxy S24", "Redmi Note 12 4G", "Xiaomi 13", "iPhone 15 Pro", "AirPods Pro 2", "iPhone 7/8"],
             ai_normalizer._clean_model_list(values),
         )
 
@@ -169,6 +170,18 @@ A55"""
             out = asyncio.run(ai_normalizer.ai_normalize(raw, deterministic))
         self.assertEqual("S24 FE | A55", out)
         self.assertIn("omitted 1 deterministic model", "\n".join(logs.output))
+
+    def test_empty_ai_answer_preserves_every_masa_polo_compatibility_group(self) -> None:
+        deterministic = " | ".join(MASA_POLO_MODELS)
+        fake = _FailingPost(_completion('{"models": []}'))
+        with (
+            patch.object(ai_normalizer, "AI_BASE_URL", "https://ai.example/v1"),
+            patch.object(ai_normalizer, "AI_TOKEN", "sk-test"),
+            patch.object(ai_normalizer, "AI_MODEL", "gpt-x"),
+            patch("httpx.AsyncClient.post", new=fake),
+        ):
+            out = asyncio.run(ai_normalizer.ai_normalize(MASA_POLO_CAPTION, deterministic))
+        self.assertEqual(deterministic, out, "an empty AI answer must not erase phone options")
 
     def test_ai_slash_groups_cannot_collapse_non_iphone_variants(self) -> None:
         raw = "Samsung A16/A26\nXiaomi / POCO NOTE9PRO/9S"

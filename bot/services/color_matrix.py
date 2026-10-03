@@ -38,6 +38,12 @@ from typing import Any
 from collections.abc import Iterable, Sequence
 
 from bot.services.phone_parser import EMOJI_RANGES_RE, fold_variant_words
+from bot.services.airpods_parser import (
+    AIRPODS_START_RE,
+    canonical_airpods_model,
+    extract_airpods_models,
+    is_airpods_attribute,
+)
 
 # ---------------------------------------------------------------------------
 # Text normalization
@@ -320,16 +326,15 @@ def model_signature(label: str) -> str:
     words are folded with the phone parser's own table (no second vocabulary
     here); without that, a model line written in Persian matched *no* model, and
     the seller's per-model colour list was quietly attached to another phone.
-    A trailing 4G/5G is dropped as well: the AI sometimes omits the network
-    suffix the caption had.
+    Network variants remain distinct: 4G/5G can have different physical compatibility.
     """
-    text = normalize_text(str(label or "")).strip()
+    canonical = canonical_airpods_model(str(label or ""))
+    text = normalize_text(canonical or str(label or "")).strip()
     text = _BRAND_RE.sub(" ", text)
     text = fold_variant_words(text)
     text = re.sub(r"(?i)\bpro\s*max\b", "promax", text)
     text = text.replace("+", "plus")
-    signature = _squash(text).casefold()
-    return re.sub(r"(?:4g|5g)$", "", signature)
+    return _squash(text).casefold()
 
 
 def attribute_signature(name: str) -> str:
@@ -359,6 +364,7 @@ _SECTION_WORDS = {
     "xiaomi": "xiaomi", "شیائومی": "xiaomi", "redmi": "xiaomi", "ردمی": "xiaomi",
     "poco": "xiaomi", "پوکو": "xiaomi", "huawei": "other", "هواوی": "other",
     "honor": "other", "آنر": "other", "nokia": "other", "نوکیا": "other",
+    "airpods": "airpods", "airpod": "airpods", "ایرپاد": "airpods", "ایرپادز": "airpods",
 }
 _SECTION_RE = re.compile(
     r"^\s*(?P<word>" + "|".join(re.escape(word) for word in _SECTION_WORDS) + r")\b",
@@ -439,12 +445,18 @@ def _models_on_line(line: str, section: str | None) -> tuple[list[str], str | No
     if not core:
         return [], section, None
 
+    if AIRPODS_START_RE.match(core):
+        section = "airpods"
     marker = _SECTION_RE.match(core)
     if marker:
         section = _SECTION_WORDS.get(marker.group("word").casefold(), section)
 
     labels: list[str] = []
     brand: str | None = None
+    if section == "airpods":
+        labels = extract_airpods_models("AirPods:\n" + core)
+        if labels:
+            return labels, section, "airpods"
     for candidate in ("apple", "samsung", "xiaomi"):
         if section != candidate and not _BRAND_START[candidate].match(core):
             continue
@@ -759,20 +771,51 @@ def prune_unused_colors(
 # ---------------------------------------------------------------------------
 
 
+MAX_COMBINATIONS = 1000
+MAX_AXES = 8
+
+
+class VariationLimitError(ValueError):
+    pass
+
+
 def build_combinations(
     attrs: Iterable[tuple[str, Sequence[str]]],
     restrictions: dict[str, list[str]] | None = None,
 ) -> list[dict[str, str]]:
-    """Cartesian product of the attributes, minus impossible model↔color pairs."""
-    combos: list[dict[str, str]] = [{}]
-    for name, options in attrs:
-        values = [str(option) for option in options if str(option).strip()]
-        if not values:
-            continue
-        combos = [{**combo, name: value} for combo in combos for value in values]
-    if len(combos) <= 1:
-        return combos
-    return restrict_combinations(combos, restrictions or {})
+    """Bounded product, pruning unavailable pairs before expanding later axes."""
+    axes = [(str(name), list(dict.fromkeys(str(option) for option in options if str(option).strip())))
+            for name, options in attrs]
+    axes = [(name, values) for name, values in axes if values]
+    if len(axes) > MAX_AXES or any(len(values) > MAX_COMBINATIONS for _, values in axes):
+        raise VariationLimitError("تعداد محور/گزینه‌ها از سقف ایمن ساخت واریژن بیشتر است")
+    allowed = {model_signature(name): {color_key(color) for color in colors}
+               for name, colors in (restrictions or {}).items()}
+    model_names = [name for name, _ in axes if is_model_attribute(name) or is_airpods_attribute(name)]
+    color_names = [name for name, _ in axes if is_color_attribute(name)]
+    combos: list[dict[str, str]] = []
+
+    def expand(index: int, combo: dict[str, str]) -> None:
+        if index == len(axes):
+            combos.append(dict(combo))
+            if len(combos) > MAX_COMBINATIONS:
+                raise VariationLimitError(f"بیش از {MAX_COMBINATIONS} واریژن؛ فهرست را به چند محصول تقسیم کن")
+            return
+        name, values = axes[index]
+        for value in values:
+            combo[name] = value
+            valid = all(
+                model_signature(combo[model]) not in allowed
+                or color_key(combo[color]) in allowed[model_signature(combo[model])]
+                for model in model_names if model in combo
+                for color in color_names if color in combo
+            )
+            if valid:
+                expand(index + 1, combo)
+        combo.pop(name, None)
+
+    expand(0, {})
+    return combos
 
 
 def restrict_combinations(
@@ -792,13 +835,12 @@ def restrict_combinations(
     allowed: dict[str, set[str]] = {}
     for model, colors in restrictions.items():
         values = {color_key(color) for color in colors or [] if str(color).strip()}
-        if values:
-            allowed.setdefault(model_signature(model), set()).update(values)
+        allowed.setdefault(model_signature(model), set()).update(values)
     if not allowed:
         return combos
 
     keys = list(combos[0].keys())
-    model_keys = [key for key in keys if is_model_attribute(key)]
+    model_keys = [key for key in keys if is_model_attribute(key) or is_airpods_attribute(key)]
     color_keys = [key for key in keys if is_color_attribute(key)]
     if not model_keys or not color_keys:
         return combos
@@ -814,15 +856,15 @@ def restrict_combinations(
                 continue
             usable = permitted & available
             if not usable:
-                # Nothing matched: a naming mismatch, not an empty stock list.
-                continue
+                keep = False
+                break
             if any(color_key(str(combo[name])) not in usable for name in color_keys):
                 keep = False
                 break
         if keep:
             kept.append(combo)
 
-    return kept or combos
+    return kept
 
 
 def variation_count(

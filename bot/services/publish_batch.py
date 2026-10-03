@@ -18,6 +18,9 @@ import json
 import time
 from pathlib import Path
 from typing import Any
+
+from bot.services.image_tags import colors_for_file
+from bot.services.color_matrix import is_color_attribute
 from collections.abc import Sequence
 
 #: meta key on the WooCommerce product, written through the REST API. No leading underscore,
@@ -71,25 +74,29 @@ def batch_id(
     *,
     chat_id: int | str | None = None,
 ) -> str:
-    """12 hex characters identifying this exact package.
+    """24 hex characters identifying this exact package, including ordered image bytes.
 
     The chat is part of the signature on purpose: two admins publishing an
     identical-looking product in their own chats are two intentions, not one, and
     blocking the second one because the first succeeded would be its own bug.
     """
-    images = []
-    for path in image_paths or ():
-        try:
-            size = path.stat().st_size
-        except OSError:
-            size = -1
-        images.append(f"{path.name}:{size}")
+    images: list[dict[str, Any]] = []
+    colors = [str(value) for name, values in (data.get("attributes") or {}).items()
+              if is_color_attribute(name) for value in values]
+    for raw in image_paths or ():
+        path = Path(raw)
+        digest = hashlib.sha256()
+        # Missing/unreadable images cannot share an identity with a valid draft.
+        # Stream to avoid copying every photo into memory just to identify it.
+        with path.open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+        images.append({"sha256": digest.hexdigest(), "colors": colors_for_file(path, colors)})
     payload = json.dumps(
-        {"content": _content(data), "images": sorted(images), "chat": str(chat_id or "")},
-        ensure_ascii=False,
-        sort_keys=True,
+        {"version": 3, "content": _content(data), "images": images, "chat": str(chat_id or "")},
+        ensure_ascii=False, sort_keys=True,
     )
-    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
 
 
 def source_meta(

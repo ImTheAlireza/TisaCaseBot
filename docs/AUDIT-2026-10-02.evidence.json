@@ -1,0 +1,731 @@
+{
+  "date": "2026-10-02",
+  "network": "disabled; only mocks and local fixtures",
+  "ptb_version": "21.11.1",
+  "probes": [
+    {
+      "probe": "R01_create_batch_empty_and_zero_ids_count_as_success",
+      "reproduced": true,
+      "evidence": {
+        "requested": 2,
+        "observed": [
+          {
+            "response": {
+              "create": []
+            },
+            "last_log": "[variation] 0 variation ساخته شد (بچ)؛ ناموفق: 0"
+          },
+          {
+            "response": {
+              "create": [
+                {
+                  "id": 0,
+                  "error": {
+                    "code": "failed"
+                  }
+                },
+                {
+                  "id": 0,
+                  "error": {
+                    "code": "failed"
+                  }
+                }
+              ]
+            },
+            "last_log": "[variation] 2 variation ساخته شد (بچ)؛ ناموفق: 0"
+          }
+        ]
+      }
+    },
+    {
+      "probe": "R02_individual_variation_html_200_counts_as_success",
+      "reproduced": true,
+      "evidence": {
+        "response": "HTTP 200 HTML login page",
+        "last_log": "[variation] 1 variation ساخته شد (تکی موازی)."
+      }
+    },
+    {
+      "probe": "R03_parent_update_html_and_empty_json_report_success",
+      "reproduced": true,
+      "evidence": {
+        "sent_title": "بعد",
+        "responses": [
+          {
+            "content_type": "text/plain; charset=utf-8",
+            "product_updated": true,
+            "ok": true
+          },
+          {
+            "content_type": "application/json",
+            "product_updated": true,
+            "ok": true
+          }
+        ]
+      }
+    },
+    {
+      "probe": "R04_rollback_failed_parent_delete_still_deletes_media",
+      "reproduced": true,
+      "evidence": {
+        "parent_delete_status": 403,
+        "media_delete_attempted": true,
+        "logs": [
+          "[rollback] محصول 42 حذف شد.",
+          "[rollback] 1 تصویر آپلودشده پاک‌سازی شد."
+        ]
+      }
+    },
+    {
+      "probe": "R05_resume_search_error_returns_not_found",
+      "reproduced": true,
+      "evidence": {
+        "search_status": 503,
+        "returned": null,
+        "fallback_log": [
+          "[resume] جستجوی تلاش‌های قبلی ممکن نشد (HTTP 503)؛ مسیر عادی ادامه می‌یابد."
+        ]
+      }
+    },
+    {
+      "probe": "R06_resume_search_never_visits_page_two",
+      "reproduced": true,
+      "evidence": {
+        "matching_product_on_page": 2,
+        "lookup_requests": [
+          {
+            "search": "عنوان",
+            "status": "any",
+            "per_page": 20,
+            "orderby": "date",
+            "order": "desc"
+          }
+        ],
+        "returned": null
+      }
+    },
+    {
+      "probe": "R07_unreadable_existing_variations_become_empty_or_create_all",
+      "reproduced": true,
+      "evidence": {
+        "html_200_result": [],
+        "unavailable_405_result": null
+      }
+    },
+    {
+      "probe": "R08_image_bytes_and_gallery_order_ignored_in_batch_id",
+      "reproduced": true,
+      "evidence": {
+        "different_bytes_same_id": true,
+        "image_size": 822,
+        "different_sha256": true,
+        "reordered_gallery_same_id": true
+      }
+    },
+    {
+      "probe": "R09_queue_accepts_failed_image_copy_without_missing_marker",
+      "reproduced": true,
+      "evidence": {
+        "enqueue_success": true,
+        "approved_images": 1,
+        "stored_images": 0,
+        "missing_images": 0
+      }
+    },
+    {
+      "probe": "R10_old_queue_item_still_attempted_after_48_hours",
+      "reproduced": true,
+      "evidence": {
+        "age_hours": 48,
+        "documented_cutoff_hours": 24.0,
+        "publish_attempts": 1
+      }
+    },
+    {
+      "probe": "R11_queue_ack_failure_deletes_retry_images_but_keeps_pending_row",
+      "reproduced": true,
+      "evidence": {
+        "pending_rows_after_success": 1,
+        "spooled_image_exists": false,
+        "missing_images_after_ack": 1
+      }
+    },
+    {
+      "probe": "R12_json_primary_removed_when_final_replace_fails_and_backup_not_read",
+      "reproduced": true,
+      "evidence": {
+        "save_success": false,
+        "primary_exists": false,
+        "backup_exists": true,
+        "read_result": {
+          "default": "lost"
+        }
+      }
+    },
+    {
+      "probe": "R13_admin_removal_write_failure_is_reported_success_and_reappears_on_reload",
+      "reproduced": true,
+      "evidence": {
+        "remove_reported_success": true,
+        "cached_is_admin": false,
+        "is_admin_after_reload": true
+      }
+    },
+    {
+      "probe": "R14_publish_intent_record_returns_entry_despite_failed_storage",
+      "reproduced": true,
+      "evidence": {
+        "returned_status": "pending",
+        "persisted_entries": 0
+      }
+    },
+    {
+      "probe": "R15_expired_admin_invite_is_hidden_but_redeemable",
+      "reproduced": true,
+      "evidence": {
+        "invite_age_seconds": 86401,
+        "pending_list_empty": true,
+        "accepted": true,
+        "admin_granted": true
+      }
+    },
+    {
+      "probe": "R16_forwarded_admin_message_uses_removed_PTB_attribute",
+      "reproduced": true,
+      "evidence": {
+        "ptb_version": "21.11.1",
+        "exception": "'Message' object has no attribute 'forward_from'",
+        "forward_origin_type": "MessageOriginUser"
+      }
+    },
+    {
+      "probe": "R17_denied_start_does_not_await_reply",
+      "reproduced": true,
+      "evidence": {
+        "replies_sent": 0,
+        "runtime_warnings": [
+          "coroutine 'FakeChat.reply_text' was never awaited"
+        ]
+      }
+    },
+    {
+      "probe": "R18_admin_name_inserted_into_HTML_without_escaping",
+      "reproduced": true,
+      "evidence": {
+        "rendered_html": "1. <audit-tag>&name  (<code>77</code>)",
+        "escaped_name_present": false
+      }
+    },
+    {
+      "probe": "R19_traceback_bypasses_secret_redaction",
+      "reproduced": true,
+      "evidence": {
+        "synthetic_secret_only": true,
+        "message_redacted": true,
+        "traceback_contains_secret": true
+      }
+    },
+    {
+      "probe": "R20_closed_product_conversation_eats_next_compression_photo",
+      "reproduced": true,
+      "evidence": {
+        "product_session_closed": true,
+        "stale_conversation_state": 0,
+        "first_handler": "bot.modules.product_flow.on_media",
+        "compression_also_matches": true
+      }
+    },
+    {
+      "probe": "R21_tracking_not_registered_in_flow_guard_and_still_matches_after_switch",
+      "reproduced": true,
+      "evidence": {
+        "registered_closers": [
+          "compress",
+          "product",
+          "restock"
+        ],
+        "first_handler": "bot.modules.tracking_converter.on_wrong_input"
+      }
+    },
+    {
+      "probe": "R22_two_document_batches_with_same_name_overwrite_first_image",
+      "reproduced": true,
+      "evidence": {
+        "files_in_session": 2,
+        "unique_file_paths": 1,
+        "first_image_changed": true,
+        "both_gallery_entries_now_identical": true,
+        "names": [
+          "01_same.jpg",
+          "01_same.jpg"
+        ]
+      }
+    },
+    {
+      "probe": "R23_concurrent_albums_lose_one_batch_from_session",
+      "reproduced": true,
+      "evidence": {
+        "downloaded_batches": 2,
+        "images_on_disk": 2,
+        "images_in_session": 1
+      }
+    },
+    {
+      "probe": "R24_album_task_untracked_during_AI_cannot_be_cancelled_and_rewrites_closed_flow",
+      "reproduced": true,
+      "evidence": {
+        "tracked_at_cancel": false,
+        "task_cancelled": false,
+        "paints_after_cancel": 1,
+        "state_records_after_cancel": 1
+      }
+    },
+    {
+      "probe": "R25_compression_cancel_still_sends_album_document",
+      "reproduced": true,
+      "evidence": {
+        "cancel_returned_end": true,
+        "documents_sent_after_cancel": 1
+      }
+    },
+    {
+      "probe": "R26_4G_5G_color_restrictions_and_update_model_identity_collide",
+      "reproduced": true,
+      "evidence": {
+        "model_signatures": [
+          "note13",
+          "note13"
+        ],
+        "expected_5g_color": "سفید",
+        "actual_5g_colors": [
+          "مشکی"
+        ],
+        "update_axis_changes": 0
+      }
+    },
+    {
+      "probe": "R27_english_airpods_axis_not_matched_to_canonical_update_axis",
+      "reproduced": true,
+      "evidence": {
+        "original_axes": [
+          "مدل",
+          "AirPods"
+        ],
+        "resulting_axes": [
+          "مدل",
+          "AirPods",
+          "ایرپاد"
+        ],
+        "created_variations": 8,
+        "deleted_variations": 4
+      }
+    },
+    {
+      "probe": "R28_regenerated_variations_do_not_preserve_sku_or_other_Woo_fields",
+      "reproduced": true,
+      "evidence": {
+        "regenerate": true,
+        "deleted_original_ids": [
+          80,
+          81
+        ],
+        "absent_fields": [
+          "sku",
+          "weight",
+          "tax_class",
+          "backorders",
+          "description"
+        ],
+        "create_count": 3
+      }
+    },
+    {
+      "probe": "R29_review_workbook_contains_active_input_formula_despite_text_format",
+      "reproduced": true,
+      "evidence": {
+        "formula": "=1+1 (harmless synthetic expression)",
+        "cell_data_type": "f",
+        "number_format": "@",
+        "raw_formula_in_review_csv": true
+      }
+    },
+    {
+      "probe": "R30_pdf_order_code_matches_prefix_of_11_digit_phone",
+      "reproduced": true,
+      "evidence": {
+        "phone": "09123456789",
+        "actual_order": "123456",
+        "extracted_order_codes": [
+          "091234",
+          "091234"
+        ]
+      }
+    },
+    {
+      "probe": "R31_pdf_persian_digits_left_unconverted",
+      "reproduced": true,
+      "evidence": {
+        "persian_order_digits_in_output": true,
+        "csv_text": "order_id,tracking_code\n۳۰۶۱۷۶,۱۹۳۵۷۰۰۰۰۰۰۰۰۰۰۰۰۰۰۰۰۰۰1\n۳۰۶۱۷۶,۱۹۳۵۷۰۰۰۰۰۰۰۰۰۰۰۰۰۰۰۰۰۰2\n"
+      }
+    },
+    {
+      "probe": "R32_superscript_digits_accepted_as_24_digit_barcode",
+      "reproduced": true,
+      "evidence": {
+        "input": "²²²²²²²²²²²²²²²²²²²²²²²²",
+        "barcode_state": "ok",
+        "note": "",
+        "ascii_digits_only": false
+      }
+    },
+    {
+      "probe": "R33_tracking_timeout_leaves_worker_running",
+      "reproduced": true,
+      "evidence": {
+        "timeout_seconds": 5,
+        "worker_still_running_after_timeout": true
+      }
+    },
+    {
+      "probe": "R34_limits_allow_negative_values_and_non_finite_wait",
+      "reproduced": true,
+      "evidence": {
+        "max_file_mb": -1.0,
+        "max_rows": -1,
+        "max_download_mb": "nan",
+        "album_wait_seconds": "inf",
+        "related_problems": []
+      }
+    },
+    {
+      "probe": "R35_ledger_keys_collide_for_same_user_in_same_second",
+      "reproduced": true,
+      "evidence": {
+        "keys_identical": true,
+        "requested_history_records": 2,
+        "actual_history_records": 2,
+        "first_card_title": "first",
+        "title_opened_by_first_card_key": "second"
+      }
+    },
+    {
+      "probe": "R36_force_duplicate_reuses_existing_product_in_real_publish_path",
+      "reproduced": true,
+      "evidence": {
+        "force_button_clicked": true,
+        "returned_product_ids": [
+          4321,
+          4321
+        ],
+        "actual_product_post_requests": 1,
+        "expected_product_post_requests": 2
+      }
+    },
+    {
+      "probe": "R37_same_batch_concurrent_publish_creates_two_products",
+      "reproduced": true,
+      "evidence": {
+        "resume_searches_that_both_saw_empty": 2,
+        "created_product_ids": [
+          6001,
+          6002
+        ],
+        "same_batch_metadata": true,
+        "returned_ids": [
+          6002,
+          6001
+        ]
+      }
+    },
+    {
+      "probe": "R38_color_category_wrong_parent_is_accepted",
+      "reproduced": true,
+      "evidence": {
+        "requested_parent": 1,
+        "chosen_leaf_parent": 999,
+        "assigned_category_ids": [
+          {
+            "id": 1
+          },
+          {
+            "id": 2
+          }
+        ]
+      }
+    },
+    {
+      "probe": "R39_learning_impact_loses_model_13_due_to_corpus_truncation",
+      "reproduced": true,
+      "evidence": {
+        "original_models": 13,
+        "stored_models": 12,
+        "real_variation_delta": -2,
+        "shown_variation_delta": 0
+      }
+    },
+    {
+      "probe": "R40_compact_airpods_pro_and_section_multi_tokens_not_fully_extracted",
+      "reproduced": true,
+      "evidence": {
+        "compact_input": "AirpodsPro2",
+        "compact_output": [],
+        "section_input": "AirPods:\n1/2 | 3 | Pro2",
+        "section_output": [
+          "AirPods 1/2"
+        ]
+      }
+    },
+    {
+      "probe": "R41_final_validator_does_not_range_check_per_model_override",
+      "reproduced": true,
+      "evidence": {
+        "override": 900000000,
+        "configured_max": 500000000,
+        "blocking": false,
+        "caveat": "AI extraction separately range-checks overrides; this is an incomplete final safety gate."
+      }
+    },
+    {
+      "probe": "R42_zero_feasible_color_combinations_fall_back_to_all_invalid_combinations",
+      "reproduced": true,
+      "evidence": {
+        "feasible_combinations": 0,
+        "combinations_returned": 8,
+        "scenario": "phone only black; AirPods only white; common color axis cannot satisfy both"
+      }
+    },
+    {
+      "probe": "R43_old_confirm_button_publishes_new_sessions_product",
+      "reproduced": true,
+      "evidence": {
+        "old_card_message_id": 123,
+        "current_card_message_id": 456,
+        "current_title": "محصول B",
+        "published_title": "محصول B",
+        "publish_calls": 1
+      }
+    },
+    {
+      "probe": "R44_new_variation_fields_not_verified_before_success",
+      "reproduced": true,
+      "evidence": {
+        "sent": {
+          "regular_price": "600000",
+          "attributes": [
+            {
+              "name": "مدل",
+              "option": "iPhone 13"
+            }
+          ]
+        },
+        "echoed": {
+          "id": 81,
+          "regular_price": "",
+          "attributes": [
+            {
+              "name": "مدل",
+              "option": "wrong"
+            }
+          ]
+        },
+        "created_count": 1,
+        "result_ok": true
+      }
+    },
+    {
+      "probe": "R45_equivalent_decimal_price_echo_marked_unconfirmed",
+      "reproduced": true,
+      "evidence": {
+        "sent_price": "600000",
+        "returned_equivalent_price": "600000.00",
+        "unconfirmed": [
+          81
+        ],
+        "result_ok": false
+      }
+    },
+    {
+      "probe": "R46_exact_1000_variations_reported_as_more_than_1000_and_unreadable",
+      "reproduced": true,
+      "evidence": {
+        "actual_variation_rows": 1000,
+        "read_requests": 10,
+        "reported_problem": "واریژن‌ها بیشتر از 1000 است و کامل خوانده نشد"
+      }
+    },
+    {
+      "probe": "R47_parser_test_runs_in_addition_to_group_zero_fallback",
+      "reproduced": true,
+      "evidence": {
+        "selected_groups": [
+          "0:bot.modules.fallback.msg_unknown",
+          "1:bot.modules.product_tools.on_parser_text"
+        ],
+        "messages_sent": 2,
+        "first_message": "من با دکمه‌ها کار می‌کنم — برای دیدن منو /start را بفرست."
+      }
+    },
+    {
+      "probe": "R48_woocommerce_ping_accepts_HTML_maintenance_as_connected",
+      "reproduced": true,
+      "evidence": {
+        "http_status": 200,
+        "body": "HTML maintenance page",
+        "reported_ok": true,
+        "reported_message": "Connected"
+      }
+    },
+    {
+      "probe": "R49_check_config_without_token_raises_traceback",
+      "reproduced": true,
+      "evidence": {
+        "exit_code": 1,
+        "traceback_present": true,
+        "structured_config_output_present": false
+      }
+    },
+    {
+      "probe": "R50_empty_valid_tracking_ledger_reported_unreadable",
+      "reproduced": true,
+      "evidence": {
+        "valid_empty_json": true,
+        "entries": 0,
+        "warned_unreadable": true
+      }
+    },
+    {
+      "probe": "R51_native_Woo_SKU_lookup_not_used_when_custom_route_missing",
+      "reproduced": true,
+      "evidence": {
+        "native_products_sku_would_return_product": 42,
+        "actual_candidates": 0,
+        "lookup_requests": [
+          {
+            "path": "/wp-json/wc/v3/products/sku/IP1",
+            "sku": null,
+            "search": null
+          },
+          {
+            "path": "/wp-json/wc/v3/products",
+            "sku": null,
+            "search": "IP1"
+          }
+        ]
+      }
+    },
+    {
+      "probe": "R52_workspace_permissions_follow_world_readable_default_umask",
+      "reproduced": true,
+      "evidence": {
+        "umask": "022",
+        "session_directory_mode": "0o755",
+        "downloaded_file_mode": "0o644",
+        "caveat": "Permission bits only; no access by another tenant was attempted. Audit parent itself is private."
+      }
+    },
+    {
+      "probe": "R53_retry_after_can_request_infinite_wait",
+      "reproduced": true,
+      "evidence": {
+        "infinite_wait_accepted": true,
+        "finite_requested_delay_hours": 24.0,
+        "actual_sleep_performed": false
+      }
+    },
+    {
+      "probe": "R54_product_tools_allow_revoked_users_to_read_history_and_arm_AI_test",
+      "reproduced": true,
+      "evidence": {
+        "user_role": "user",
+        "feature_allowed": false,
+        "history_exposed": true,
+        "parser_test_armed": true
+      }
+    },
+    {
+      "probe": "R55_tracking_conversion_proceeds_with_feature_permission_false",
+      "reproduced": true,
+      "evidence": {
+        "feature_permission": false,
+        "permission_rechecks": 0,
+        "documents_sent": 1
+      }
+    },
+    {
+      "probe": "R56_160_megapixel_image_only_warns_at_120_megapixel_setting",
+      "reproduced": true,
+      "evidence": {
+        "pixels": 160000000,
+        "configured_limit": 120000000,
+        "warning_instead_of_rejection": true,
+        "pixel_buffer_allocated": false
+      }
+    },
+    {
+      "probe": "R57_diagnostics_woo_check_calls_required_arguments_function_without_arguments",
+      "reproduced": true,
+      "evidence": {
+        "exception": "ping_woocommerce() missing 3 required positional arguments: 'url', 'consumer_key', and 'consumer_secret'",
+        "external_request_attempted": false
+      }
+    },
+    {
+      "probe": "R58_diagnostics_media_probe_writes_even_when_dry_run_true_and_claims_read_only",
+      "reproduced": true,
+      "evidence": {
+        "dry_run": true,
+        "would_send_requests": [
+          "POST /wp-json/wp/v2/media",
+          "DELETE /wp-json/wp/v2/media/99"
+        ],
+        "actual_network": "MockTransport only",
+        "diagnostic_claims_no_site_writes": true,
+        "result_state": "ok"
+      }
+    },
+    {
+      "probe": "R59_revoked_admin_can_confirm_product_write_after_authorized_entry",
+      "reproduced": true,
+      "evidence": {
+        "authorized_at_entry": true,
+        "authorized_at_confirmation": false,
+        "publish_calls_after_revocation": 1,
+        "resulting_product_id": 42
+      }
+    },
+    {
+      "probe": "R60_confirmation_discards_still_buffered_second_album",
+      "reproduced": true,
+      "evidence": {
+        "existing_images": 1,
+        "buffered_new_images": 1,
+        "images_passed_to_publisher": 1,
+        "new_album_discarded": true
+      }
+    },
+    {
+      "probe": "R61_flow_entry_records_restart_marker_then_immediately_clears_it",
+      "reproduced": true,
+      "evidence": {
+        "in_memory_session_started": true,
+        "durable_restart_marker_present": false
+      }
+    }
+  ],
+  "notice": "Synthetic offline reproductions of faulty behavior, not production incidents and not tests of a fix. No application code was changed by the audit.",
+  "baseline": {
+    "branch": "arena/01a0fb3f-tisacasebot",
+    "base_commit": "9361bf53cf155051b28041592f6ca44725f382ee",
+    "pytest_passed": 1109,
+    "pytest_skipped": 6,
+    "subtests_passed": 86,
+    "warnings": 24,
+    "coverage_statements": 12351,
+    "coverage_missing": 1760,
+    "coverage_percent": 85.75014168893208,
+    "ruff": "clean",
+    "mypy": "clean (48 source files)",
+    "plugin_zip_check": "clean"
+  }
+}

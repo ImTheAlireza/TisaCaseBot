@@ -30,6 +30,8 @@ class MediaTestResult:
 
 
 async def test_wordpress_media(timeout: float = 15.0) -> MediaTestResult:
+    if settings.woo_dry_run:
+        return MediaTestResult(False, "🧪 dry-run: تست زندهٔ آپلود/حذف رسانه اجرا نشد.")
     if not all((settings.wordpress_url, settings.wordpress_username, settings.wordpress_app_password)):
         return MediaTestResult(False, "اطلاعات WordPress Application Password در .env کامل نیست.")
 

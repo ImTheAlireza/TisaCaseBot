@@ -148,7 +148,7 @@ class TestSavingsMath(unittest.TestCase):
         """`Image.MAX_IMAGE_PIXELS` باید روی همان سقفِ مستندشده قفل باشد."""
         if not HAS_PILLOW:  # pragma: no cover
             self.skipTest("Pillow نصب نیست")
-        self.assertEqual(120_000_000, Image.MAX_IMAGE_PIXELS)
+        self.assertEqual(40_000_000, Image.MAX_IMAGE_PIXELS)
         self.assertIsNotNone(ImageOps.exif_transpose)
 
 

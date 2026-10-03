@@ -150,6 +150,15 @@ def validate_draft(
                        "هیچ تغییری برای اعمال وجود ندارد.",
                        "عکس، قیمت، موجودی، مدل یا رنگ تازه بفرست؛ چیزی که نفرستی دست‌نخورده می‌ماند.")
 
+    planned = plan_from_dict(data)
+    if planned.capacity_error:
+        report.add(LEVEL_ERROR, "E_GRID_LIMIT", planned.capacity_error)
+    elif planned.is_variable and not planned.count:
+        report.add(LEVEL_ERROR, "E_EMPTY_GRID", "هیچ ترکیب سازگار مدل/رنگ باقی نمانده است؛ محدودیت رنگ‌ها را اصلاح کن.")
+    for model, amount in model_prices.items():
+        if not price_min <= amount <= price_max:
+            report.add(LEVEL_ERROR, "E_MODEL_PRICE_RANGE", f"قیمت مدل «{model}» از بازهٔ ایمن قیمت خارج است.")
+
     stock = data.get("stock")
     stock = None if stock in (None, "") else int(stock)
     stock_status = str(data.get("stock_status") or "").strip()

@@ -1,73 +1,90 @@
-"""Temp workspaces for the flows that download files from Telegram.
-
-A download that is being waited on between two messages cannot live in the
-process's memory: the bot may restart, the user may answer an hour later, and a
-file left in ``/tmp`` by a killed process is never cleaned by anything. So every
-flow that holds a file gets one directory per session, under one shared rule —
-delete what is older than ``TEMP_TTL_HOURS`` — and each flow schedules the sweep
-for its own root.
-
-This module owns the *mechanics*. Which directory belongs to which flow stays
-with the flow (``bot/modules/*.py`` patch their own module-level ``TEMP_DIR`` in
-tests, and that must keep working).
-"""
-
+"""Private session directories with active-work protection and race-safe cleanup."""
 from __future__ import annotations
 
 import logging
-import os
 import shutil
+import tempfile
+import threading
 import time
 from collections.abc import Iterator
 from pathlib import Path
 
+from bot.services.fsutils import private_dir
+
 logger = logging.getLogger(__name__)
+_active: set[Path] = set()
+_guard = threading.RLock()
 
 
 def new_dir(root: Path, owner: object, prefix: str = "") -> Path:
-    """A private directory for one session of one user (created on demand)."""
-    root.mkdir(parents=True, exist_ok=True)
-    tag = f"{prefix}{owner}_{int(time.time() * 1000)}_{os.getpid()}"
-    path = root / tag
-    path.mkdir(parents=True, exist_ok=True)
+    private_dir(root)
+    path = Path(tempfile.mkdtemp(prefix=f"{prefix}{owner}_", dir=root))
+    path.chmod(0o700)
     return path
 
 
+def protect(path: Path) -> None:
+    with _guard:
+        _active.add(path.resolve())
+
+
+def remove(path: Path) -> None:
+    with _guard:
+        try:
+            shutil.rmtree(path, ignore_errors=True)
+        finally:
+            _active.discard(path.resolve())
+
+
 def iter_workspaces(root: Path) -> Iterator[Path]:
-    """The session directories of ``root``, oldest first (missing root is fine)."""
-    if not root.exists():
+    try:
+        entries = list(root.iterdir())
+    except OSError:
         return iter(())
-    return iter(sorted((p for p in root.iterdir() if p.is_dir()), key=lambda p: p.stat().st_mtime))
+    found: list[tuple[float, Path]] = []
+    for path in entries:
+        try:
+            if path.is_dir() and not path.is_symlink():
+                found.append((path.stat().st_mtime, path))
+        except OSError:
+            continue
+    return iter(path for _modified, path in sorted(found))
 
 
 def sweep(root: Path, max_age_hours: float, *, label: str = "workspace") -> int:
-    """Delete session directories older than ``max_age_hours``; return how many."""
     removed = 0
     cutoff = time.time() - max(1.0, max_age_hours) * 3600
-    for path in list(iter_workspaces(root)):
-        if path.stat().st_mtime < cutoff:
-            shutil.rmtree(path, ignore_errors=True)
-            removed += 1
+    for path in iter_workspaces(root):
+        with _guard:
+            if path.resolve() in _active:
+                continue
+            try:
+                if path.stat().st_mtime >= cutoff:
+                    continue
+                shutil.rmtree(path)
+                removed += 1
+            except OSError:
+                continue
     if removed:
         logger.info("swept %d stale %s(s) older than %g h", removed, label, max_age_hours)
     return removed
 
 
 def close_owner(root: Path, owner: object, *, prefix: str = "") -> bool:
-    """Drop this owner's leftover directories; True when something was on disk.
-
-    Used when a flow ends or another flow takes over, so a half-finished download
-    cannot be picked up by the next session of the same user.
-    """
-    if not root.exists():
-        return False
     removed = False
     needle = f"{prefix}{owner}_"
-    for path in root.iterdir():
-        if path.is_dir() and path.name.startswith(needle):
-            shutil.rmtree(path, ignore_errors=True)
-            removed = True
+    for path in iter_workspaces(root):
+        if not path.name.startswith(needle):
+            continue
+        with _guard:
+            if path.resolve() in _active:
+                continue
+            try:
+                shutil.rmtree(path)
+                removed = True
+            except OSError:
+                continue
     return removed
 
 
-__all__ = ["close_owner", "iter_workspaces", "new_dir", "sweep"]
+__all__ = ["close_owner", "iter_workspaces", "new_dir", "protect", "remove", "sweep"]

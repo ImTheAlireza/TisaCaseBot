@@ -172,14 +172,18 @@ class FakeStore:
         params = dict(request.url.params)
         body = request.content.decode("utf-8", "ignore") if request.content else ""
         self.requests.append((method, path, params, body))
+        if path.endswith("/tisa-health"):
+            return httpx.Response(200, json={"contract": 1, "batch_fencing": True, "variation_fencing": True, "parent_cas": True, "stock_cas": True})
         if method == "GET" and path.endswith("/variations"):
             if self.variations_status != 200:
                 return httpx.Response(self.variations_status, json={"code": "rest_invalid_param"})
-            return httpx.Response(200, json=self.variations)
+            page, per_page = int(params.get("page", 1)), int(params.get("per_page", 100))
+            return httpx.Response(200, json=self.variations[(page-1)*per_page:page*per_page])
         if method == "GET" and path.endswith("/products"):
             if self.search_status != 200:
                 return httpx.Response(self.search_status, json={"code": "rest_invalid_param"})
-            return httpx.Response(200, json=self.products)
+            page, per_page = int(params.get("page", 1)), int(params.get("per_page", 100))
+            return httpx.Response(200, json=self.products[(page-1)*per_page:page*per_page])
         if method == "POST" and path.endswith("/media"):
             if self.media_status != 201:
                 return httpx.Response(self.media_status, json={"message": "آپلود رسانه رد شد"})
@@ -188,11 +192,15 @@ class FakeStore:
         if method == "POST" and path.endswith("/products"):
             if self.create_status != 201:
                 return httpx.Response(self.create_status, json={"message": "خطای ساخت محصول"})
-            return httpx.Response(201, json={"id": 4321, "sku": "IP151"})
+            row = (_json.loads(body) if body else {}) | {"id": 4321 + len(self.products)}
+            self.products.append(row)
+            return httpx.Response(201, json=row)
         if method == "POST" and path.endswith("/variations"):
             if self.variation_create_status != 201:
                 return httpx.Response(self.variation_create_status, json={"message": "variation failed"})
-            return httpx.Response(201, json={"id": 9500})
+            row = (_json.loads(body) if body else {}) | {"id": 9500 + len(self.variations)}
+            self.variations.append(row)
+            return httpx.Response(201, json=row)
         if method == "POST" and path.endswith("/variations/batch"):
             if self.batch_status != 201:
                 return httpx.Response(self.batch_status, json={"message": "batch failed"})
@@ -200,7 +208,17 @@ class FakeStore:
                 wanted = _json.loads(body).get("create") or []
             except ValueError:
                 wanted = []
-            return httpx.Response(201, json={"create": [{"id": 9000 + i} for i in range(len(wanted))]})
+            rows = [dict(row) | {"id": 9000 + len(self.variations) + i} for i, row in enumerate(wanted)]
+            self.variations.extend(rows)
+            return httpx.Response(201, json={"create": rows})
+        if method == "GET" and "/variations/" in path:
+            identity = int(path.rsplit("/", 1)[-1])
+            row = next((row for row in self.variations if int(row.get("id") or 0) == identity), None)
+            return httpx.Response(200 if row else 404, json=row or {"code": "not_found"})
+        if method == "GET" and "/products/" in path and path.rsplit("/", 1)[-1].isdigit():
+            identity = int(path.rsplit("/", 1)[-1])
+            row = next((row for row in self.products if int(row.get("id") or 0) == identity), None)
+            return httpx.Response(200 if row else 404, json=row or {"code": "not_found"})
         if path.endswith("/categories"):
             return httpx.Response(200, json=[])
         if method in ("DELETE", "PUT", "PATCH"):
@@ -258,6 +276,7 @@ def temp_ledger():
     the next real start — which the first two did. `unittest discover -s tests` has no
     conftest to redirect ``TISA_DATA_DIR``, so the isolation has to live here.
     """
+    from bot import rbac
     from bot.services import outbox, sku, tracking_ledger
 
     tmp = Path(tempfile.mkdtemp(prefix="tisa-test-ledger-"))
@@ -267,11 +286,15 @@ def temp_ledger():
     outbox.DB_PATH = tmp / "outbox.sqlite3"
     outbox.FILES_DIR = tmp / "outbox_files"
     tracking_ledger.FILE = tmp / "tracking_ledger.json"
+    old_roles = rbac.ROLES_FILE
+    rbac.ROLES_FILE = tmp / "roles.json"
+    jsonstore.checked_write(rbac.ROLES_FILE, {"admins": {"7": {"name": "Test admin"}}})
     jsonstore.invalidate()
     try:
         yield products_ledger
     finally:
         (products_ledger.FILE, sku.STATE_FILE, outbox.DB_PATH, outbox.FILES_DIR, tracking_ledger.FILE) = old
+        rbac.ROLES_FILE = old_roles
         jsonstore.invalidate()
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -512,8 +535,13 @@ def document_update(
     return update, sent
 
 
-def query_update(data: str, *, user_id: int = 7, chat_id: int = 9, thread_id: int | None = None):
+def query_update(data: str, *, user_id: int = 7, chat_id: int = 9, thread_id: int | None = None, signed: bool = True):
     """An update shaped like PTB's, with every reply recorded on the query."""
+    if signed and "|" not in data:
+        from bot.modules import product_flow, restock_flow
+        session = product_flow.sessions.get(user_id) or restock_flow.sessions.get(user_id)
+        if session is not None and (data.startswith(("product:", "restock:")) or data == "nav:main"):
+            data = f"{data}|{session.nonce}.{session.revision:x}"
     seen: list[tuple[str, object]] = []
 
     async def answer(text=None, **kwargs):

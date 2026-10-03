@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 
-from bot.services.jsonstore import lock_for, read_json, write_json
+from bot.services.jsonstore import checked_write, lock_for, read_json, write_json
 from bot.config import data_dir
 
 logger = logging.getLogger(__name__)
@@ -49,7 +49,7 @@ def set_button_visible(key: str, value: bool) -> None:
     with _lock:
         data = _load()
         data["button_visibility"][key] = bool(value)
-        write_json(FILE, data)
+        checked_write(FILE, data, write_json)
 
 
 __all__ = ["button_visible", "set_button_visible"]

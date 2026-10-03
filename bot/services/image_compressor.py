@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+import warnings
 from pathlib import Path
 
 from PIL import Image, ImageOps
@@ -12,7 +13,8 @@ SUPPORTED = {"jpg", "jpeg", "png", "webp", "bmp", "tiff"}
 
 # Allow generously sized product photos but block decompression bombs that
 # would exhaust memory on shared hosting.
-Image.MAX_IMAGE_PIXELS = 120_000_000
+MAX_IMAGE_PIXELS = 40_000_000
+Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
 
 # The store sometimes wants a heavier image; reading the quality per call (and
 # not once at import) means an `.env` edit only needs a restart, not a deploy.
@@ -47,9 +49,14 @@ def compress_image(src: Path, dest_dir: Path) -> Path:
     out = dest_dir / f"{src.stem}_compressed.jpg"
 
     try:
-        with Image.open(src) as opened:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            opened = Image.open(src)
+        with opened:
             # exif_transpose returns a new image when the orientation tag needs
             # applying, so keep it in its own variable.
+            if opened.width * opened.height > MAX_IMAGE_PIXELS:
+                raise Image.DecompressionBombError("Image exceeds the hard pixel limit")
             im = ImageOps.exif_transpose(opened)
 
             if "A" in im.getbands():
@@ -71,7 +78,10 @@ def compress_image(src: Path, dest_dir: Path) -> Path:
                 progressive=True,
                 subsampling="4:2:0",
             )
-    except (Image.DecompressionBombError, OSError, ValueError):
+    except (Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
+        out.unlink(missing_ok=True)
+        raise ValueError("تصویر از سقف ایمن ۴۰ مگاپیکسل بزرگ‌تر است") from exc
+    except (OSError, ValueError):
         # Too large/broken to decode safely; keep the original instead of failing.
         return src
 

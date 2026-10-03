@@ -15,8 +15,8 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import secrets
 import re
-import shutil
 import time
 from pathlib import Path
 
@@ -33,9 +33,11 @@ from telegram.ext import (
 )
 
 from bot.buttons import feature_allowed
-from bot.services import metrics, flow_guard, product_journal
+from bot.services.access import guard_feature
+from bot.services import metrics, flow_guard, product_journal, worker, workspace
 from bot.config import settings
 from bot.constants import CB
+from bot.services.conversations import FlowConversationHandler
 from bot.keyboards import main_menu_keyboard, main_menu_text
 from bot.services.image_compressor import compress_image
 from bot.services.product_text_summary import format_product_summary
@@ -52,7 +54,11 @@ def close_for(user_id: int) -> bool:
     A Telegram upload already in flight is never force-cancelled: it may have been
     accepted remotely, so interrupting it would leave an ambiguous user-visible result.
     """
-    changed = False
+    data = _active_data.pop(user_id, None)
+    if data is not None:
+        data["compress_closed"] = True
+        data.pop("compress_generation", None)
+    changed = data is not None
     for key, task in list(album_tasks.items()):
         if key[0] != user_id:
             continue
@@ -68,7 +74,7 @@ def close_for(user_id: int) -> bool:
         protected = active_roots.get(user_id, set())
         for path in TEMP_DIR.iterdir():
             if path.is_dir() and path.name.startswith(prefix) and path not in protected:
-                shutil.rmtree(path, ignore_errors=True)
+                workspace.remove(path)
                 changed = True
     return changed
 
@@ -94,6 +100,7 @@ album_tasks: dict[tuple[int, str], asyncio.Task[None]] = {}
 processing_albums: set[tuple[int, str]] = set()
 cancelled_albums: set[tuple[int, str]] = set()
 active_roots: dict[int, set[Path]] = {}
+_active_data: dict[int, dict] = {}
 _global_media_semaphore: asyncio.Semaphore | None = None
 _global_media_loop: asyncio.AbstractEventLoop | None = None
 MAX_PARALLEL_MEDIA = 4
@@ -117,6 +124,9 @@ def _append_analysis_text(context: ContextTypes.DEFAULT_TYPE, key: str, text: st
 
 async def _send_analysis(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
     """Analyze the text accompanying compressed photos and send a concise admin report."""
+    generation = context.user_data.get("compress_generation")
+    if context.user_data.get("compress_closed"):
+        return
     captions = context.user_data.get(ANALYSIS_CAPTIONS_KEY, [])
     info_parts = context.user_data.get(ANALYSIS_INFO_KEY, [])
     caption = "\n".join(captions)
@@ -151,6 +161,9 @@ async def _send_analysis(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> No
     extraction_ms = (time.perf_counter() - extraction_started) * 1000
     report = format_product_summary(models, attributes)
     if report == context.user_data.get(ANALYSIS_REPORT_KEY):
+        return
+    if (context.user_data.get("compress_closed") or context.user_data.get("compress_generation") != generation
+            or not _can_compress(user_id)):
         return
     await context.bot.send_message(chat_id=user_id, text=report, parse_mode="HTML")
     audit_text = (
@@ -261,6 +274,9 @@ async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await query.answer("⛔ دسترسی ندارید.", show_alert=True)
         return ConversationHandler.END
     await query.answer()
+    context.user_data["compress_closed"] = False
+    context.user_data["compress_generation"] = secrets.token_hex(8)
+    _active_data[user.id] = context.user_data
     _clear_analysis(context)
     context.user_data[COMPRESS_RETRIES_KEY] = 0
     # «one thing at a time»: any other open flow of this user is closed first.
@@ -307,6 +323,17 @@ async def _process_media_batch(
     album_key: tuple[int, str] | None = None,
 ) -> None:
     """Bounded, failure-isolated download/compress/send for one Telegram batch."""
+    user_data = getattr(context, "user_data", {})
+    generation = user_data.get("compress_generation")
+    if user_data.get("compress_closed"):
+        return
+    _active_data[user_id] = user_data
+
+    def still_open() -> bool:
+        return (not user_data.get("compress_closed")
+                and user_data.get("compress_generation") == generation
+                and _can_compress(user_id))
+
     media_items = [
         (message, _media(message))
         for message in sorted(messages, key=lambda item: item.message_id)
@@ -315,9 +342,8 @@ async def _process_media_batch(
     if not media_items:
         return
 
-    root = TEMP_DIR / f"{user_id}_{time.time_ns()}"
     try:
-        root.mkdir(parents=True, exist_ok=True)
+        root = workspace.new_dir(TEMP_DIR, user_id)
     except OSError as exc:
         logger.exception("Could not create image-compression workspace for user %s", user_id)
         await _log_to_group(
@@ -331,6 +357,7 @@ async def _process_media_batch(
             logger.info("Could not notify user %s about workspace failure", user_id, exc_info=True)
         return
     active_roots.setdefault(user_id, set()).add(root)
+    workspace.protect(root)
     first_message = media_items[0][0]
     status = None
     started_batch = time.perf_counter()
@@ -360,7 +387,7 @@ async def _process_media_batch(
             download_ms = (time.perf_counter() - download_started) * 1000
             compress_started = time.perf_counter()
             async with process_semaphore:
-                compressed = await asyncio.to_thread(compress_image, source, root / "out")
+                compressed = await worker.run(compress_image, source, root / "out", timeout=settings.process_timeout_seconds)
             compress_ms = (time.perf_counter() - compress_started) * 1000
             compressed_size = compressed.stat().st_size if compressed.is_file() else 0
             metrics.observe("compress_download_ms", download_ms)
@@ -395,7 +422,7 @@ async def _process_media_batch(
 
         sent = 0
         for item in successes:
-            if album_key is not None and album_key in cancelled_albums:
+            if not still_open() or (album_key is not None and album_key in cancelled_albums):
                 failures.append("ادامهٔ ارسال به‌دلیل بسته‌شدن جریان متوقف شد")
                 break
             name = str(item["name"])
@@ -424,7 +451,7 @@ async def _process_media_batch(
                     f"{name}: {type(exc).__name__}: {str(exc)[:160]}{ambiguity}"
                 )
 
-        cancelled = album_key is not None and album_key in cancelled_albums
+        cancelled = not still_open() or (album_key is not None and album_key in cancelled_albums)
         if status is not None:
             if failures:
                 final_text = f"⚠️ {sent} از {len(media_items)} عکس ارسال شد؛ جزئیات در گروه لاگ ثبت شد."
@@ -464,7 +491,7 @@ async def _process_media_batch(
             roots.discard(root)
             if not roots:
                 active_roots.pop(user_id, None)
-        shutil.rmtree(root, ignore_errors=True)
+        workspace.remove(root)
 
 
 async def _flush_album(key: tuple[int, str], context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -492,10 +519,12 @@ async def _flush_album(key: tuple[int, str], context: ContextTypes.DEFAULT_TYPE)
             album_tasks.pop(key, None)
         # A Telegram album photo that arrived just after the collection window
         # gets a new bounded batch instead of being stranded in the buffer.
-        if album_buffers.get(key) and key not in album_tasks:
+        if (album_buffers.get(key) and key not in album_tasks
+                and not context.user_data.get("compress_closed")):
             album_tasks[key] = asyncio.create_task(_flush_album(key, context))
 
 
+@guard_feature("compress", on_denial=close_for, checker=lambda uid, key: feature_allowed(uid, key))
 async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Queue albums immediately; process singles in a one-file batch."""
     message = update.effective_message
@@ -522,6 +551,7 @@ async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return WAITING
 
 
+@guard_feature("compress", on_denial=close_for, checker=lambda uid, key: feature_allowed(uid, key))
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Collect product info sent beside photos and show detected models/features."""
     message = update.effective_message
@@ -544,6 +574,8 @@ async def cb_back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     query = update.callback_query
     user = update.effective_user
     await query.answer()
+    if user:
+        close_for(user.id)
     _clear_analysis(context)
     await query.edit_message_text(
         main_menu_text(user.id if user else None, user),
@@ -556,6 +588,8 @@ async def cb_back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def cmd_exit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """/cancel, /start or /menu during the flow → back to the main menu."""
     user = update.effective_user
+    if user:
+        close_for(user.id)
     _clear_analysis(context)
     await update.effective_message.reply_html(
         main_menu_text(user.id if user else None, user),
@@ -569,8 +603,20 @@ async def cmd_exit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 flow_guard.register("compress", "فشرده‌سازی عکس‌ها", close_for)
 
 
+async def shutdown() -> None:
+    for user_id in set(_active_data) | {key[0] for key in album_tasks}:
+        close_for(user_id)
+    tasks = list(album_tasks.values())
+    for task in tasks:
+        if not task.done() and not task.cancelling():
+            task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
 def register(app: Application) -> None:
-    conv = ConversationHandler(
+    conv = FlowConversationHandler(
+        flow="compress",
         entry_points=[CallbackQueryHandler(entry, pattern=f"^{CB.COMPRESS}$")],
         states={
             WAITING: [

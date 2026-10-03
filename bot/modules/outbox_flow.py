@@ -9,7 +9,10 @@ same ledger card, and (in dry-run) no draining at all.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
+import time
 from typing import Any
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
@@ -17,6 +20,8 @@ from telegram.ext import Application, ContextTypes
 
 from bot import __version__ as _BOT_VERSION
 from bot.config import settings
+from bot.buttons import feature_allowed
+from bot.services.validation import validate_draft
 from bot.keyboards import result_card, result_keyboard
 from bot.services import outbox, product_journal, products_ledger, publish_batch
 from bot.services.woo_client import WooCommerceAPIError, describe_exception
@@ -40,6 +45,7 @@ def enqueue_after_failure(
     batch_id: str,
     ledger_key: str = "",
     error: str,
+    retry_after: float = 0.0,
 ) -> bool:
     """Put a refused publish back in line. ``False`` means it is *not* queued — said out loud.
 
@@ -55,7 +61,7 @@ def enqueue_after_failure(
     return outbox.enqueue(
         batch_id=batch_id, chat_id=chat_id, user_id=user_id, payload=payload,
         images=list(files), thread_id=thread_id, mode=mode, error=error,
-        delay=outbox.backoff_seconds(1),
+        delay=max(outbox.backoff_seconds(1), retry_after),
     )
 
 
@@ -97,6 +103,22 @@ def _describe_missing(entry: outbox.QueuedPublish) -> str:
 async def _attempt(app: Application, entry: outbox.QueuedPublish) -> None:
     report: list[str] = []
     try:
+        if outbox.expired(entry):
+            raise WooCommerceAPIError(410, "مهلت ۲۴ ساعته/تعداد تلاش این بسته تمام شده؛ بدون ارسال به فروشگاه رها شد.")
+        try:
+            actor = int(entry.user_id)
+        except (TypeError, ValueError):
+            actor = None
+        if not feature_allowed(actor, "product_new"):
+            raise WooCommerceAPIError(403, "دسترسی ناشر برداشته شده؛ انتشار خودکار انجام نشد.")
+        expected = entry.payload.get("_queued_image_count", len(entry.images) + len(entry.missing_images))
+        if entry.missing_images or type(expected) is not int or expected != len(entry.images):
+            raise WooCommerceAPIError(422, "همهٔ تصاویر بسته در spool موجود نیستند؛ انتشار ناقص انجام نشد.")
+        issues = validate_draft(entry.payload, mode=entry.mode, image_count=len(entry.images),
+                                price_min=settings.price_min, price_max=settings.price_max,
+                                require_models=settings.require_models)
+        if issues.blocking:
+            raise WooCommerceAPIError(422, issues.errors[0].message)
         product_id, edit_url = await create_draft(
             entry.payload, list(entry.images), report=report, batch_id=entry.batch_id,
             resume_existing=True,
@@ -114,22 +136,24 @@ async def _attempt(app: Application, entry: outbox.QueuedPublish) -> None:
         reason = f"HTTP {exc.status_code}: {exc}" if isinstance(exc, WooCommerceAPIError) \
             else describe_exception(exc)
         if outbox.is_transient(exc):
-            updated = outbox.note_failure(entry, reason)
+            if entry.attempts + 1 >= outbox.MAX_ATTEMPTS or outbox.expired(entry):
+                await asyncio.to_thread(_finish_card, entry, status="failed", error=reason)
+            updated = await asyncio.to_thread(outbox.note_failure, entry, reason)
             if updated.status == outbox.STATUS_DROPPED:
-                _finish_card(entry, status="failed", error=f"بعد از {updated.attempts} تلاش: {reason}")
                 await _notify(
                     app, entry,
                     f"❌ بعد از {updated.attempts} تلاش این محصول در صف ماند و رها شد:\n{reason}\n"
                     "هرچه در پیش‌نمایش تأیید کرده بودی ذخیره شده؛ دوباره «تأیید و ساخت» را بزن.",
                 )
             else:
-                wait = max(0, int(updated.next_at - __import__("time").time()))
+                wait = max(0, int(updated.next_at - time.time()))
                 logger.info("outbox: تلاش %s/%s برای %s پس از %ss", updated.attempts,
                             outbox.MAX_ATTEMPTS, updated.batch_id, wait)
             return
         # A 400 will answer the same way tomorrow: saying why now is kinder than a silent queue.
-        outbox.abandon(entry.batch_id, reason)
-        _finish_card(entry, status="failed", error=reason)
+        await asyncio.to_thread(_finish_card, entry, status="failed", error=reason)
+        await asyncio.to_thread(outbox.abandon, entry.batch_id, reason, expected_updated_at=entry.updated_at or None,
+                                expected_generation=entry.generation or None, claim_token=entry.claim_token or None)
         await _notify(
             app, entry,
             f"❌ تلاشِ صف‌شده نشد، چون خطای تکراری است (HTTP {getattr(exc, 'status_code', '?')}):\n{exc}\n"
@@ -139,9 +163,8 @@ async def _attempt(app: Application, entry: outbox.QueuedPublish) -> None:
 
     if report:
         await product_journal.send_publish_trace(app.bot, report)
-    outbox.succeed(entry.batch_id)
     entry_payload = entry.payload
-    card = _finish_card(
+    card = await asyncio.to_thread(_finish_card,
         entry,
         status="created",
         product_id=product_id,
@@ -162,6 +185,8 @@ async def _attempt(app: Application, entry: outbox.QueuedPublish) -> None:
             + _describe_missing(entry)
         ],
     )
+    await asyncio.to_thread(outbox.succeed, entry.batch_id, expected_updated_at=entry.updated_at or None,
+                                expected_generation=entry.generation or None, claim_token=entry.claim_token or None)
     buttons = [[InlineKeyboardButton("🌐 ویرایش در سایت", url=edit_url)]] if edit_url else []
     await _notify(
         app, entry,
@@ -170,20 +195,63 @@ async def _attempt(app: Application, entry: outbox.QueuedPublish) -> None:
     )
 
 
+async def _claimed_attempt(app: Application, entry: outbox.QueuedPublish) -> None:
+    current = asyncio.current_task()
+
+    async def heartbeat() -> None:
+        while True:
+            await asyncio.sleep(30)
+            try:
+                valid = await asyncio.to_thread(outbox.renew_claim, entry)
+            except Exception:
+                valid = False
+                logger.exception("outbox: could not renew claim")
+            if not valid:
+                if current is not None:
+                    current.cancel()
+                return
+
+    pulse = asyncio.create_task(heartbeat())
+    try:
+        await _attempt(app, entry)
+    finally:
+        pulse.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await pulse
+        await asyncio.to_thread(outbox.release_claim, entry)
+
+
+_drain_lock: asyncio.Lock | None = None
+_drain_loop: asyncio.AbstractEventLoop | None = None
+
+
 async def drain_once(app: Application) -> int:
     """Try what is due, one item at a time. Returns how many were attempted."""
     if settings.woo_dry_run:
         # A rehearsal must not write anything, and a queue would be no exception: in dry-run
         # the store is unreachable by design, so retrying is only noise.
         return 0
+    global _drain_lock, _drain_loop
+    loop = asyncio.get_running_loop()
+    if _drain_lock is None or _drain_loop is not loop:
+        _drain_loop = loop
+        _drain_lock = asyncio.Lock()
+    if _drain_lock.locked():
+        return 0
     attempted = 0
-    for entry in outbox.due():
-        attempted += 1
-        await _attempt(app, entry)
-    if attempted:
-        left = outbox.stats()["pending"]
-        logger.info("outbox: %s تلاش انجام شد؛ %s مورد در صف مانده", attempted, left)
+    async with _drain_lock:
+        for _ in range(outbox.DRAIN_LIMIT):
+            entry = await asyncio.to_thread(outbox.claim_due)
+            if entry is None:
+                break
+            attempted += 1
+            try:
+                await _claimed_attempt(app, entry)
+            except Exception:
+                logger.exception("outbox: durable acknowledgement failed; generation retained")
+        await asyncio.to_thread(outbox.prune)
     return attempted
+
 
 
 async def drain(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -198,19 +266,19 @@ async def drain(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def start(app: Application) -> int:
-    """Schedule the queue and run one pass now (items from before a restart must not wait)."""
+    """Schedule a post-start pass; never block polling startup on network retries."""
     if settings.woo_dry_run:
         logger.info("outbox: خاموش (حالت آزمایشی)")
         return 0
-    pending = outbox.stats()
+    pending = await asyncio.to_thread(outbox.stats)
     if app.job_queue is not None:
+        app.job_queue.run_once(drain, when=0, name="outbox_drain_boot")
         app.job_queue.run_repeating(
             drain, interval=DRAIN_INTERVAL_SECONDS, first=DRAIN_INTERVAL_SECONDS, name="outbox_drain"
         )
     else:                                                     # pragma: no cover - no APScheduler
-        logger.warning("outbox: JobQueue نصب نیست؛ صف فقط هنگام استارت ربات بررسی می‌شود")
+        logger.warning("outbox: JobQueue نصب نیست؛ تخلیهٔ خودکار صف زمان‌بندی نشد")
     if pending["pending"]:
         logger.info("outbox: %s مورد در صف است (آخرین خطا: %s)", pending["pending"],
                     pending.get("last_error") or "—")
-        return await drain_once(app)
     return 0

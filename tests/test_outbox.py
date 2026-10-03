@@ -51,7 +51,7 @@ SHARED = {
 
 
 def _payload(**over: object) -> dict:
-    base = {"title": "قاب سیلیکونی آیفون 13", "price": 698000, "stock": 20, "sale_price": 498000}
+    base = {"title": "قاب سیلیکونی آیفون 13", "price": 698000, "stock": 20, "sale_price": 498000, "sku_prefix": "LP", "models": ["iPhone 13", "iPhone 14"]}
     base.update(over)
     return base
 
@@ -334,6 +334,11 @@ class TestDrainingTheQueue(QueueTestCase):
         self.sent: list[dict] = []
         self._calls: list[dict] = []
         self.error: Exception | None = None
+        original_enqueue = self.enqueue
+        def approved_enqueue(**kwargs):
+            kwargs.setdefault("images", [self.image()])
+            return original_enqueue(**kwargs)
+        self.enqueue = approved_enqueue
         outbox_flow.create_draft = self._fake_create_draft
         self.addCleanup(setattr, outbox_flow, "create_draft", create_draft)
 

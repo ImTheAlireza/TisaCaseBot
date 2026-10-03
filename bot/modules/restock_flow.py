@@ -24,13 +24,14 @@ from __future__ import annotations
 
 import html
 import logging
+import secrets
+from functools import wraps
 from dataclasses import dataclass, field
 from typing import Any
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
 from telegram.ext import (
-    CallbackQueryHandler,
     ContextTypes,
     ConversationHandler,
     MessageHandler,
@@ -41,6 +42,9 @@ from bot.config import settings
 from bot.constants import CB
 from bot.services import flow_state, product_match, products_ledger
 from bot.services.woo_client import Audit, describe_exception
+
+from bot.services import callbacks as signed_callbacks
+from bot.services.callbacks import SessionCallbackHandler
 
 logger = logging.getLogger(__name__)
 
@@ -64,9 +68,31 @@ class RestockSession:
     thread_id: int | None = None
     candidates: list[product_match.Candidate] = field(default_factory=list)
     dry_run: bool = False
+    nonce: str = field(default_factory=lambda: secrets.token_hex(8))
+    revision: int = 0
+    proof_required: bool = False
 
 
 sessions: dict[int, RestockSession] = {}
+
+
+def _signed(session: RestockSession, markup: InlineKeyboardMarkup) -> InlineKeyboardMarkup:
+    session.proof_required = True
+    return signed_callbacks.bind(markup, session.nonce, session.revision)
+
+
+def _owned(callback):
+    @wraps(callback)
+    async def owned(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        session = _session(update)
+        if query is not None:
+            _, nonce, revision = signed_callbacks.split(query.data)
+            if session is None or nonce != session.nonce or revision != session.revision:
+                await query.answer("این فهرست مربوط به جست‌وجوی قبلی است؛ از فهرست تازه انتخاب کن.", show_alert=True)
+                return None
+        return await callback(update, context)
+    return owned
 
 
 def cleanup(user_id: int) -> bool:
@@ -136,7 +162,7 @@ async def _search_keyboard(user_id: int) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton(
             f"🧾 {title} · #{product_id}", callback_data=f"{CB.RESTOCK_PICK}:{product_id}")])
     rows.append([InlineKeyboardButton("⏹ انصراف", callback_data=CB.RESTOCK_CANCEL)])
-    return InlineKeyboardMarkup(rows)
+    return _signed(sessions[user_id], InlineKeyboardMarkup(rows))
 
 
 # — step 1: find it —
@@ -166,6 +192,7 @@ async def handle_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             reply_markup=_kb([[InlineKeyboardButton("⏹ انصراف", callback_data=CB.RESTOCK_CANCEL)]]),
         )
         return RESTOCK_MATCH
+    session.revision += 1
     session.candidates = found
     head = ("📊 این محصول را پیدا کردم:" if len(found) == 1
             else f"📊 {len(found)} محصول پیدا شد؛ کدام است؟")
@@ -177,10 +204,11 @@ async def handle_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         for candidate in found]
     rows.append([InlineKeyboardButton("🔎 جستجوی دوباره", callback_data=CB.RESTOCK_RETRY_SEARCH),
                  InlineKeyboardButton("⏹ انصراف", callback_data=CB.RESTOCK_CANCEL)])
-    await message.reply_text(f"{head}\n\n{body}", reply_markup=_kb(rows))
+    await message.reply_text(f"{head}\n\n{body}", reply_markup=_signed(session, _kb(rows)))
     return RESTOCK_MATCH
 
 
+@_owned
 async def pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """A candidate was tapped: read it with its variations, then hand the chat to the builder."""
     query = update.callback_query
@@ -189,7 +217,7 @@ async def pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if query is None or session is None or user is None:
         return ConversationHandler.END
     try:
-        product_id = int(str(query.data or "").rsplit(":", 1)[-1])
+        product_id = int(signed_callbacks.action(query).rsplit(":", 1)[-1])
     except ValueError:
         await query.answer("دکمهٔ قدیمی است؛ دوباره جستجو کن.", show_alert=True)
         return RESTOCK_MATCH
@@ -209,6 +237,7 @@ async def pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return await product_flow.begin_update(update, context, product)
 
 
+@_owned
 async def retry_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     user = update.effective_user
@@ -223,6 +252,7 @@ async def retry_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     return RESTOCK_MATCH
 
 
+@_owned
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     user = update.effective_user
@@ -298,8 +328,8 @@ async def _log(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
 def callbacks() -> list[Any]:
     """Buttons of the search screens, so «انصراف» works wherever it is pressed."""
     return [
-        CallbackQueryHandler(retry_search, pattern=rf"^{CB.RESTOCK_RETRY_SEARCH}$"),
-        CallbackQueryHandler(cancel, pattern=rf"^{CB.RESTOCK_CANCEL}$"),
+        SessionCallbackHandler(retry_search, pattern=rf"^{CB.RESTOCK_RETRY_SEARCH}$"),
+        SessionCallbackHandler(cancel, pattern=rf"^{CB.RESTOCK_CANCEL}$"),
     ]
 
 
@@ -307,7 +337,7 @@ def states() -> dict[int, list[Any]]:
     """The state product_flow's conversation adds for this flow."""
     return {
         RESTOCK_MATCH: [
-            CallbackQueryHandler(pick, pattern=rf"^{CB.RESTOCK_PICK}:[0-9]+$"),
+            SessionCallbackHandler(pick, pattern=rf"^{CB.RESTOCK_PICK}:[0-9]+$"),
             MessageHandler(filters.TEXT & ~filters.COMMAND, handle_search),
             MessageHandler(filters.PHOTO | filters.Document.ALL, ignore_media),
             *callbacks(),

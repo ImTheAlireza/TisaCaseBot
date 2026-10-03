@@ -63,7 +63,8 @@ def classify(cleaned: str) -> tuple[str, str]:
     «بارکد ۱۳ رقمی» with a wrong last digit is a typo, not a product code.
     """
     digits = cleaned or ""
-    if not digits.isdigit() or not digits:
+    digits = digits.translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789"))
+    if not re.fullmatch(r"[0-9]+", digits):
         return "error", "بارکد عدد نیست"
     if len(digits) in settings.barcode_lengths:
         return "ok", ""
@@ -80,11 +81,11 @@ def classify(cleaned: str) -> tuple[str, str]:
 
 
 def order_code_is_valid(cleaned: str) -> bool:
-    return bool(re.fullmatch(r"\d{6}", cleaned or ""))
+    return bool(re.fullmatch(r"[0-9]{6}", cleaned or ""))
 
 
 def order_code_is_short(cleaned: str) -> bool:
-    return bool(re.fullmatch(r"\d{5}", cleaned or ""))
+    return bool(re.fullmatch(r"[0-9]{5}", cleaned or ""))
 
 
 __all__ = [

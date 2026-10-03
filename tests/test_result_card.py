@@ -185,6 +185,10 @@ class TestResultCard(LedgerTestCase):
 class TestProductTools(LedgerTestCase):
     def setUp(self):
         super().setUp()
+        from _flow_harness import temp_ledger
+        isolated = temp_ledger()
+        isolated.__enter__()
+        self.addCleanup(isolated.__exit__, None, None, None)
 
     def _query(self, data, *, user_id=7):
         sent = []
@@ -204,7 +208,7 @@ class TestProductTools(LedgerTestCase):
             message=SimpleNamespace(reply_text=reply_text, chat_id=user_id),
             edit_message_text=edit_message_text,
         )
-        return SimpleNamespace(callback_query=query), sent
+        return SimpleNamespace(callback_query=query, effective_user=query.from_user), sent
 
     def test_recent_lists_cards_and_links_each_one(self):
         entry = products_ledger.record(user_id=7, title="قاب", product_id=11, variations=4)

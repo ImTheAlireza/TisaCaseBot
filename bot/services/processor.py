@@ -119,7 +119,7 @@ _LAYOUT_ATTR = {FIELD_BARCODE: "barcode_col", FIELD_CODE: "code_col"}
 
 _RE_DATE = re.compile(r"14\d{2}/\d{2}/\d{2}")
 # کد ۵-۶ رقمی داخل متن (مثلاً چسبیده به نام گیرنده)
-_RE_CODE_IN_TEXT = re.compile(r"(?<!\d)(\d{5,6})(?!\d)")
+_RE_CODE_IN_TEXT = re.compile(r"(?<![0-9])([0-9]{5,6})(?![0-9])")
 
 #: How many columns a question may offer — a Telegram keyboard with 30 buttons is
 #: not a question, it is a chore.
@@ -254,11 +254,16 @@ def _col_letter(index: int) -> str:
 # ---------------------------------------------------------------------------
 def _read_excel_or_csv(path, ext):
     if ext == ".xlsx":
-        return pd.read_excel(path, header=None, dtype=object)
+        import zipfile
+        with zipfile.ZipFile(path) as archive:
+            members = archive.infolist()
+            if len(members) > 2000 or sum(item.file_size for item in members) > 128 * 1024 * 1024:
+                raise RowLimitError("حجم بازشده/تعداد فایل‌های XLSX از سقف ایمن بیشتر است")
+        return pd.read_excel(path, header=None, dtype=object, nrows=settings.max_rows + 1)
     last_err = None
     for enc in ("utf-8-sig", "utf-8", "cp1256"):
         try:
-            return pd.read_csv(path, header=None, dtype=object, keep_default_na=False, encoding=enc)
+            return pd.read_csv(path, header=None, dtype=object, keep_default_na=False, encoding=enc, nrows=settings.max_rows + 1)
         except (UnicodeDecodeError, pd.errors.ParserError) as e:
             last_err = e
     raise ValueError(f"فایل CSV قابل خواندن نیست: {last_err}")
@@ -443,7 +448,7 @@ def _collect_rows(
         # (مثل «امیرحسین عاشوری ۳۰۶۱۷۶»)
         code_from_name = False
         if not c and name_for_code and name_col is not None:
-            m = _RE_CODE_IN_TEXT.search(_clean(get(name_col)))
+            m = _RE_CODE_IN_TEXT.search(str(get(name_col) or "").translate(_FA2EN_TABLE))
             if m:
                 c = m.group(1)
                 code_from_name = True
@@ -473,6 +478,9 @@ def _read_pdf(path) -> list[dict[str, Any]]:
     import pymupdf
 
     doc = pymupdf.open(path)
+    if len(doc) > 500:
+        doc.close()
+        raise RowLimitError("بیش از ۵۰۰ صفحه در PDF؛ فایل را تقسیم کن")
     rows: list[dict[str, Any]] = []
     for pno in range(len(doc)):
         page = doc[pno]
@@ -482,13 +490,14 @@ def _read_pdf(path) -> list[dict[str, Any]]:
             for line in block.get("lines", []):
                 for span in line.get("spans", []):
                     x0, y0, x1 = span["bbox"][0], span["bbox"][1], span["bbox"][2]
-                    text = "".join(ch["c"] for ch in span.get("chars", [])).strip()
+                    text = "".join(ch["c"] for ch in span.get("chars", [])).strip().translate(_FA2EN_TABLE)
                     if not text:
                         continue
                     key = round(y0, 1)
                     spans_by_y.setdefault(key, []).append((x0, x1, text))
         for _y, spans in spans_by_y.items():
             # یک سطر می‌تواند هم سلول متنی و هم فهرست سلول‌های میانی داشته باشد
+            _guard_rows(len(rows))
             rec: dict[str, Any] = {}
             for x0, x1, t in spans:
                 if x0 > 535 and t.isdigit() and len(t) <= 4:
@@ -500,7 +509,7 @@ def _read_pdf(path) -> list[dict[str, Any]]:
             if "bc" in rec and "n" in rec:
                 mid = "".join(rec.get("mid") or [])
                 mid_clean = _RE_DATE.sub("", mid)  # حذف تاریخ
-                m = re.search(r"(\d{5,6})", mid_clean)  # کد سفارش
+                m = _RE_CODE_IN_TEXT.search(mid_clean)  # کد سفارش
                 rows.append(
                     {
                         "rownum": rec["n"],
@@ -513,7 +522,8 @@ def _read_pdf(path) -> list[dict[str, Any]]:
                         "sheet_row": None,
                     }
                 )
-    if len(rows) < 2:
+    doc.close()
+    if not rows:
         raise ValueError("ساختار PDF شناخته نشد (ستون‌های جدول پیدا نشد)")
     return rows
 
@@ -684,11 +694,16 @@ def build_csv(rows) -> str:
     return "\n".join(out) + "\n"
 
 
+def _safe_cell(value: object) -> str:
+    text = str(value)
+    return "'" + text if text.lstrip(" \t\r\n").startswith(("=", "+", "-", "@")) else text
+
+
 def _csv_join(cells: list[str]) -> str:
     """CSV فیلدِ ایمن: کاما/دوزاق/خط جدید در متنِ فارقی را نمی‌شکند."""
     out = []
     for cell in cells:
-        text = str(cell)
+        text = _safe_cell(cell)
         if any(ch in text for ch in [",", '"', "\n", "\r"]):
             text = '"' + text.replace('"', '""') + '"'
         out.append(text)
@@ -796,6 +811,9 @@ def build_review_workbook(rows, layout: Layout | None = None) -> bytes | None:
             ]
         )
     for r in range(2, len(items) + 2):
+        for cell in ws[r]:
+            if isinstance(cell.value, str):
+                cell.data_type = "s"
         for col in (1, 2, 3):
             ws.cell(row=r, column=col).number_format = "@"  # متن، نه عدد
             ws.cell(row=r, column=col).alignment = Alignment(horizontal="left")
@@ -905,7 +923,7 @@ def _guard_rows(count: int) -> None:
     limit = int(settings.max_rows)
     if limit > 0 and count > limit:
         raise RowLimitError(
-            f"فایل {count:,} ردیف دارد و سقف {limit:,} ردیف (MAX_ROWS) را رد کرده است. "
+            f"فایل حداقل {count:,} ردیف دارد و سقف {limit:,} ردیف (MAX_ROWS) را رد کرده است. "
             "فایل را به دو یا چند بخش تقسیم کن؛ پردازشِ این حجم، ربات را برای همه slow می‌کند."
         )
 

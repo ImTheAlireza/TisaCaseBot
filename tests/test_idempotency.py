@@ -90,7 +90,7 @@ class TestBatchId(unittest.TestCase):
         first = publish_batch.batch_id(_data().to_dict(), [], chat_id=9)
         second = publish_batch.batch_id(_data().to_dict(), [], chat_id=9)
         self.assertEqual(first, second, "بعد از crash همان draft باید همان شناسه را بدهد")
-        self.assertRegex(first, r"^[0-9a-f]{12}$")
+        self.assertRegex(first, r"^[0-9a-f]{24}$")
 
     def test_everything_that_matters_changes_the_id(self) -> None:
         base = publish_batch.batch_id(_data().to_dict(), [], chat_id=9)
@@ -142,7 +142,8 @@ class TestBatchId(unittest.TestCase):
         self.assertNotEqual(base, one, "همان متن با یک عکس تازه، محصول دیگری است")
         self.assertNotEqual(one, bigger, "حجم فایل هم بخشی از هویت است (نام تنها کافی نیست)")
         # فایلِ غایب نباید تست را بترکاند (روی هاست هم ممکن است پاک شده باشد)
-        self.assertEqual(12, len(publish_batch.batch_id(_data().to_dict(), [tmp / "nope.jpg"], chat_id=9)))
+        with self.assertRaises(FileNotFoundError):
+            publish_batch.batch_id(_data().to_dict(), [tmp / "nope.jpg"], chat_id=9)
 
     def test_two_admins_are_two_intentions(self) -> None:
         """دو ادمین با یک متن، دو محصول می‌خواهند؛ بلاک کردن دومی خودش باگ است."""
@@ -525,7 +526,7 @@ class TestFlowGate(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, len(entries), f"یک تلاش باید یک کارت باشد: {[e['status'] for e in entries]}")
         self.assertEqual("failed", entries[0]["status"])
         self.assertIn("HTTP 400", entries[0]["error"])
-        self.assertEqual(12, len(str(entries[0]["batch_id"])))
+        self.assertEqual(24, len(str(entries[0]["batch_id"])))
         from bot.services import outbox as queue
 
         self.assertEqual(0, queue.pending(), "خطای تکراری نباید در صف بماند")
@@ -547,7 +548,7 @@ class TestFlowGate(unittest.IsolatedAsyncioTestCase):
         entry = products_ledger.recent(1)[0]
         meta = {row["key"]: row["value"] for row in self.calls[0]["meta"]}
         self.assertEqual(entry["batch_id"], meta[publish_batch.META_BATCH])
-        self.assertRegex(entry["batch_id"], r"^[0-9a-f]{12}$")
+        self.assertRegex(entry["batch_id"], r"^[0-9a-f]{24}$")
         self.assertEqual(4, json.loads(meta[publish_batch.META_SOURCE])["variations"])
         self.assertEqual(9, json.loads(meta[publish_batch.META_SOURCE])["chat_id"])
 

@@ -396,9 +396,16 @@ class TestFieldFlow(unittest.TestCase):
         PF.sessions.clear()
         PF.album_buffers.clear()
         PF.album_tasks.clear()
+        from _flow_harness import temp_ledger
+        ledger = temp_ledger()
+        ledger.__enter__()
+        self.addCleanup(ledger.__exit__, None, None, None)
 
     def _query(self, data, *, user_id=7):
         """A callback query that records transient answers and message text."""
+        session = PF.sessions.get(user_id)
+        if session and "|" not in data:
+            data = f"{data}|{session.nonce}.{session.revision:x}"
         messages: list = []
         self.answers: list = []
 
@@ -421,7 +428,7 @@ class TestFieldFlow(unittest.TestCase):
             message=SimpleNamespace(reply_html=reply_html, reply_text=reply_text,
                                     edit_text=edit_text, chat_id=user_id),
         )
-        return SimpleNamespace(callback_query=query), messages
+        return SimpleNamespace(callback_query=query, effective_user=query.from_user), messages
 
     def _context(self, messages):
         async def send_message(text=None, **kwargs):
@@ -443,6 +450,7 @@ class TestFieldFlow(unittest.TestCase):
         return SimpleNamespace(bot=bot, chat_data={})
 
     def test_edit_without_a_draft_asks_for_input_first(self):
+        PF.sessions[7] = PF.ProductSession()
         update, messages = self._query("product:edit")
         result = asyncio.run(PF.edit(update, self._context(messages)))
         self.assertEqual(result, PF.COLLECT, "no draft yet ⇒ still collecting, not reviewing")
@@ -457,7 +465,7 @@ class TestFieldFlow(unittest.TestCase):
         self.assertIn("title", session.field_keys)
         self.assertIn("price", session.field_keys)
         markup = messages[0][1]["reply_markup"]
-        buttons = [b.callback_data for row in markup.inline_keyboard for b in row]
+        buttons = [b.callback_data.split("|", 1)[0] for row in markup.inline_keyboard for b in row]
         self.assertIn("product:field:0", buttons)
         self.assertNotIn("product:edit:free", buttons)
 
@@ -468,7 +476,7 @@ class TestFieldFlow(unittest.TestCase):
         update, messages = self._query("product:edit")
         asyncio.run(PF.edit(update, self._context(messages)))
         buttons = [
-            button.callback_data
+            button.callback_data.split("|", 1)[0]
             for row in messages[0][1]["reply_markup"].inline_keyboard
             for button in row
         ]
@@ -496,7 +504,7 @@ class TestFieldFlow(unittest.TestCase):
         self.assertEqual(result, PF.EDITING_FIELD)
         self.assertEqual(session.editing_field, "title")
         self.assertIn("قاب سیلیکونی", messages[0][0])
-        cancel = [b.callback_data for row in messages[0][1]["reply_markup"].inline_keyboard for b in row]
+        cancel = [b.callback_data.split("|", 1)[0] for row in messages[0][1]["reply_markup"].inline_keyboard for b in row]
         self.assertIn("product:field:cancel", cancel, "an edit step needs a visible way out")
 
     def test_typed_value_updates_the_existing_preview_card(self):
@@ -517,7 +525,7 @@ class TestFieldFlow(unittest.TestCase):
         text, kwargs = self.messages[0]
         self.assertEqual(77, kwargs["message_id"])
         self.assertIn("698,000 تومان", text)
-        buttons = [b.callback_data for row in kwargs["reply_markup"].inline_keyboard for b in row]
+        buttons = [b.callback_data.split("|", 1)[0] for row in kwargs["reply_markup"].inline_keyboard for b in row]
         self.assertIn("product:confirm", buttons)
 
     def test_a_bad_value_keeps_the_user_in_the_step(self):
@@ -572,7 +580,7 @@ class TestFieldFlow(unittest.TestCase):
         session.data.suggestions = [
             {"kind": "brand", "word": "Nubia", "target": "Nokia", "brand": "nokia"}
         ]
-        keys = [button.callback_data
+        keys = [button.callback_data.split("|", 1)[0]
                 for row in PF._keyboard(session).inline_keyboard
                 for button in row]
         self.assertIn("product:sug:0", keys)
@@ -590,7 +598,7 @@ class TestFieldFlow(unittest.TestCase):
         self.assertEqual(session.data.suggestions, [])
         self.assertIn("brand:Nubia", session.dismissed)
         # the offer must not come back on the next render
-        keys = [button.callback_data
+        keys = [button.callback_data.split("|", 1)[0]
                 for row in PF._keyboard(session).inline_keyboard
                 for button in row]
         self.assertNotIn("product:sug:0", keys)

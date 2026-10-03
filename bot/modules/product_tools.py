@@ -21,6 +21,8 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
+    CommandHandler,
+    ConversationHandler,
     ContextTypes,
     MessageHandler,
     filters,
@@ -28,7 +30,9 @@ from telegram.ext import (
 
 from bot.constants import CB
 from bot.keyboards.cards import result_card
-from bot.services import learning
+from bot.services import flow_guard, learning
+from bot.services.access import guard_feature
+from bot.services.conversations import FlowConversationHandler
 from bot.services import postmodel as ev
 from bot.services import products_ledger
 from bot.utils.text import clip_html
@@ -40,12 +44,23 @@ logger = logging.getLogger(__name__)
 _PENDING_KEY = "parser_test_until"
 _PENDING_TTL_SECONDS = 300
 _MAX_REPORT = 3500
+PARSER_WAIT = 0
+_active_data: dict[int, dict] = {}
+
+
+def close_for(user_id: int) -> bool:
+    data = _active_data.pop(user_id, None)
+    return data is not None and data.pop(_PENDING_KEY, None) is not None
+
+
+flow_guard.register("parser_test", "تست پارسر", close_for)
 
 
 def _clip(text: str, parse_mode: str | None = "HTML") -> tuple[str, str | None]:
     return clip_html(text, limit=_MAX_REPORT)
 
 
+@guard_feature("recent_products")
 async def cb_recent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """The last few cards, newest first, each one openable."""
     query = update.callback_query
@@ -69,6 +84,7 @@ async def cb_recent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+@guard_feature("recent_products")
 async def cb_open(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """One stored card: the numbers as they were approved, not as they read today."""
     query = update.callback_query
@@ -86,6 +102,7 @@ async def cb_open(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await query.message.reply_text(result_card(entry), parse_mode="HTML", reply_markup=markup)
 
 
+@guard_feature("recent_products")
 async def cb_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show the approved field-by-field preview only when someone asks for it."""
     query = update.callback_query
@@ -106,6 +123,7 @@ async def cb_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+@guard_feature("recent_products")
 async def cb_summary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     key = (query.data or "").rsplit(":", 1)[-1]
@@ -120,8 +138,12 @@ async def cb_summary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await query.edit_message_text(result_card(entry), parse_mode="HTML", reply_markup=markup)
 
 
-async def cb_parser_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+@guard_feature("parser_test", on_denial=close_for)
+async def cb_parser_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
+    user = update.effective_user
+    flow_guard.close_others("parser_test", user.id)
+    _active_data[user.id] = context.user_data
     await query.answer()
     context.user_data[_PENDING_KEY] = time.time() + _PENDING_TTL_SECONDS
     await query.message.reply_text(
@@ -135,12 +157,16 @@ async def cb_parser_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         ]]),
     )
 
+    return PARSER_WAIT
 
-async def cb_parser_test_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cb_parser_test_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
     context.user_data.pop(_PENDING_KEY, None)
+    if update.effective_user:
+        close_for(update.effective_user.id)
     await query.message.reply_text("↩️ تست پارسر لغو شد.")
+    return ConversationHandler.END
 
 
 def _fmt(value: object) -> str:
@@ -281,15 +307,18 @@ def _data_report(data: object, extra: list[str] | None = None) -> tuple[str, str
     return _clip("\n".join(lines))
 
 
-async def on_parser_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+@guard_feature("parser_test", on_denial=close_for)
+async def on_parser_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Read the sample with the flow's own pipeline. Never creates anything."""
     message = update.effective_message
     if not message or not message.text:
-        return
+        return ConversationHandler.END
     until = float(context.user_data.get(_PENDING_KEY) or 0)
     if time.time() > until:
-        return
+        return ConversationHandler.END
     context.user_data.pop(_PENDING_KEY, None)
+    if update.effective_user:
+        _active_data.pop(update.effective_user.id, None)
     from bot.modules.product_flow import analyze  # local: keeps this module importable alone
 
     # The second run is what makes the diff real, and it is skipped when there is
@@ -302,9 +331,27 @@ async def on_parser_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     except Exception as exc:                       # pragma: no cover — parser bug
         logger.exception("parser test failed")
         await message.reply_text(f"⚠️ پارسر خطا داد: {type(exc).__name__}: {exc}")
-        return
+        return ConversationHandler.END
     text, mode = _data_report(data, _rules_block(data, without))
     await message.reply_text(text, **({"parse_mode": mode} if mode else {}))
+    return ConversationHandler.END
+
+
+async def parser_exit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.pop(_PENDING_KEY, None)
+    if update.effective_user:
+        close_for(update.effective_user.id)
+    from bot.modules.start import cmd_start
+    await cmd_start(update, context)
+    return ConversationHandler.END
+
+
+async def parser_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.effective_user:
+        close_for(update.effective_user.id)
+    from bot.modules.start import cb_main_menu
+    await cb_main_menu(update, context)
+    return ConversationHandler.END
 
 
 def register(app: Application) -> None:
@@ -312,11 +359,18 @@ def register(app: Application) -> None:
     app.add_handler(CallbackQueryHandler(cb_open, pattern=f"^{CB.PRODUCTS_OPEN}:\\w+$"))
     app.add_handler(CallbackQueryHandler(cb_report, pattern=r"^products:report:\w+$"))
     app.add_handler(CallbackQueryHandler(cb_summary, pattern=r"^products:summary:\w+$"))
-    app.add_handler(CallbackQueryHandler(cb_parser_test, pattern=f"^{CB.PARSER_TEST}$"))
-    app.add_handler(CallbackQueryHandler(cb_parser_test_cancel, pattern=f"^{CB.PARSER_TEST_CANCEL}$"))
-    # Group 1, not 0: while a product conversation is open its handlers win, so
-    # a seller typing product info never has it hijacked by a pending test.
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_parser_text), group=1)
+    app.add_handler(FlowConversationHandler(
+        flow="parser_test",
+        entry_points=[CallbackQueryHandler(cb_parser_test, pattern=f"^{CB.PARSER_TEST}$")],
+        states={PARSER_WAIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_parser_text)]},
+        fallbacks=[
+            CallbackQueryHandler(cb_parser_test_cancel, pattern=f"^{CB.PARSER_TEST_CANCEL}$"),
+            CallbackQueryHandler(parser_menu, pattern=f"^{CB.MAIN_MENU}$"),
+            CommandHandler(["cancel", "start", "menu"], parser_exit),
+        ],
+        conversation_timeout=_PENDING_TTL_SECONDS,
+        name="parser_test",
+    ))
 
 
 __all__ = ["register"]

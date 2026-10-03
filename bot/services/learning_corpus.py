@@ -20,6 +20,7 @@ question the owner is asking is «آیا این قاعده روی محصولات
 
 from __future__ import annotations
 
+import copy
 import logging
 import threading
 import time
@@ -36,7 +37,7 @@ CORPUS_FILE = DATA_DIR / "learning_corpus.json"
 MAX_ENTRIES = 20
 # One product must not be able to grow the file without limit; the first lines are
 # where prices, models and colors are written anyway.
-MAX_TEXT_CHARS = 2000
+MAX_TEXT_CHARS = 64_000
 
 
 def _lock_for() -> threading.Lock:
@@ -44,7 +45,7 @@ def _lock_for() -> threading.Lock:
     return jsonstore.lock_for(CORPUS_FILE)
 
 
-def record(text: str, data: Any) -> None:
+def record(text: str, data: Any) -> bool:
     """Add one extraction to the replay corpus.
 
     ``data`` is a ``ProductData`` (anything with the same attributes is fine);
@@ -55,15 +56,16 @@ def record(text: str, data: Any) -> None:
     title = str(payload.get("title") or "").strip()
     body = (text or "").strip()
     if not title and not body:
-        return
+        return True
     entry = {
         "ts": time.time(),
-        "text": body[-MAX_TEXT_CHARS:],
+        "text": body[:MAX_TEXT_CHARS],
+        "replay_complete": len(body) <= MAX_TEXT_CHARS,
         "title": title[:160],
         "price": int(payload.get("price") or 0),
-        "models": [str(x) for x in (payload.get("models") or [])][:12],
+        "models": [str(x) for x in (payload.get("models") or [])],
         "attributes": {
-            str(name): [str(v) for v in (values or [])][:20]
+            str(name): [str(v) for v in (values or [])]
             for name, values in (payload.get("attributes") or {}).items()
             if isinstance(values, (list, tuple))
         },
@@ -71,13 +73,17 @@ def record(text: str, data: Any) -> None:
         # Per-model colour limits decide how many variations the product really
         # has, so a replay that wanted the card's number needs them.
         "model_colors": {
-            str(name): [str(v) for v in (values or [])][:20]
+            str(name): [str(v) for v in (values or [])]
             for name, values in (payload.get("model_colors") or {}).items()
             if isinstance(values, (list, tuple))
         },
         # Not the number the session happened to carry: the same builder that
         # fills the preview card, so the corpus and the card cannot drift apart.
         "variation_count": plan.plan_from_dict(payload).count,
+        "stock_matrix": copy.deepcopy(payload.get("stock_matrix") or {}),
+        "stock_matrix_errors": copy.deepcopy(payload.get("stock_matrix_errors") or []),
+        "prices": copy.deepcopy(payload.get("prices") or {}),
+        "model_prices": copy.deepcopy(payload.get("model_prices") or {}),
     }
     with _lock_for():
         entries = _read()
@@ -93,8 +99,9 @@ def record(text: str, data: Any) -> None:
             # A corpus that cannot be written means impact previews will be empty.
             # It must not break a publish, so this only says so in the log.
             logger.warning("learning corpus could not be written to %s", CORPUS_FILE)
-        else:
-            jsonstore.invalidate(CORPUS_FILE)
+            return False
+        jsonstore.invalidate(CORPUS_FILE)
+        return True
 
 
 def _read() -> list[dict[str, Any]]:
@@ -119,7 +126,7 @@ def count() -> int:
 def clear() -> None:
     """Forget the corpus (the rules themselves are untouched)."""
     with _lock_for():
-        jsonstore.write_json(CORPUS_FILE, [])
+        jsonstore.checked_write(CORPUS_FILE, [])
 
 
 __all__ = ["CORPUS_FILE", "MAX_ENTRIES", "clear", "count", "entries", "record"]

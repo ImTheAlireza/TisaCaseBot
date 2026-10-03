@@ -19,7 +19,7 @@ import html
 import logging
 import re
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, MessageOriginUser, Update
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -31,7 +31,9 @@ from telegram.ext import (
 )
 
 from bot import rbac
-from bot.services import metrics
+from bot.services.conversations import FlowConversationHandler
+from bot.services import flow_guard, metrics
+from bot.services.access import guard_feature
 from bot.constants import (
     ADMIN_REMOVE_BACK_PREFIX,
     ADMIN_REMOVE_CONFIRM_PREFIX,
@@ -48,6 +50,15 @@ ADDING = 0
 
 # user_data key remembering the instruction message to refresh into the list.
 _EDIT_KEY = "admin_add_edit_target"
+_active_data: dict[int, dict] = {}
+
+
+def close_for(user_id: int) -> bool:
+    data = _active_data.pop(user_id, None)
+    return data is not None and data.pop(_EDIT_KEY, None) is not None
+
+
+flow_guard.register("admin_add", "افزودن ادمین", close_for)
 
 ADD_INSTRUCTION = (
     "➕ <b>افزودن ادمین</b>\n\n"
@@ -76,7 +87,7 @@ def _admin_rows() -> str:
     for i, (uid, rec) in enumerate(sorted(stored.items(), key=lambda kv: int(kv[0])), 1):
         name = rec.get("name") or ""
         handle = rec.get("username") or ""
-        label = name or (f"@{handle}" if handle else uid)
+        label = html.escape(str(name or (f"@{handle}" if handle else uid)))
         lines.append(f"{i}. {label}  (<code>{uid}</code>)")
     return "\n".join(lines)
 
@@ -267,6 +278,8 @@ async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         metrics.note_denial("admins")
         await query.answer("⛔ دسترسی ندارید.", show_alert=True)
         return ConversationHandler.END
+    flow_guard.close_others("admin_add", user.id)
+    _active_data[user.id] = context.user_data
     await query.answer()
     await query.edit_message_text(
         ADD_INSTRUCTION, reply_markup=_back_to_list_keyboard(), parse_mode="HTML"
@@ -279,7 +292,12 @@ async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def _finish_add(update: Update, context: ContextTypes.DEFAULT_TYPE,
                       uid: int, name: str) -> int:
     user = update.effective_user
+    if not user or not rbac.is_sudo(user.id):
+        await update.effective_message.reply_text("⛔ دسترسی ندارید.")
+        return ConversationHandler.END
     target = context.user_data.pop(_EDIT_KEY, None)
+    if user:
+        _active_data.pop(user.id, None)
 
     if rbac.is_sudo(uid):
         await update.effective_message.reply_text(
@@ -301,9 +319,11 @@ async def _finish_add(update: Update, context: ContextTypes.DEFAULT_TYPE,
     return ConversationHandler.END
 
 
+@guard_feature("admins")
 async def on_forwarded(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """A forwarded message → the original sender becomes the admin."""
-    sender = update.effective_message.forward_from
+    origin = getattr(update.effective_message, "forward_origin", None)
+    sender = origin.sender_user if isinstance(origin, MessageOriginUser) else None
     if sender is None:
         await update.effective_message.reply_text(
             "❗ نتوانستم فرستنده‌ی اصلی این پیام را پیدا کنم. "
@@ -314,6 +334,7 @@ async def on_forwarded(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     return await _finish_add(update, context, sender.id, rec["name"])
 
 
+@guard_feature("admins")
 async def on_id_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Text → a numeric id or @username; creates an invite, never direct access.
 
@@ -425,7 +446,8 @@ def register(app: Application) -> None:
     )
 
     # Add-flow conversation.
-    add_conv = ConversationHandler(
+    add_conv = FlowConversationHandler(
+        flow="admin_add",
         entry_points=[
             CallbackQueryHandler(entry, pattern=f"^{CB.ADMINS_ADD}$"),
         ],
