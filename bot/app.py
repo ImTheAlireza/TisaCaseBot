@@ -102,8 +102,12 @@ async def _post_init(app: Application) -> None:
 
 async def _post_stop(app: Application) -> None:
     from bot.modules import image_compress, product_flow
+    from bot.services import metrics, worker
+
     await product_flow.shutdown()
     await image_compress.shutdown()
+    await worker.shutdown()
+    metrics.close()
 
 
 def build_application() -> Application:
@@ -132,6 +136,9 @@ def build_application() -> Application:
         .request(api_request)
         .get_updates_request(polling_request)
         .application_class(PrivateOnlyApplication)
+        # 8 handlers may *run* at once; a tap waiting for its own user's earlier tap
+        # waits in a cheap dispatch slot instead of parking one of those 8 (the reason
+        # «یک نفر چند بار پشت‌سرهم بزند» no longer freezes everyone else).
         .concurrent_updates(PerUserUpdateProcessor(8))
         .post_init(_post_init)
         .post_stop(_post_stop)

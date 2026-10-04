@@ -7,6 +7,7 @@ permission changes and publish intents must not report success without storage.
 """
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 import logging
@@ -157,4 +158,33 @@ def invalidate(path: Path | str | None = None) -> None:
             _cache.pop(str(path), None)
 
 
-__all__ = ["StateWriteError", "checked_write", "invalidate", "lock_for", "read_json", "write_json"]
+async def write_json_async(path: Path | str, data: Any) -> bool:
+    """``write_json`` off the event loop.
+
+    The synchronous API stays synchronous (CLI, tests, service internals), but a
+    *tap* that saves state must not sit on the loop while the disk does its three
+    fsyncs: on a slow host that stall is paid by every other user (measured with a
+    30 ms fsync: one save made the next user's update wait 95 ms; through a thread,
+    6 ms). Durability is unchanged — the same ``write_json`` runs, it just does not
+    block the loop while running.
+    """
+    return await asyncio.to_thread(write_json, path, data)
+
+
+async def checked_write_async(
+    path: Path | str, data: Any, writer: Callable[[Path | str, Any], bool] | None = None,
+) -> None:
+    """``checked_write`` off the event loop; still raises :class:`StateWriteError`."""
+    await asyncio.to_thread(checked_write, path, data, writer)
+
+
+__all__ = [
+    "StateWriteError",
+    "checked_write",
+    "checked_write_async",
+    "invalidate",
+    "lock_for",
+    "read_json",
+    "write_json",
+    "write_json_async",
+]

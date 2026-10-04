@@ -36,6 +36,7 @@ from bot.services.conversations import FlowConversationHandler
 from bot.services import postmodel as ev
 from bot.services import products_ledger
 from bot.utils.text import clip_html
+from bot.utils.ui import answer_and, answer_and_edit
 
 logger = logging.getLogger(__name__)
 
@@ -64,12 +65,12 @@ def _clip(text: str, parse_mode: str | None = "HTML") -> tuple[str, str | None]:
 async def cb_recent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """The last few cards, newest first, each one openable."""
     query = update.callback_query
-    await query.answer()
     entries = products_ledger.recent(10)
     if not entries:
-        await query.edit_message_text(
+        await answer_and_edit(
+            query,
             "🧾 هنوز محصولی از این ربات ساخته نشده است.\n"
-            "بعد از هر ساخت موفق (یا ناموفق)، همین‌جا قابل دیدن خواهد بود."
+            "بعد از هر ساخت موفق (یا ناموفق)، همین‌جا قابل دیدن خواهد بود.",
         )
         return
     lines = ["🧾 <b>آخرین محصولات</b>", ""]
@@ -79,8 +80,8 @@ async def cb_recent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         label = str(entry.get("title") or "—")[:32]
         rows.append([InlineKeyboardButton(f"{index}. {label}", callback_data=f"{CB.PRODUCTS_OPEN}:{entry.get('key')}")])
     rows.append([InlineKeyboardButton("↩️ منو", callback_data=CB.MAIN_MENU)])
-    await query.edit_message_text(
-        "\n".join(lines), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows)
+    await answer_and_edit(
+        query, "\n".join(lines), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows)
     )
 
 
@@ -88,18 +89,21 @@ async def cb_recent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cb_open(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """One stored card: the numbers as they were approved, not as they read today."""
     query = update.callback_query
-    await query.answer()
     key = (query.data or "").rsplit(":", 1)[-1]
     entry = products_ledger.find(key)
     if entry is None:
-        await query.message.reply_text("این کارت پیدا نشد؛ احتمالاً تاریخچه پاک شده است.")
+        await answer_and(
+            query, query.message.reply_text("این کارت پیدا نشد؛ احتمالاً تاریخچه پاک شده است.")
+        )
         return
     markup = None
     if entry.get("report"):
         markup = InlineKeyboardMarkup([[
             InlineKeyboardButton("👁 پیش‌نمایش", callback_data=f"products:report:{key}")
         ]])
-    await query.message.reply_text(result_card(entry), parse_mode="HTML", reply_markup=markup)
+    await answer_and(
+        query, query.message.reply_text(result_card(entry), parse_mode="HTML", reply_markup=markup)
+    )
 
 
 @guard_feature("recent_products")
@@ -112,9 +116,9 @@ async def cb_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not report:
         await query.answer("پیش‌نمایش پیدا نشد.", show_alert=True)
         return
-    await query.answer()
     text, mode = _clip(report)
-    await query.edit_message_text(
+    await answer_and_edit(
+        query,
         text,
         **({"parse_mode": mode} if mode else {}),
         reply_markup=InlineKeyboardMarkup([[
@@ -131,11 +135,10 @@ async def cb_summary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not entry:
         await query.answer("این کارت پیدا نشد.", show_alert=True)
         return
-    await query.answer()
     markup = InlineKeyboardMarkup([[
         InlineKeyboardButton("👁 پیش‌نمایش", callback_data=f"products:report:{key}")
     ]]) if entry.get("report") else None
-    await query.edit_message_text(result_card(entry), parse_mode="HTML", reply_markup=markup)
+    await answer_and_edit(query, result_card(entry), parse_mode="HTML", reply_markup=markup)
 
 
 @guard_feature("parser_test", on_denial=close_for)
@@ -144,28 +147,29 @@ async def cb_parser_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user = update.effective_user
     flow_guard.close_others("parser_test", user.id)
     _active_data[user.id] = context.user_data
-    await query.answer()
     context.user_data[_PENDING_KEY] = time.time() + _PENDING_TTL_SECONDS
-    await query.message.reply_text(
+    await answer_and(
+        query,
+        query.message.reply_text(
         "🔍 متن نمونهٔ پست را بفرست (قیمت، مدل‌ها، رنگ‌ها…).\n\n"
         "همان مسیری اجرا می‌شود که یک پست واقعی می‌رود — با این تفاوت که هیچ "
         "محصولی ساخته نمی‌شود و هیچ فایلی نوشته نمی‌شود.\n\n"
         "اگر قاعدهٔ فعالی داشته باشی، متن را یک بار با قواعد و یک بار بدون آن‌ها "
         "می‌خوانم و فرقی که می‌کند را نشان می‌دهم.",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("↩️ انصراف", callback_data=CB.PARSER_TEST_CANCEL)
-        ]]),
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("↩️ انصراف", callback_data=CB.PARSER_TEST_CANCEL)
+            ]]),
+        ),
     )
 
     return PARSER_WAIT
 
 async def cb_parser_test_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
-    await query.answer()
     context.user_data.pop(_PENDING_KEY, None)
     if update.effective_user:
         close_for(update.effective_user.id)
-    await query.message.reply_text("↩️ تست پارسر لغو شد.")
+    await answer_and(query, query.message.reply_text("↩️ تست پارسر لغو شد."))
     return ConversationHandler.END
 
 

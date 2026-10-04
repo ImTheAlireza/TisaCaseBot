@@ -8,6 +8,7 @@ to admins. Values persist in data/preferences.json (bot/services/preferences).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 
@@ -18,6 +19,7 @@ from bot import rbac
 from bot.buttons import BUTTONS
 from bot.constants import CB
 from bot.services import preferences
+from bot.utils.ui import answer_and_edit
 
 logger = logging.getLogger(__name__)
 
@@ -71,8 +73,7 @@ async def cb_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not user or not rbac.is_sudo(user.id):
         await query.answer("⛔ دسترسی ندارید.", show_alert=True)
         return
-    await query.answer()
-    await query.edit_message_text(_text(), reply_markup=_keyboard(), parse_mode="HTML")
+    await answer_and_edit(query, _text(), reply_markup=_keyboard(), parse_mode="HTML", quiet=True)
 
 
 async def cb_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -87,13 +88,20 @@ async def cb_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not key:
         await query.answer()
         return
-    preferences.set_button_visible(key, not preferences.button_visible(key))
+    # Off the loop: three fsyncs on a shared host would stall every other user.
+    await asyncio.to_thread(preferences.set_button_visible, key, not preferences.button_visible(key))
     logger.info(
         "Sudo %s toggled button %s -> %s",
         user.id, key, preferences.button_visible(key),
     )
-    await query.answer("✅ به‌روزرسانی شد.")
-    await query.edit_message_text(_text(), reply_markup=_keyboard(), parse_mode="HTML")
+    await answer_and_edit(
+        query,
+        _text(),
+        reply_markup=_keyboard(),
+        parse_mode="HTML",
+        toast="✅ به‌روزرسانی شد.",
+        quiet=True,
+    )
 
 
 async def cb_locked(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

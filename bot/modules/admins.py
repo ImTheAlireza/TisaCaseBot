@@ -15,6 +15,7 @@ can't accidentally lock itself out.
 
 from __future__ import annotations
 
+import asyncio
 import html
 import logging
 import re
@@ -34,6 +35,7 @@ from bot import rbac
 from bot.services.conversations import FlowConversationHandler
 from bot.services import flow_guard, metrics
 from bot.services.access import guard_feature
+from bot.utils.ui import answer_and_edit
 from bot.constants import (
     ADMIN_REMOVE_BACK_PREFIX,
     ADMIN_REMOVE_CONFIRM_PREFIX,
@@ -192,9 +194,12 @@ async def cb_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         metrics.note_denial("admins")
         await query.answer("⛔ دسترسی ندارید.", show_alert=True)
         return
-    await query.answer()
-    await query.edit_message_text(
-        _list_text(_owner_display()), reply_markup=_list_keyboard(), parse_mode="HTML"
+    await answer_and_edit(
+        query,
+        _list_text(_owner_display()),
+        reply_markup=_list_keyboard(),
+        parse_mode="HTML",
+        quiet=True,
     )
 
 
@@ -210,8 +215,8 @@ async def cb_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     m = re.search(rf"{re.escape(ADMIN_REMOVE_PREFIX)}(\d+)$", query.data or "")
     uid = int(m.group(1)) if m else 0
-    await query.answer()
-    await query.edit_message_text(
+    await answer_and_edit(
+        query,
         f"❌ <b>حذف ادمین</b>\n\n"
         f"مطمئنی که دسترسی ادمین <code>{uid}</code> برداشته شود؟",
         reply_markup=_confirm_remove_keyboard(uid),
@@ -230,10 +235,13 @@ async def cb_remove_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     m = re.search(rf"{re.escape(ADMIN_REMOVE_CONFIRM_PREFIX)}(\d+)$", query.data or "")
     uid = int(m.group(1)) if m else 0
     if uid:
-        rbac.remove_admin(uid)
-    await query.answer()
-    await query.edit_message_text(
-        _list_text(_owner_display()), reply_markup=_list_keyboard(), parse_mode="HTML"
+        await asyncio.to_thread(rbac.remove_admin, uid)
+    await answer_and_edit(
+        query,
+        _list_text(_owner_display()),
+        reply_markup=_list_keyboard(),
+        parse_mode="HTML",
+        quiet=True,
     )
 
 
@@ -247,10 +255,16 @@ async def cb_revoke_invite(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
     match = re.search(rf"{re.escape(ADMIN_REVOKE_PREFIX)}(\d+)$", query.data or "")
     uid = int(match.group(1)) if match else 0
-    cancelled = rbac.cancel_invite(uid) if uid else False
-    await query.answer("🗑️ دعوت لغو شد." if cancelled else "دعوتی پیدا نشد.")
-    await query.edit_message_text(
-        _list_text(_owner_display()), reply_markup=_list_keyboard(), parse_mode="HTML"
+    cancelled = False
+    if uid:
+        cancelled = await asyncio.to_thread(rbac.cancel_invite, uid)
+    await answer_and_edit(
+        query,
+        _list_text(_owner_display()),
+        reply_markup=_list_keyboard(),
+        parse_mode="HTML",
+        toast="🗑️ دعوت لغو شد." if cancelled else "دعوتی پیدا نشد.",
+        quiet=True,
     )
 
 
@@ -262,9 +276,12 @@ async def cb_remove_back(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         metrics.note_denial("admins")
         await query.answer("⛔ دسترسی ندارید.", show_alert=True)
         return
-    await query.answer()
-    await query.edit_message_text(
-        _list_text(_owner_display()), reply_markup=_list_keyboard(), parse_mode="HTML"
+    await answer_and_edit(
+        query,
+        _list_text(_owner_display()),
+        reply_markup=_list_keyboard(),
+        parse_mode="HTML",
+        quiet=True,
     )
 
 
@@ -280,9 +297,8 @@ async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return ConversationHandler.END
     flow_guard.close_others("admin_add", user.id)
     _active_data[user.id] = context.user_data
-    await query.answer()
-    await query.edit_message_text(
-        ADD_INSTRUCTION, reply_markup=_back_to_list_keyboard(), parse_mode="HTML"
+    await answer_and_edit(
+        query, ADD_INSTRUCTION, reply_markup=_back_to_list_keyboard(), parse_mode="HTML"
     )
     # Remember this message so we can refresh it into the list when done.
     context.user_data[_EDIT_KEY] = (query.message.chat_id, query.message.message_id)
@@ -305,7 +321,7 @@ async def _finish_add(update: Update, context: ContextTypes.DEFAULT_TYPE,
             "نیازی به افزودن نیست."
         )
     else:
-        rbac.add_admin(uid, name=name, added_by=user.id if user else None)
+        await asyncio.to_thread(rbac.add_admin, uid, name=name, added_by=user.id if user else None)
         await update.effective_message.reply_text(
             f"✅ ادمین <code>{uid}</code> با موفقیت اضافه شد.", parse_mode="HTML"
         )
@@ -401,9 +417,12 @@ async def cb_add_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         await query.answer("⛔ دسترسی ندارید.", show_alert=True)
         return ConversationHandler.END
     context.user_data.pop(_EDIT_KEY, None)
-    await query.answer()
-    await query.edit_message_text(
-        _list_text(_owner_display()), reply_markup=_list_keyboard(), parse_mode="HTML"
+    await answer_and_edit(
+        query,
+        _list_text(_owner_display()),
+        reply_markup=_list_keyboard(),
+        parse_mode="HTML",
+        quiet=True,
     )
     return ConversationHandler.END
 

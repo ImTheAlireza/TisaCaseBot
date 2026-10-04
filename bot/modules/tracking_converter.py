@@ -51,6 +51,7 @@ from bot.services.conversations import FlowConversationHandler
 from bot.keyboards import main_menu_keyboard, main_menu_text
 from bot.services import flow_guard, metrics, processor, tracking_ledger, worker, workspace
 from bot.services.access import guard_feature
+from bot.utils.ui import answer_and, answer_and_edit
 
 logger = logging.getLogger(__name__)
 
@@ -183,9 +184,8 @@ async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     flow_guard.close_others("tracking", user.id)
     close_for(user.id)
     _active_contexts[user.id] = context
-    await query.answer()
     logger.info("User %s entered tracking-converter flow", user.id)
-    await query.edit_message_text(INSTRUCTIONS, reply_markup=_cancel_keyboard(), parse_mode="HTML")
+    await answer_and_edit(query, INSTRUCTIONS, reply_markup=_cancel_keyboard(), parse_mode="HTML")
     return ASK_FILE
 
 
@@ -491,9 +491,8 @@ async def on_retry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def on_send_another(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """«📤 فایل دیگری بفرست» → drop this one, stay in the flow."""
     query = update.callback_query
-    await query.answer()
     _release(context)
-    await query.message.reply_text(NEXT_FILE_TEXT, reply_markup=_cancel_keyboard())
+    await answer_and(query, query.message.reply_text(NEXT_FILE_TEXT, reply_markup=_cancel_keyboard()))
     return ASK_FILE
 
 
@@ -514,14 +513,15 @@ async def cb_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """«بازگشت به منو» button → end flow, show main menu."""
     query = update.callback_query
     user = update.effective_user
-    await query.answer()
     if user:
         close_for(user.id)
     _release(context)
-    await query.edit_message_text(
+    await answer_and_edit(
+        query,
         main_menu_text(user.id if user else None, user),
         reply_markup=main_menu_keyboard(user.id if user else None),
         parse_mode="HTML",
+        quiet=True,
     )
     return ConversationHandler.END
 

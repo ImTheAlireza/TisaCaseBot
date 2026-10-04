@@ -41,6 +41,7 @@ from bot.services.conversations import FlowConversationHandler
 from bot.keyboards import main_menu_keyboard, main_menu_text
 from bot.services.image_compressor import compress_image
 from bot.services.product_text_summary import format_product_summary
+from bot.utils.ui import answer_and_edit
 
 logger = logging.getLogger(__name__)
 
@@ -573,14 +574,15 @@ async def cb_back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     """The in-flow «بازگشت به منو» button."""
     query = update.callback_query
     user = update.effective_user
-    await query.answer()
     if user:
         close_for(user.id)
     _clear_analysis(context)
-    await query.edit_message_text(
+    await answer_and_edit(
+        query,
         main_menu_text(user.id if user else None, user),
         reply_markup=main_menu_keyboard(user.id if user else None),
         parse_mode="HTML",
+        quiet=True,
     )
     return ConversationHandler.END
 

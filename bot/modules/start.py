@@ -11,6 +11,7 @@ from bot import rbac
 from bot.services import flow_guard
 from bot.constants import CB, DENIED_TEXT
 from bot.keyboards import main_menu_keyboard, main_menu_text
+from bot.utils.ui import answer_and_edit
 
 logger = logging.getLogger(__name__)
 
@@ -69,8 +70,8 @@ async def cb_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     flow_guard.close_others("", user.id)
-    await query.answer()
-    await query.edit_message_text(
+    await answer_and_edit(
+        query,
         main_menu_text(user.id, user),
         reply_markup=main_menu_keyboard(user.id),
         parse_mode="HTML",

@@ -23,6 +23,7 @@ from telegram.ext import Application, CallbackQueryHandler, ContextTypes
 from bot import rbac
 from bot.config import data_dir, settings
 from bot.constants import CB
+from bot.utils.ui import answer_and, answer_and_edit
 from dotenv import dotenv_values
 
 logger = logging.getLogger(__name__)
@@ -116,8 +117,8 @@ async def cb_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await query.answer("⛔ دسترسی ندارید.", show_alert=True)
         return
 
-    await query.answer()
-    await query.edit_message_text(
+    await answer_and_edit(
+        query,
         "🔄 <b>ری‌استارت ربات</b>\n\n"
         f"ربات از طریق supervisor ری‌استارت می‌شود:\n"
         f"<code>{' '.join(_candidate_commands()[0])}</code>\n\n"
@@ -135,10 +136,9 @@ async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await query.answer("⛔ دسترسی ندارید.", show_alert=True)
         return
 
-    await query.answer()
     logger.warning("Restart requested by user %s via supervisor", user.id if user else "?")
 
-    msg = await query.edit_message_text("♻️ در حال ری‌استارت از طریق supervisor…")
+    msg = await answer_and(query, query.edit_message_text("♻️ در حال ری‌استارت از طریق supervisor…"))
 
     # Marker so the freshly-started process can confirm success in this chat.
     PENDING_FILE.parent.mkdir(parents=True, exist_ok=True)
