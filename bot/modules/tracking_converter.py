@@ -59,7 +59,16 @@ ASK_FILE = 0
 MAP_COLUMNS = 1
 DUPLICATE_FILE = 2
 
-ALLOWED_EXTS = {".xlsx", ".csv", ".pdf"}
+ALLOWED_EXTS = {".xlsx", ".xlsm", ".csv", ".pdf"}
+
+#: پسوندهایی که نمی‌پذیریم — با راهِ حلِ خودشان. «دوباره بفرست» برای فایل xls یعنی
+#: فرستادنِ همان فایلِ xls؛ جمله باید بگوید چطور xlsx شود.
+_UNSUPPORTED_HINTS = {
+    ".xls": "این فایل اکسل قدیمی (xls) است؛ در اکسل بازش کن و «Save As → Excel Workbook (*.xlsx)» بزن.",
+    ".ods": "این فایل LibreOffice است؛ در همان برنامه «Save As → xlsx» بزن.",
+    ".txt": "این فایل متنی است؛ پسوندش را به csv تغییر بده (اگر جدولِ جداکننده‌دار است).",
+    ".numbers": "این فایل Numbers است؛ از آن «Export → Excel» بگیر.",
+}
 #: Where a download waits between messages (swept, like the product flow's workspace).
 TEMP_DIR = Path("/tmp/tisaposttowp-tracking")
 PENDING_KEY = "tisa_tracking_pending"
@@ -89,7 +98,7 @@ def _limits_line() -> str:
 INSTRUCTIONS = (
     "📦 <b>تبدیل فایل کد رهگیری</b>\n\n"
     "یک فایل با یکی از این فرمت‌ها بفرست (به‌صورت Document، نه عکس):\n"
-    "📊 اکسل (<code>.xlsx</code>) — خروجی جدول سفارش‌ها\n"
+    "📊 اکسل (<code>.xlsx</code> / <code>.xlsm</code>) — خروجی جدول سفارش‌ها\n"
     "📄 CSV (<code>.csv</code>)\n"
     "📑 PDF (<code>.pdf</code>) — خروجی مستقیم سامانه تیساکیس / تیسا چاپ\n\n"
     "ربات این کارها را می‌کند:\n"
@@ -104,6 +113,27 @@ INSTRUCTIONS = (
 )
 
 NEXT_FILE_TEXT = "📤 فایل بعدی را بفرست، یا برگرد به منو."
+
+#: راهِ حلِ هر پسوند — «چه بفرستم» به‌جای «دوباره امتحان کن». Every functional error in
+#: this flow ends with one of these, because «خطا در پردازش» alone sends the warehouse
+#: back to the same file.
+_EXCEL_HINT = (
+    "راه‌حل: فایل را در اکسل باز کن و «Save As → Excel Workbook (*.xlsx)» بزن، "
+    "یا همان گزارش را از سامانه به‌صورت CSV/PDF بگیر."
+)
+_RECOVERY_HINTS = {
+    ".xlsx": _EXCEL_HINT,
+    ".xlsm": _EXCEL_HINT,
+    ".csv": (
+        "راه‌حل: خروجی CSV را دوباره از سامانه بگیر (جداکننده یا کدگذاری‌اش ممکن است خراب شده باشد)، "
+        "یا همان گزارش را به‌صورت اکسل/PDF بفرست."
+    ),
+    ".pdf": "راه‌حل: اگر PDF اسکن‌شده یا عکس است، خروجیِ متنی (اکسل/CSV) همان گزارش را از سامانه بگیر.",
+}
+
+
+def _recovery_hint(path) -> str:
+    return _RECOVERY_HINTS.get(Path(path).suffix.lower() or "", _RECOVERY_HINTS[".xlsx"])
 
 
 def _cancel_keyboard() -> InlineKeyboardMarkup:
@@ -171,8 +201,10 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 
     _release(context)  # an abandoned question from the previous file is gone now
     if ext not in ALLOWED_EXTS:
+        hint = _UNSUPPORTED_HINTS.get(ext)
         await msg.reply_text(
-            "❌ فقط فایل‌های xlsx / csv / pdf پشتیبانی می‌شوند. دوباره بفرست.",
+            "❌ فقط فایل‌های xlsx / xlsm / csv / pdf پشتیبانی می‌شوند."
+            + (f"\n{hint}" if hint else " دوباره بفرست."),
             reply_markup=_cancel_keyboard(),
         )
         return ASK_FILE
@@ -237,9 +269,24 @@ async def _run(path: Path, fname: str, layout: processor.Layout | None = None):
         )
     except processor.RowLimitError as exc:
         return f"🚧 {exc}\n\nسقف‌ها در .env قابل تغییرند (MAX_ROWS / MAX_FILE_MB)."
+    except worker.WorkerCrash:
+        # The child died (memory/CPU cap) or the bot was restarted mid-file. There is no
+        # sentence to translate, only something to do: split the file.
+        logger.exception("tracking worker stopped mid-file: %s", fname)
+        return (
+            "🚧 پردازش این فایل وسطِ کار متوقف شد — فایل برای حافظهٔ ربات سنگین بود یا ربات "
+            "ری‌استارت شد.\n"
+            "فایل را به دو یا چند بخش کوچک‌تر تقسیم کن و هر بخش را جدا بفرست؛ "
+            "یا از سامانه خروجی CSV بگیر (سبک‌تر از اکسل است).\n\n"
+            f"🚧 {_limits_line()}"
+        )
     except Exception as exc:  # pragma: no cover — parser-level
         logger.exception("tracking file failed: %s", fname)
-        return f"❌ خطا در پردازش:\n{exc}\n\nفایل دیگری بفرست یا برگرد به منو."
+        reason = str(exc).strip() or type(exc).__name__
+        return (
+            f"❌ خطا در پردازش:\n{reason}\n\n{_recovery_hint(path)}\n"
+            f"(جزئیاتِ فنی در logs/bot.log)\n{NEXT_FILE_TEXT}"
+        )
 
 
 def _record(context: ContextTypes.DEFAULT_TYPE, report: processor.Report) -> None:

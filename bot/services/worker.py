@@ -17,6 +17,15 @@ from typing import Any
 
 MAX_WORKERS = 2
 MEMORY_MB = 768
+
+
+class WorkerCrash(RuntimeError):
+    """The child process died before answering (memory cap, CPU cap, or a crash).
+
+    A type of its own so a flow can answer with something to *do* — «فایل را تقسیم کن» —
+    instead of forwarding «File worker exited before returning a result».
+    """
+
 _slots: asyncio.Semaphore | None = None
 _loop: asyncio.AbstractEventLoop | None = None
 
@@ -44,7 +53,7 @@ def _entry(connection: Any, function: Callable[..., Any], args: tuple[Any, ...],
         try:
             connection.send((False, exc))
         except Exception:
-            connection.send((False, RuntimeError(f"File worker failed: {type(exc).__name__}")))
+            connection.send((False, WorkerCrash(f"File worker failed: {type(exc).__name__}")))
     finally:
         connection.close()
 
@@ -79,7 +88,7 @@ async def run(function: Callable[..., Any], *args: Any, timeout: float = 120.0, 
             try:
                 success, result = await asyncio.shield(result_task)
             except EOFError as exc:
-                raise RuntimeError("File worker exited before returning a result (resource limit or crash)") from exc
+                raise WorkerCrash("File worker exited before returning a result (resource limit or crash)") from exc
             if not success:
                 raise result
             return result
