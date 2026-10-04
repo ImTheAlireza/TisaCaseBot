@@ -98,6 +98,9 @@ async def _post_init(app: Application) -> None:
     # A publish the shop refused (429/5xx) waits in data/outbox.sqlite3 and is retried by
     # itself — including the ones left over from before this restart.
     await start_outbox(app)
+    # Daily zip backup + daily ops report (catch-up at startup if a backup is due).
+    from bot.modules import maintenance
+    await maintenance.start(app)
 
 
 async def _post_stop(app: Application) -> None:

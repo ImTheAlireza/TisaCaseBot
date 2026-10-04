@@ -374,7 +374,8 @@ class TestDocsMatchTheTools(unittest.TestCase):
         keys = set(re.findall(r"^([A-Z][A-Z0-9_]{2,})=", read(ENV_EXAMPLE), re.M))
         text = read(README)
         for key in ("PRICE_MIN", "PRICE_MAX", "MAX_ROWS", "MAX_FILE_MB", "VERBOSE_LOG", "TISA_DATA_DIR",
-                 "TISA_TEMP_DIR", "TISA_DRY_RUN"):
+                 "TISA_TEMP_DIR", "TISA_BACKUP_DIR", "TISA_BACKUP_KEEP", "TISA_DAILY_REPORT_HOUR",
+                 "TISA_DRY_RUN"):
             self.assertTrue(key in keys, f"{key} در .env.example نیست")
             self.assertTrue(f"`{key}`" in text, f"{key} در README توضیح ندارد")
 

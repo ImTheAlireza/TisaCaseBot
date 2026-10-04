@@ -170,6 +170,12 @@ class Settings:
     #: Default ``<TISA_DATA_DIR>/tmp``; ``TISA_TEMP_DIR`` moves it. Predictable paths
     #: under the system ``/tmp`` can be created by another account on a shared host.
     temp_dir: Path = field(default_factory=lambda: data_dir() / "tmp")
+    #: Daily state backups (JSON stores + both SQLite databases + the send queue).
+    #: One zip per day, rotated; see bot/services/backup.py.
+    backup_dir: Path = field(default_factory=lambda: data_dir() / "backups")
+    backup_keep: int = 7
+    #: Hour (server-local) of the daily «📊 گزارش روزانه» in the log chat; 0 = off.
+    daily_report_hour: int = 9
     max_file_mb: float = 25.0
     max_rows: int = 200_000
     process_timeout_seconds: float = 120.0
@@ -238,6 +244,16 @@ class Settings:
 
         temp_raw = _raw("TISA_TEMP_DIR")
         temp_dir = Path(temp_raw).expanduser() if temp_raw else data_dir() / "tmp"
+        backup_raw = _raw("TISA_BACKUP_DIR")
+        backup_dir = Path(backup_raw).expanduser() if backup_raw else data_dir() / "backups"
+        backup_keep, problem = _as_int("TISA_BACKUP_KEEP", 7)
+        note(problem)
+        backup_keep = max(1, min(365, backup_keep))
+        report_hour, problem = _as_int("TISA_DAILY_REPORT_HOUR", 9)
+        note(problem)
+        if not 0 <= report_hour <= 23:
+            note("TISA_DAILY_REPORT_HOUR باید بین ۰ و ۲۳ باشد؛ گزارش خاموش شد.")
+            report_hour = 0
 
         price_min, problem = _as_int("PRICE_MIN", 1_000)
         note(problem)
@@ -322,6 +338,9 @@ class Settings:
             flow_timeout_seconds=flow_timeout,
             temp_ttl_hours=temp_ttl,
             temp_dir=temp_dir,
+            backup_dir=backup_dir,
+            backup_keep=backup_keep,
+            daily_report_hour=report_hour,
             max_file_mb=max_file_mb,
             max_rows=max_rows,
             process_timeout_seconds=max(5.0, process_timeout),

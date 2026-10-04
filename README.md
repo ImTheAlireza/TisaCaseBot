@@ -94,6 +94,9 @@ required to start.
 | `REQUIRE_MODELS` | no | Opt-in strict validation: `yes` blocks products with no detected model. Default `no`; model-less products are allowed and can be created as simple products. |
 | `TISA_DATA_DIR` | no | Where the JSON stores live (roles, publish history, learned rules). Default `./data`. On a shared host point it **out of the code directory** (e.g. `/var/lib/tisaposttowp`) so a redeploy or `git clean` cannot delete the shop's history. `python main.py --check-config` prints the resolved path and **fails** if it is not writable — the JSON writers never raise. |
 | `TISA_TEMP_DIR` | no | Where per-session work directories live (downloads, compressed photos). Default `<TISA_DATA_DIR>/tmp`. On a shared host point it at an owner-only directory: a predictable path under `/tmp` can be created first by another account. A symlink is refused on purpose. |
+| `TISA_BACKUP_DIR` | no | Where daily rotating zip backups land (state JSONs + both SQLite DBs + the outbox file queue). Default `<TISA_DATA_DIR>/backups`. The directory is created `0700` and each zip is `0600` — these are the shop's data. |
+| `TISA_BACKUP_KEEP` | no | How many daily zips to keep before rotation (default `7`, clamped to `1..365`). |
+| `TISA_DAILY_REPORT_HOUR` | no | Server-local hour (0–23) at which a short ops report is sent to `LOG_CHAT_ID` (default `9`; `0` disables the report; backups still run at 04:00). Requires `LOG_CHAT_ID` to be set. |
 | `TISA_DRY_RUN` | no | `yes` = rehears every publish: the real payload is built and sent to a fake transport, so **nothing is written on the shop** (default `no`). See [dry-run](#-حالت-آزمایشی-انتشار-dry-run). |
 | `FLOW_TIMEOUT_SECONDS` | no | Idle time before a product flow is closed and its temp files deleted (default `900`). |
 | `TEMP_TTL_HOURS` | no | Age after which leftover `/tmp` workspaces are swept (default `12`). |
