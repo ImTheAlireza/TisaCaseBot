@@ -97,6 +97,7 @@ required to start.
 | `FLOW_TIMEOUT_SECONDS` | no | Idle time before a product flow is closed and its temp files deleted (default `900`). |
 | `TEMP_TTL_HOURS` | no | Age after which leftover `/tmp` workspaces are swept (default `12`). |
 | `MAX_FILE_MB` / `MAX_ROWS` / `PROCESS_TIMEOUT_SECONDS` | no | Limits for the tracking-file converter. |
+| `WORKER_MEMORY_MB` | no | Memory (MB) **one file** may spend in the converter's worker process, *on top of* what that process already holds (python + pandas + the host's own limit). Default `768`. Not a ceiling for the whole process — that is what made a 22 KB file fail with `MemoryError` on a host whose imports already filled the old absolute cap. Raise it if a file is refused with «حافظهٔ پردازش پر شد»; `logs/bot.log` prints baseline + budget + cap + headroom for every worker. |
 | `BARCODE_LENGTHS` | no | Accepted barcode digit counts, comma-separated (default `24`). |
 | `WOOCOMMERCE_URL` | no | Store URL used by the WooCommerce REST connection test. |
 | `WOOCOMMERCE_CONSUMER_KEY` / `WOOCOMMERCE_CONSUMER_SECRET` | no | WooCommerce REST API credentials used by the Ping diagnostic and the direct product writer. |
@@ -139,6 +140,7 @@ required to start.
 | PDF با حاشیه/چیدمانِ متفاوت (تنظیمِ چاپ عوض شده) | «ساختار PDF شناخته نشد» | بارکد از خودِ سند پیدا می‌شود (طولِ عدد، نه مختصاتِ ثابت) |
 | فایل خراب/نصفه‌دانلودشده یا xlsِ قدیمی | متنِ انگلیسیِ pandas | جملهٔ فارسی + راه‌حل: چه بفرست |
 | فایل `.xls` (اکسل ۹۷–۲۰۰۳) | «فقط xlsx / csv / pdf» و بدونِ راهِ حل | جملهٔ «Save As → xlsx» (فایل‌های `.xlsm` هم حالا پذیرفته می‌شوند) |
+| فایلِ **کوچک** روی هاستی که سقفِ حافظه‌اش پر است | «خطای فنی: MemoryError» (یا `MemoryError` خام) — در هر سه فرمت | «حافظهٔ پردازشِ ربات پر است…» + دو کارِ دقیق: `WORKER_MEMORY_MB` و سقفِ خودِ هاست؛ عددها در `logs/bot.log` |
 
 هر خطای این جریان با **راه‌حل** تمام می‌شود (ذخیرهٔ دوباره به xlsx، گرفتنِ خروجیِ CSV/PDF از
 سامانه، یا تقسیمِ فایل) — «❌ خطا در پردازش» تنها جواب نیست. اگر پردازش وسطِ کار بمیرد
@@ -159,6 +161,12 @@ required to start.
 **سقف‌ها:** `MAX_FILE_MB` (پیش‌فرض ۲۵) حجم فایل، `MAX_ROWS` (پیش‌فرض ۲۰۰٬۰۰۰) تعداد
 ردیف، و `PROCESS_TIMEOUT_SECONDS` (پیش‌فرض ۱۲۰) زمان پردازش. رد شدن یعنی **پیام با
 دلیل و راهِ حل**، نه فایل نصفه‌نیمه یا بی‌خبر رفتن.
+
+**حافظهٔ پردازش:** هر فایل در یک پردازهٔ جدای محدود پردازش می‌شود و سقفش
+«آن‌چه آن پردازه همین حالا دارد + `WORKER_MEMORY_MB`» است — یعنی بودجهٔ *فایل*، نه سقفِ کلِ
+پردازه. اگر سرور/سوپروایزر سقفِ خودش را داشته باشد (`ulimit -v`، systemd `LimitAS`) همان
+برنده است و پیامِ خطا همان را نام می‌برد. عددهای واقعی (پایه، بودجه، سقف، فضای آزاد) برای
+هر کارگر در `logs/bot.log` نوشته می‌شوند.
 
 **جریان کار:** دکمه «📦 تبدیل فایل کد رهگیری» → فایل را به‌صورت Document بفرست
 (`.xlsx` / `.xlsm` / `.csv` / `.pdf`) → خروجی‌ها را بگیر → فایل بعدی، یا «⬅️ بازگشت به منو» /

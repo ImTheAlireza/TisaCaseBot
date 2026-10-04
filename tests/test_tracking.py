@@ -927,13 +927,21 @@ class TestTrackingFlow(FileFixture):
         documents = dict(update.effective_message.documents())
         self.assertIn("123456," + GOOD, documents["tracking.csv"].decode("utf-8-sig"))
 
-    def test_the_instructions_carry_the_limits_the_code_enforces(self):
+    def test_the_limits_are_told_where_they_matter_not_in_the_intro(self):
         with h.patched_settings(h.settings_with(max_rows=1234, max_file_mb=7.5)):
             # از `TC.settings` خوانده می‌شود، نه `settings` تست: patched_settings همان
             # نامِ ماژول را عوض می‌کند، و ما می‌خواهیم ببینیم صفحه چه عددی نشان می‌دهد.
-            text = TC.INSTRUCTIONS + "\n" + f"سقف‌ها: {TC.settings.limits_line}"
-        self.assertIn("1,234", text)
-        self.assertIn("7.5 MB", text)
+            limits = TC._limits_line()
+            intro = TC.INSTRUCTIONS
+        # سقف‌ها کنارِ خودِ خطا («🚧 …») و در «📊 وضعیت» گفته می‌شوند…
+        self.assertIn("1,234", limits)
+        self.assertIn("7.5 MB", limits)
+        # …و پیامِ ورود فقط «چه بفرست» است: بدونِ گام‌ها، هشدارها و تکرارِ سقف‌ها.
+        for token in ("xlsx", "xlsm", "csv", "pdf"):
+            self.assertIn(token, intro)
+        self.assertNotIn("ربات این کارها را می‌کند", intro)
+        self.assertNotIn("1,234", intro)
+        self.assertNotIn("7.5 MB", intro)
 
     def test_leaving_the_flow_releases_the_download(self):
         import asyncio

@@ -96,21 +96,15 @@ def _limits_line() -> str:
     return f"سقف‌ها: {settings.limits_line}"
 
 
+#: پیامِ ورودِ جریان: فقط «چه بفرست». توضیحِ گام‌ها، هشدارها و خطِ سقف‌ها حذف شد
+#: (خواستهٔ صاحب ربات: «خیلی توضیح اضافه دارد»). همین سقف‌ها همان‌جایی گفته می‌شوند که
+#: به کار می‌آیند — «🚧 …» کنارِ خودِ خطا و «📊 وضعیت» — تا دو نسخهٔ مختلف از یک قول نداشته باشیم.
 INSTRUCTIONS = (
     "📦 <b>تبدیل فایل کد رهگیری</b>\n\n"
     "یک فایل با یکی از این فرمت‌ها بفرست (به‌صورت Document، نه عکس):\n"
     "📊 اکسل (<code>.xlsx</code> / <code>.xlsm</code>) — خروجی جدول سفارش‌ها\n"
     "📄 CSV (<code>.csv</code>)\n"
-    "📑 PDF (<code>.pdf</code>) — خروجی مستقیم سامانه تیساکیس / تیسا چاپ\n\n"
-    "ربات این کارها را می‌کند:\n"
-    "1️⃣ ستون «بارکد» و «کد سفارش» را پیدا می‌کند؛ اگر دو ستون محتمل باشد، <b>می‌پرسد</b>\n"
-    "2️⃣ مشکلات را گزارش می‌دهد (خالی، تکراری، فرمت اشتباه، بارکد خراب‌شده در اکسل)\n"
-    "3️⃣ فایل <code>tracking.csv</code> با ستون‌های <code>order_id,tracking_code</code> می‌سازد\n"
-    "4️⃣ سطرهایی که باید بررسی شوند در <code>needs-review.xlsx</code> می‌آیند — اصلاحش کن و "
-    "همان فایل را دوباره بفرست\n\n"
-    "⚠️ کد سفارش‌های خالی در CSV خالی می‌مانند تا خودت تکمیل کنی.\n"
-    "⚠️ بارکدی که اکسل عددش کرده و رقم‌هایش را خورده، هرگز در CSV نوشته نمی‌شود.\n\n"
-    f"🚧 {_limits_line()}"
+    "📑 PDF (<code>.pdf</code>) — خروجی مستقیم سامانه تیساکیس / تیسا چاپ"
 )
 
 NEXT_FILE_TEXT = "📤 فایل بعدی را بفرست، یا برگرد به منو."
@@ -269,6 +263,17 @@ async def _run(path: Path, fname: str, layout: processor.Layout | None = None):
         )
     except processor.RowLimitError as exc:
         return f"🚧 {exc}\n\nسقف‌ها در .env قابل تغییرند (MAX_ROWS / MAX_FILE_MB)."
+    except (worker.WorkerNoMemory, MemoryError) as exc:
+        # خودِ ربات جا ندارد، نه فایل: تا امروز این حالت یک «❌ خطا در پردازش: MemoryError»
+        # بی‌توضیح بود (فایل ۲۲KB هم همین را می‌گرفت). حالا جمله می‌گوید چه چیزی را بالا ببرد.
+        logger.error("tracking worker is out of memory: %s", exc)
+        return (
+            "🚧 حافظهٔ پردازشِ ربات پر است و این فایل — هرچقدر هم کوچک — جا نشد.\n"
+            "دو کار: ۱) WORKER_MEMORY_MB را در .env بالا ببر (و ربات را ری‌استارت کن)؛ "
+            "۲) اگر سرور/سوپروایزر خودش سقف دارد (`ulimit -v`، systemd `LimitAS`)، همان را "
+            "بالا ببر.\n"
+            "اعدادِ دقیق — پایه، سقف و فضای آزادِ کارگر — در logs/bot.log نوشته شده‌اند."
+        )
     except worker.WorkerCrash:
         # The child died (memory/CPU cap) or the bot was restarted mid-file. There is no
         # sentence to translate, only something to do: split the file.

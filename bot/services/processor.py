@@ -136,6 +136,17 @@ class RowLimitError(ValueError):
     """More rows than ``MAX_ROWS`` — refuse instead of grinding the bot to dust."""
 
 
+class MemoryLimitError(RowLimitError):
+    """The file could not be read because the worker ran out of memory.
+
+    A ``RowLimitError`` on purpose: the flow already answers that family with «🚧 …» and
+    something to *do*, which is exactly the right channel. The sentence itself names both
+    causes — a file that is genuinely too big, and a host whose memory ceiling is too low
+    for even a small file — because from inside the parser the two look identical, and only
+    the shop can tell which one it is (the worker log prints the numbers).
+    """
+
+
 # ---------------------------------------------------------------------------
 # What the file looks like (schema detection)
 # ---------------------------------------------------------------------------
@@ -459,6 +470,22 @@ def _unreadable(what: str, exc: Exception) -> UnreadableFileError:
     return UnreadableFileError(f"{what} (خطای فنی: {type(exc).__name__}).")
 
 
+def _memory_error(exc: BaseException) -> MemoryLimitError:
+    """«MemoryError» خام → جملهٔ صریح با هر دو علتِ ممکن.
+
+    از داخلِ پارسر، «فایل واقعاً بزرگ است» و «سقفِ حافظهٔ کارگر برای همین هاست کم است»
+    یک‌شکل دیده می‌شوند؛ پس هر دو گفته می‌شوند و عددها در ``logs/bot.log`` می‌مانند.
+    کاربری که فایلِ ۲۲KB فرستاده بود، این‌جا دیگر «خطای فنی: MemoryError» نمی‌بیند.
+    """
+    return MemoryLimitError(
+        "حافظهٔ پردازشِ ربات برای خواندن این فایل پر شد. "
+        f"(خطای فنی: {type(exc).__name__})\n"
+        "• اگر فایل بزرگ است: به دو یا چند بخش تقسیمش کن، یا همان گزارش را CSV/PDF بگیر.\n"
+        "• اگر فایل کوچک است: سقفِ حافظهٔ کارگر کم است — WORKER_MEMORY_MB را در .env "
+        "بالا ببر (یا حافظهٔ سرور را). اعدادِ دقیق در logs/bot.log نوشته شده‌اند."
+    )
+
+
 def _pick_sheet(book: pd.ExcelFile, names: list[str]) -> tuple[str, tuple[str, ...]]:
     """برگه‌ای که جدول سفارش‌ها در آن است — نه همیشه برگهٔ اول.
 
@@ -498,11 +525,14 @@ def _read_not_really_xlsx(path, exc: Exception) -> tuple[pd.DataFrame, str, tupl
     Before this, every one of those reached the warehouse as «File is not a zip file» —
     a sentence that tells nobody what to send instead.
     """
-    raw = Path(path).read_bytes()
-    text = _decode_bytes(raw)
-    rows = _spreadsheetml_rows(text) if "spreadsheet" in text[:3000].lower() else None
-    if rows is None:
-        rows = _html_rows(text)
+    try:
+        raw = Path(path).read_bytes()
+        text = _decode_bytes(raw)
+        rows = _spreadsheetml_rows(text) if "spreadsheet" in text[:3000].lower() else None
+        if rows is None:
+            rows = _html_rows(text)
+    except MemoryError as oom:  # a web panel's HTML export can be absurdly large
+        raise _memory_error(oom) from oom
     if rows is not None:
         logger.info("xlsx is really an HTML/XML table; read as a table: %s", path)
         return (
@@ -526,8 +556,12 @@ def _read_excel(path) -> tuple[pd.DataFrame, str, tuple[str, ...]]:
                 raise RowLimitError("حجم بازشده/تعداد فایل‌های XLSX از سقف ایمن بیشتر است")
     except zipfile.BadZipFile as exc:
         return _read_not_really_xlsx(path, exc)
+    except MemoryError as exc:
+        raise _memory_error(exc) from exc
     try:
         book = pd.ExcelFile(path, engine="openpyxl")
+    except MemoryError as exc:
+        raise _memory_error(exc) from exc
     except Exception as exc:
         logger.warning("xlsx could not be opened: %s", path, exc_info=True)
         raise _unreadable("این فایل به‌عنوان اکسل باز نشد", exc) from exc
@@ -540,6 +574,8 @@ def _read_excel(path) -> tuple[pd.DataFrame, str, tuple[str, ...]]:
             frame = pd.read_excel(
                 book, sheet_name=chosen, header=None, dtype=object, nrows=settings.max_rows + 1
             )
+        except MemoryError as exc:
+            raise _memory_error(exc) from exc
         except Exception as exc:  # pragma: no cover — a broken sheet in a readable book
             logger.warning("sheet %r could not be read: %s", chosen, path, exc_info=True)
             raise _unreadable(f"خواندن برگهٔ «{chosen}» ممکن نشد", exc) from exc
@@ -561,7 +597,10 @@ def _csv_width(text: str, delimiter: str, lines: int = 200) -> int:
 
 def _read_text_table(path) -> tuple[pd.DataFrame, str, tuple[str, ...]]:
     """CSV با هر کدگذاری/جداکننده‌ای که خروجی‌های فارسی دارند."""
-    text = _decode_bytes(Path(path).read_bytes())
+    try:
+        text = _decode_bytes(Path(path).read_bytes())
+    except MemoryError as exc:
+        raise _memory_error(exc) from exc
     delimiter = _sniff_delimiter(text)
     names = list(range(_csv_width(text, delimiter)))
     notes: list[str] = []
@@ -571,12 +610,16 @@ def _read_text_table(path) -> tuple[pd.DataFrame, str, tuple[str, ...]]:
     }
     try:
         frame = pd.read_csv(io.StringIO(text), **kwargs)
+    except MemoryError as exc:
+        raise _memory_error(exc) from exc
     except pd.errors.ParserError:
         # A ragged export is common (a note row with two fields). Long lines are the one
         # thing this cannot repair, so they are skipped — and the report says so.
         logger.warning("csv has broken lines, skipping them: %s", path, exc_info=True)
         try:
             frame = pd.read_csv(io.StringIO(text), engine="python", on_bad_lines="skip", **kwargs)
+        except MemoryError as inner:
+            raise _memory_error(inner) from inner
         except Exception as inner:
             raise _unreadable("فایل CSV خوانده نشد", inner) from inner
         notes.append("چند خط شکستهٔ فایل CSV خوانده نشد؛ بهتر است خروجی را دوباره از سامانه بگیری.")
@@ -867,6 +910,8 @@ def _read_pdf(path) -> list[dict[str, Any]]:
 
     try:
         doc = pymupdf.open(path)
+    except MemoryError as exc:
+        raise _memory_error(exc) from exc
     except Exception as exc:
         logger.warning("pdf could not be opened: %s", path, exc_info=True)
         raise _unreadable("این فایل PDF سالم نیست — خراب یا نصفه دانلود شده", exc) from exc
@@ -881,6 +926,10 @@ def _read_pdf(path) -> list[dict[str, Any]]:
                     continue
                 _guard_rows(len(rows))
                 rows.append(_pdf_row(line, index, page_number + 1, len(rows)))
+    except MemoryError as exc:
+        # «rawdict» یک صفحهٔ پرمتن می‌تواند صدها مگابایت شیء پایتون بسازد؛ پیش‌تر این
+        # خطا بدون هیچ ترجمه‌ای به کاربر می‌رسید: «❌ خطا در پردازش: MemoryError».
+        raise _memory_error(exc) from exc
     finally:
         doc.close()
     if not rows:
@@ -1406,6 +1455,7 @@ __all__ = [
     "FIELD_CODE",
     "Column",
     "Layout",
+    "MemoryLimitError",
     "Question",
     "Report",
     "RowLimitError",

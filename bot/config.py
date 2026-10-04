@@ -174,6 +174,11 @@ class Settings:
     max_file_mb: float = 25.0
     max_rows: int = 200_000
     process_timeout_seconds: float = 120.0
+    #: حافظه‌ای که کارگرِ فایل می‌تواند *روی پایهٔ خودش* خرج کند (MB). سقفِ کلِ
+    #: پردازه نیست: ایمپورت‌های خودِ کارگر (pandas و…) روی همین عدد سوار می‌شوند.
+    #: روی هاستِ کوچک، کمکردنش فایل‌ها را زودتر و صادقانه رد می‌کند؛ بالا بردنش
+    #: اجازه می‌دهد فایل‌های بزرگ‌تر خوانده شوند. جزئیات در bot/services/worker.py.
+    worker_memory_mb: float = 768.0
     #: VERBOSE_LOG=1 → besides the one product card, the full line-by-line trace of
     #: that product is sent to the log chat too (and written to the log file). Off by
     #: default on purpose: the card is what you read on a normal day.
@@ -271,6 +276,11 @@ class Settings:
             note("MAX_ROWS باید مثبت باشد؛ پیش‌فرض ۲۰۰٬۰۰۰ استفاده شد.")
         process_timeout, problem = _as_float("PROCESS_TIMEOUT_SECONDS", 120.0)
         note(problem)
+        worker_memory, problem = _as_float("WORKER_MEMORY_MB", 768.0)
+        note(problem)
+        if not (worker_memory >= 64):
+            worker_memory = 768.0
+            note("WORKER_MEMORY_MB باید حداقل ۶۴ باشد؛ پیش‌فرض ۷۶۸ استفاده شد.")
 
         log_level = _raw("LOG_LEVEL", "INFO").upper()
         if log_level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
@@ -312,6 +322,7 @@ class Settings:
             max_file_mb=max_file_mb,
             max_rows=max_rows,
             process_timeout_seconds=max(5.0, process_timeout),
+            worker_memory_mb=worker_memory,
             problems=tuple(problems),
         )
         for problem in problems:
