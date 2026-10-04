@@ -61,6 +61,15 @@ def callbacks(markup: object) -> list[str]:
             for button in row]
 
 
+def actions(markup: object) -> list[str]:
+    """کنشِ هر دکمه، بدونِ امضای نشست (``action|nonce.revision``).
+
+    هر دکمهٔ جریان با nonce و revision همان نشست امضا می‌شود تا یک کیبوردِ قدیمی
+    دوباره کار نکند؛ تست به *کنش* کار دارد، نه به مقدارِ تصادفیِ امضا.
+    """
+    return [code.split("|", 1)[0] for code in callbacks(markup)]
+
+
 class Bot:
     """A recording Telegram bot: every send, edit, delete, reaction and chat action, in order."""
 
@@ -240,13 +249,13 @@ class FindingTheProduct(UpdateFlowCase):
         self.assertEqual(len(texts), 1, "فقط جوابِ جست‌وجو؛ «دنبال می‌گردم…» پیامِ جدا نیست")
         self.assertNotIn("دنبال می‌گردم", texts[0])
         self.assertIn("قاب سیلیکونی آیفون", texts[0])
-        buttons = callbacks(seen[-1][2]["reply_markup"])
+        buttons = actions(seen[-1][2]["reply_markup"])
         self.assertIn(f"{CB.RESTOCK_PICK}:1201", buttons)
 
     def test_a_title_fragment_finds_it_too(self) -> None:
         self.start()
         _result, seen = self.say("سیلیکونی", handler=RF.handle_search)
-        self.assertIn(f"{CB.RESTOCK_PICK}:1201", callbacks(seen[-1][2]["reply_markup"]))
+        self.assertIn(f"{CB.RESTOCK_PICK}:1201", actions(seen[-1][2]["reply_markup"]))
 
     def test_a_search_with_no_hit_says_so_in_the_chat(self) -> None:
         self.start()
@@ -280,7 +289,7 @@ class FindingTheProduct(UpdateFlowCase):
         products_ledger.record(user_id=USER, status="failed", product_id=1400, title="خراب")
         products_ledger.record(user_id=99, status="created", product_id=1500, title="مال دیگری")
         _result, seen = self.start()
-        buttons = callbacks(seen[-1][2]["reply_markup"])
+        buttons = actions(seen[-1][2]["reply_markup"])
         self.assertIn(f"{CB.RESTOCK_PICK}:1201", buttons)
         self.assertIn(f"{CB.RESTOCK_PICK}:1300", buttons, "محصولِ اپدیت‌شده هم دوباره قابل انتخاب است")
         self.assertNotIn(f"{CB.RESTOCK_PICK}:1400", buttons)
@@ -311,7 +320,7 @@ class PickingTheProduct(UpdateFlowCase):
         self.assertIn("3 واریژن", text)
         self.assertIn("iPhone 13 Pro Max", text)
         self.assertIn("هرچه نفرستی دست‌نخورده می‌ماند", text)
-        self.assertEqual(callbacks(guide[2]["reply_markup"]), ["product:cancel"],
+        self.assertEqual(actions(guide[2]["reply_markup"]), ["product:cancel"],
                          "راهنما فقط دکمهٔ لغو دارد")
         self.assertEqual(self.session.mode, "update")
         self.assertEqual(self.session.target.product_id, 1201)

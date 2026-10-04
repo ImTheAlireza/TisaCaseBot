@@ -29,7 +29,7 @@ os.environ.setdefault("BOT_TOKEN", "123456:TEST")
 os.environ.setdefault("SUDO_IDS", "1234567")
 
 REPO = Path(__file__).resolve().parents[1]
-PLAN = REPO / "docs" / "CODE-REVIEW-AND-UPGRADE-PLAN.md"
+PLAN = REPO / "docs" / "archive" / "CODE-REVIEW-AND-UPGRADE-PLAN.md"
 CHANGELOG = REPO / "CHANGELOG.md"
 README = REPO / "README.md"
 ENV_EXAMPLE = REPO / ".env.example"
@@ -75,6 +75,13 @@ class TestVersionIsStatedOnce(unittest.TestCase):
             env={**os.environ, "PYTHONPATH": str(REPO)},
         ).stdout.strip()
         self.assertEqual(bot.__version__, out, "main.py --version منبعِ دیگری برای نسخه است")
+
+    def test_pyproject_reads_the_version_from_the_code(self) -> None:
+        """نسخه فقط در ``bot/__init__.py`` نوشته می‌شود؛ pyproject باید همان را بخواند."""
+        text = read(REPO / "pyproject.toml")
+        self.assertIn('dynamic = ["version"]', text)
+        self.assertIn('version = {attr = "bot.__version__"}', text)
+        self.assertNotRegex(text, r'(?m)^version = "', "نسخه دوباره در pyproject دستی نوشته شده")
 
     def test_the_release_section_names_the_phase_it_closes(self) -> None:
         """بندِ بالای CHANGELOG باید بگوید کدام فاز برنامه بسته شده — برای کسی که
@@ -325,6 +332,26 @@ class TestRequirementsSplit(unittest.TestCase):
 
 
 @unittest.skipUnless(README.exists(), "README نیست")
+class TestWorkDirectoriesAreConfigured(unittest.TestCase):
+    """ریشهٔ کارِ هر جریان باید از ``settings.temp_dir`` بیاید، نه یک مسیرِ /tmp ثابت."""
+
+    def test_every_flow_work_root_lives_under_the_configured_temp_dir(self) -> None:
+        from bot.config import settings
+        from bot.modules import image_compress, product_flow, tracking_converter
+
+        for module in (image_compress, product_flow, tracking_converter):
+            self.assertEqual(
+                settings.temp_dir,
+                Path(module.TEMP_DIR).parent,
+                f"{module.__name__} مسیرِ /tmp ثابت دارد",
+            )
+
+    def test_the_setting_is_documented_and_configurable(self) -> None:
+        text = read(REPO / "bot" / "config.py")
+        self.assertIn('"TISA_TEMP_DIR"', text, "کلید خوانده نمی‌شود")
+        self.assertIn("TISA_TEMP_DIR=", read(ENV_EXAMPLE))
+
+
 class TestDocsMatchTheTools(unittest.TestCase):
     """README قول نمی‌دهد جز آنچه هست — و برعکس."""
 
@@ -346,7 +373,8 @@ class TestDocsMatchTheTools(unittest.TestCase):
     def test_env_example_and_readme_agree_on_the_documented_keys(self) -> None:
         keys = set(re.findall(r"^([A-Z][A-Z0-9_]{2,})=", read(ENV_EXAMPLE), re.M))
         text = read(README)
-        for key in ("PRICE_MIN", "PRICE_MAX", "MAX_ROWS", "MAX_FILE_MB", "VERBOSE_LOG", "TISA_DATA_DIR", "TISA_DRY_RUN"):
+        for key in ("PRICE_MIN", "PRICE_MAX", "MAX_ROWS", "MAX_FILE_MB", "VERBOSE_LOG", "TISA_DATA_DIR",
+                 "TISA_TEMP_DIR", "TISA_DRY_RUN"):
             self.assertTrue(key in keys, f"{key} در .env.example نیست")
             self.assertTrue(f"`{key}`" in text, f"{key} در README توضیح ندارد")
 

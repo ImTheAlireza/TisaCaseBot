@@ -50,7 +50,11 @@ def _make_workspace(root: Path) -> tuple[Path, Path]:
 class TestWorkspaceCleanup(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(self.enterContext(__import__("tempfile").TemporaryDirectory()))
+        # Restore it: a leaked module global used to be harmless, but it is still a leak
+        # (and now that TEMP_DIR comes from settings, other tests can see it).
+        self._temp_dir = PF.TEMP_DIR
         PF.TEMP_DIR = self.tmp
+        self.addCleanup(setattr, PF, "TEMP_DIR", self._temp_dir)
         PF.sessions.clear()
         PF.album_buffers.clear()
         PF.album_tasks.clear()
@@ -117,25 +121,17 @@ class TestPublishingIsSingleShot(unittest.IsolatedAsyncioTestCase):
         import tempfile
         from bot.services.product_extractor import ProductData
 
+        from _flow_harness import temp_ledger
+
         self.tmp = Path(tempfile.mkdtemp())
         self.addCleanup(__import__("shutil").rmtree, self.tmp, True)
-        # ♻️ The publish gate reads the ledger, so this test needs an EMPTY one — and the
-        # repo's real history must never be the thing that decides whether a product
-        # gets published (until this line, running the suite wrote fake cards into it).
-        from bot.services import jsonstore, products_ledger
-
-        self._ledger_file = products_ledger.FILE
-        products_ledger.FILE = self.tmp / "recent_products.json"
-        jsonstore.invalidate()
-
-        def _restore_ledger() -> None:
-            products_ledger.FILE = self._ledger_file
-            jsonstore.invalidate()
-
-        self.addCleanup(_restore_ledger)
+        # ♻️ Two things must be the *test's* state, never the repo's: the publish gate reads
+        # the ledger, and the button gate reads roles.json. temp_ledger() gives an empty
+        # history plus an admin (user 7) in a throwaway roles file, so the flow really runs.
+        self.enterContext(temp_ledger())
+        self.user_id = 7
         image = self.tmp / "01_one.jpg"
         image.write_bytes(b"z" * 64)
-        self.user_id = 99
         session = PF.ProductSession(
             mode="new",
             workspace=self.tmp,
@@ -200,7 +196,8 @@ class TestPublishingIsSingleShot(unittest.IsolatedAsyncioTestCase):
         await first
         self.assertEqual(len(self.calls), 1, "the product was published twice")
         self.assertIs(False, self.calls[0]["dry_run"], "بدون TISA_DRY_RUN باید انتشار واقعی بماند")
-        self.assertEqual(12, len(self.calls[0]["batch_id"]), "جریان باید شناسهٔ تلاش را به سرویس بدهد")
+        self.assertRegex(self.calls[0]["batch_id"], r"^[0-9a-f]{24}$",
+                         "جریان باید شناسهٔ تلاش (۲۴ رقم هگز) را به سرویس بدهد")
         self.assertEqual("tisa_batch_id", self.calls[0]["meta"][0]["key"],
                          "محصول روی سایت باید برچسب تلاش را داشته باشد تا جستجو شدنی باشد")
         self.assertTrue(any("در جریان است" in (text or "") for text in answered))
@@ -222,10 +219,10 @@ class TestConfirmGate(unittest.IsolatedAsyncioTestCase):
         image.write_bytes(b"image")
         data = ProductData(title="قاب ساده", price=698_000, sku_prefix="BO", models=[], attributes={})
         session = PF.ProductSession(
-            mode="new", files=[image], data=data, workspace=workspace, chat_id=101
+            mode="new", files=[image], data=data, workspace=workspace, chat_id=7
         )
-        PF.sessions[101] = session
-        self.addCleanup(PF.sessions.pop, 101, None)
+        PF.sessions[7] = session
+        self.addCleanup(PF.sessions.pop, 7, None)
 
         answered: list[str | None] = []
         sent: list[dict] = []
@@ -249,7 +246,7 @@ class TestConfirmGate(unittest.IsolatedAsyncioTestCase):
                 data="product:confirm", answer=answer, edit_message_text=edit_message_text,
                 message=SimpleNamespace(chat_id=101),
             ),
-            effective_user=SimpleNamespace(id=101, username="t", first_name="t"),
+            effective_user=SimpleNamespace(id=7, username="t", first_name="t"),
             effective_message=None,
         )
         calls: list[dict] = []

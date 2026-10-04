@@ -107,7 +107,7 @@ REVIEW = 2
 #: the collecting state, named the way the older handlers speak it
 WAITING = COLLECT
 
-TEMP_DIR = Path("/tmp/tisaposttowp-products")
+TEMP_DIR = settings.temp_dir / "products"
 
 #: How many steps back the card can go. Each snapshot is one draft plus two
 #: short texts — small enough that a handful never matters, deep enough that a
@@ -254,6 +254,11 @@ def _owned_callback(callback):
                 message_id = getattr(query.message, "message_id", None)
                 valid = getattr(session, "status_message_id", None) is None or message_id == session.status_message_id
             if not valid:
+                if session is None and action == "product:force":
+                    # There is no card to go back to (the flow is gone), so the handler's
+                    # own «این جریان بسته شده است» is the honest answer; blaming an «old
+                    # preview» would point the seller at a card that does not exist.
+                    return await callback(update, context)
                 await query.answer("این دکمه متعلق به پیش‌نمایش قبلی است؛ از کارت تازه استفاده کن.", show_alert=True)
                 return None
         if isinstance(session, ProductSession) and user and _pending_media(user.id, session):
@@ -554,6 +559,7 @@ async def _flush_journal(
     )
 
 
+# Test-only: the flow tests render the chat audit with this exact function.
 def _audit_for_chat(lines: list[str]) -> str:
     """Condense the WooCommerce audit into a short diagnostic for operator text.
 
@@ -623,6 +629,7 @@ def _audit_for_chat(lines: list[str]) -> str:
     return "\n".join(parts)
 
 
+# Test-only: the dry-run card builder; the tests check the real renderer, not a copy.
 def _dry_run_report(lines: Sequence[str], budget: int = 3600) -> str:
     """Compatibility wrapper for the dry-run trace format (sent to the log group)."""
     return product_journal.publish_trace_report(lines, dry_run=True, budget=budget)
@@ -800,6 +807,8 @@ async def show_preview(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     return REVIEW
 
 
+# The plugin's contract, not a leftover: `docs/IMPORTER-CONTRACT.md` tells the site
+# to read this manifest out of the uploaded zip.
 def _zip_manifest(
     data: ProductData, *, usable_attributes: dict[str, list[str]], image_mode: str, batch: str,
     mode: str = "new",
@@ -1434,8 +1443,9 @@ def _canonical_category_paths(categories: Sequence[str]) -> list[str]:
 
 def _extract_fingerprint(session: ProductSession) -> str:
     """Stable cache key for parser inputs and learned rules."""
-    return hashlib.sha1(
-        f"{session.model_text}|{session.info_text}|{learning.revision()}".encode()
+    return hashlib.blake2b(
+        f"{session.model_text}|{session.info_text}|{learning.revision()}".encode(),
+        digest_size=20,
     ).hexdigest()
 
 

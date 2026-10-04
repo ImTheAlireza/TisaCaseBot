@@ -152,7 +152,9 @@ class TestSkuResolution(unittest.IsolatedAsyncioTestCase):
 
         script = TransportScript(
             respond(400, {"message": "Invalid or duplicated SKU."}),
-            respond(201, {"id": 77, "sku": "BO12"}),
+            # A real WooCommerce POST echoes the fields the writer sent (its absence makes
+            # the writer re-read the row to check the write — which is its own GET).
+            respond(201, {"id": 77, "name": "قاب", "sku": "BO12"}),
         )
         audit = Audit()
         with patched_settings(settings_with(**NO_PLUGIN)):

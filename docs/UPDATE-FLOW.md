@@ -142,7 +142,7 @@
 ## آزمایشش
 
 ```bash
-.venv/bin/python scripts/simulate_update_flow.py            # پنج صحنهٔ کامل، هندلرهای واقعی، فروشگاه حافظه‌دار
+.venv/bin/python tools/simulate_update_flow.py            # پنج صحنهٔ کامل، هندلرهای واقعی، فروشگاه حافظه‌دار
 .venv/bin/python -m unittest tests.test_update_plan tests.test_update_apply tests.test_update_flow tests.test_product_match
 ```
 

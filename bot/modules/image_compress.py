@@ -46,7 +46,7 @@ from bot.utils.ui import answer_and_edit
 logger = logging.getLogger(__name__)
 
 WAITING = 0
-TEMP_DIR = Path("/tmp/tisaposttowp-compress")
+TEMP_DIR = settings.temp_dir / "compress"
 
 
 def close_for(user_id: int) -> bool:

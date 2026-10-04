@@ -165,7 +165,8 @@ class WhatTheShopHoldsAfterwards(ShopTestCase):
         body = self.shop.body("POST", "/variations/batch")
         self.assertEqual(set(body), {"update"})
         for row in body["update"]:
-            self.assertEqual(set(row), {"id", "regular_price"})
+            self.assertEqual(set(row), {"id", "regular_price", "tisa_fence"},
+                             "امضای قفلِ امنیتی (tisa_fence) همراه هر ردیف می‌رود")
 
     def test_a_title_alone_is_one_product_write_and_no_variation_request(self) -> None:
         plan, result = self.update({"title": "قاب مگنتی"})
@@ -428,10 +429,17 @@ class WhenTheNetworkOrTheHostMisbehaves(ShopTestCase):
         self.assertEqual(result.unconfirmed, [9001], "اعتماد به حدس نه؛ تأییدنشده می‌ماند")
 
     def test_a_response_that_is_not_json_is_not_confirmation(self) -> None:
-        # A maintenance page answers 200 to everything and carries no JSON.
-        script = h.TransportScript(default=(200, None))
+        # A maintenance page answers 200 to everything and carries no JSON. The fence preflight
+        # is the one request that has to be answered properly before anything is written at all.
+        shop = UpdateShop()
+
+        def handle(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/tisa-health"):
+                return shop.handle(request)
+            return httpx.Response(200)
+
         plan = self.plan({"price": 720_000})
-        result = self.apply(plan, script.transport())
+        result = self.apply(plan, httpx.MockTransport(handle))
         self.assertFalse(result.ok)
         self.assertEqual(result.updated, [], "صفحهٔ تعمیرات «موفق» نیست")
         self.assertEqual(sorted(result.unconfirmed), [9001, 9002, 9003])

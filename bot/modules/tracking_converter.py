@@ -71,7 +71,7 @@ _UNSUPPORTED_HINTS = {
     ".numbers": "این فایل Numbers است؛ از آن «Export → Excel» بگیر.",
 }
 #: Where a download waits between messages (swept, like the product flow's workspace).
-TEMP_DIR = Path("/tmp/tisaposttowp-tracking")
+TEMP_DIR = settings.temp_dir / "tracking"
 PENDING_KEY = "tisa_tracking_pending"
 _active_contexts: dict[int, ContextTypes.DEFAULT_TYPE] = {}
 
@@ -312,10 +312,16 @@ def _record(context: ContextTypes.DEFAULT_TYPE, report: processor.Report) -> Non
 
 
 async def _drop_status(status) -> None:
+    """Remove the «⏳ پردازش…» bubble — cosmetic, so a refusal is not an error.
+
+    It is still *counted*: a steady stream of failures means something is wrong with the
+    chat (a deleted message, no permission), and that used to be completely invisible.
+    """
     try:
         await status.delete()
     except Exception:  # pragma: no cover — best effort
-        pass
+        metrics.incr("status_delete_failed")
+        logger.debug("could not remove the progress message", exc_info=True)
 
 
 async def _send_report(msg, status, report: processor.Report) -> None:

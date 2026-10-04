@@ -140,6 +140,22 @@ class TestRbacInvites(_TempState):
         self.assertIn("4242", self.rbac.admins())
         self.assertEqual(self.rbac.admins()["4242"]["name"], "پایدار")
 
+    def test_the_admin_list_is_not_rebuilt_when_roles_json_did_not_change(self):
+        """کش فقط با تغییرِ *واقعیِ* فایل باطل می‌شود — با همان قاعدهٔ jsonstore (امضا)."""
+        from unittest import mock
+
+        self.rbac.add_admin(4242, name="کشِ نقش")
+        self.assertTrue(self.rbac.is_admin(4242))  # کش را گرم کن
+        with mock.patch.object(self.rbac, "_load", wraps=self.rbac._load) as loader:
+            self.assertTrue(self.rbac.is_admin(4242))
+            self.assertIn("4242", self.rbac.admins())
+            self.assertTrue(self.rbac.is_admin(4242))
+            self.assertEqual(0, loader.call_count, "بدون تغییرِ فایل، دوباره خوانده نمی‌شود")
+            # ...و برعکس: سلبِ نقش باید فوراً دیده شود، نه بعد از ری‌استارت.
+            self.rbac.remove_admin(4242)
+            self.assertFalse(self.rbac.is_admin(4242))
+            self.assertGreater(loader.call_count, 0, "تغییرِ نقش باید کش را باطل کند")
+
 
 @needs_config
 class TestPreferences(_TempState):

@@ -273,7 +273,10 @@ class VariationBuildingTest(unittest.TestCase):
 
     def test_no_restrictions_keeps_the_full_cartesian_product(self):
         combos = build_combinations([("مدل", self.models), ("رنگ", self.colors)])
-        self.assertEqual(combos, [])
+        self.assertEqual(len(combos), len(self.models) * len(self.colors),
+                         "بدون محدودیت، شبکهٔ کامل مدل×رنگ ساخته می‌شود")
+        restricted = build_combinations([("مدل", self.models), ("رنگ", self.colors)], self.restrictions)
+        self.assertLess(len(restricted), len(combos), "محدودیت‌ها همین شبکه را کوچک می‌کنند")
 
     def test_a_spelling_mismatch_never_deletes_variations(self):
         # The AI wrote a color the caption never used: that model must stay

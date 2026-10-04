@@ -470,11 +470,6 @@ def succeed(batch_id: str, *, now: float | None = None, expected_updated_at: flo
     _forget_paths(paths)
 
 
-def forget_files(batch_id: str) -> None:
-    """Explicit maintenance helper; normal acknowledgements clean their own generation."""
-    shutil.rmtree(_batch_dir(batch_id), ignore_errors=True)
-
-
 def prune(*, now: float | None = None, retention_days: int = 7) -> int:
     """Bound terminal history and orphan generations without touching pending bytes."""
     moment = time.time() if now is None else now
@@ -553,6 +548,7 @@ def probe() -> str:
     return ""
 
 
+# Test-only: lets a test point the queue at a throwaway database without leftovers.
 def clear_for_tests() -> None:
     """Empty the queue and its files. Only for the suite."""
     try:

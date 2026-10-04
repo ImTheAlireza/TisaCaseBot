@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -210,3 +211,31 @@ class TestTheFlowSaysWhatToRaise(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+@needs_processor
+class TestTheLimitMessagesSayWhatToDo(unittest.TestCase):
+    """سقف‌ها باید به فارسی بگویند «چه کار کنم» — نه یک کلمهٔ ناتمامِ انگلیسی."""
+
+    def setUp(self) -> None:
+        self.dir = Path(tempfile.mkdtemp(prefix="tisa-limits-"))
+        self.addCleanup(shutil.rmtree, self.dir, True)
+
+    def test_an_xlsx_with_too_many_inner_files_is_refused_in_persian(self):
+        import zipfile
+
+        path = self.dir / "orders.xlsx"
+        with zipfile.ZipFile(path, "w") as archive:
+            for index in range(2001):
+                archive.writestr(f"part{index}.xml", "x")
+        with self.assertRaises(processor.RowLimitError) as caught:
+            processor.process_file(path, "orders.xlsx")
+        message = str(caught.exception)
+        self.assertIn("۲۰۰۰", message, "عددِ واقعیِ سقف باید در پیام باشد")
+        self.assertTrue("CSV" in message or "بخش" in message, "پیام باید راهِ حل بدهد")
+
+    def test_the_row_limit_message_has_no_english_filler(self):
+        with self.assertRaises(processor.RowLimitError) as caught:
+            processor._guard_rows(int(processor.settings.max_rows) + 1)
+        message = str(caught.exception)
+        self.assertIn(f"{int(processor.settings.max_rows):,}", message)
+        self.assertNotIn("slow", message, "«slow» یک کلمهٔ انگلیسیِ جاافتاده در جملهٔ فارسی بود")

@@ -283,6 +283,8 @@ class TestProductTools(LedgerTestCase):
 
         update = SimpleNamespace(
             effective_message=SimpleNamespace(text="قیمت 698000", reply_text=reply_text),
+            # هر آپدیت واقعیِ تلگرام کاربر دارد؛ دروازهٔ دسترسی روی همان حساب (ادمین ۷) اجرا می‌شود.
+            effective_user=SimpleNamespace(id=7, username="t", first_name="t"),
         )
         context = SimpleNamespace(user_data={PT._PENDING_KEY: time.time() + 30})
         asyncio.run(PT.on_parser_text(update, context))
@@ -302,7 +304,8 @@ class TestProductTools(LedgerTestCase):
         PF.analyze = fake_analyze
         self.addCleanup(setattr, PF, "analyze", original)
 
-        update = SimpleNamespace(effective_message=SimpleNamespace(text="قیمت 698000"))
+        update = SimpleNamespace(effective_message=SimpleNamespace(text="قیمت 698000"),
+                                 effective_user=SimpleNamespace(id=7, username="t", first_name="t"))
         context = SimpleNamespace(user_data={PT._PENDING_KEY: time.time() - 1})
         asyncio.run(PT.on_parser_text(update, context))
         self.assertEqual(called, [])

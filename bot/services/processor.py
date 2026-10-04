@@ -22,6 +22,7 @@ processor.py — هسته‌ی پردازش فایل سفارش برای ربا�
 from __future__ import annotations
 
 import codecs
+import csv
 import io
 import logging
 import os
@@ -132,8 +133,27 @@ _RE_CODE_IN_TEXT = re.compile(r"(?<![0-9])([0-9]{5,6})(?![0-9])")
 MAX_OPTIONS = 8
 
 
+#: How many columns a CSV may have before the reader says so out loud. A frame is
+#: rows×columns cells in memory, and 4096-wide is already a system dump, not an order
+#: export — but the point is that a file past the cap gets a *sentence*, never a
+#: silently narrower table.
+MAX_CSV_COLUMNS = 4096
+
+
 class RowLimitError(ValueError):
     """More rows than ``MAX_ROWS`` — refuse instead of grinding the bot to dust."""
+
+
+class ColumnLimitError(RowLimitError):
+    """A CSV wider than :data:`MAX_CSV_COLUMNS` — refuse, and name the real number.
+
+    The reader used to cap the column count at 512 *silently*: pandas keeps the first
+    N fields of every line and drops the rest without a word, so a 600-column export
+    whose «بارکد» column sat at index 590 came back as a 512-column table and the bot
+    asked about the wrong columns. A refusal the seller can act on beats a wrong answer.
+
+    A ``RowLimitError`` on purpose: the flow already answers that family with «🚧 …».
+    """
 
 
 class MemoryLimitError(RowLimitError):
@@ -553,7 +573,11 @@ def _read_excel(path) -> tuple[pd.DataFrame, str, tuple[str, ...]]:
         with zipfile.ZipFile(path) as archive:
             members = archive.infolist()
             if len(members) > 2000 or sum(item.file_size for item in members) > 128 * 1024 * 1024:
-                raise RowLimitError("حجم بازشده/تعداد فایل‌های XLSX از سقف ایمن بیشتر است")
+                raise RowLimitError(
+                    "این فایل اکسل وقتی باز می‌شود بیش از حد بزرگ است — بیش از ۱۲۸ مگابایت "
+                    "محتوا یا ۲۰۰۰ فایل داخلی. برگه‌های اضافی/تصاویر را حذف کن، فایل را به "
+                    "چند بخش تقسیم کن، یا همان گزارش را CSV/PDF بگیر."
+                )
     except zipfile.BadZipFile as exc:
         return _read_not_really_xlsx(path, exc)
     except MemoryError as exc:
@@ -588,11 +612,37 @@ def _csv_width(text: str, delimiter: str, lines: int = 200) -> int:
     Without an explicit width pandas takes the *first* line as the truth: a report whose
     first line is a title («گزارش سفارش‌ها») then reads every later row as a broken line
     and the whole table disappears.
+
+    The head sample is not enough on its own: pandas does not complain when a line has
+    *more* fields than ``names`` — it keeps the first N and drops the rest silently
+    (measured: 600 fields with ``names=range(512)`` came back as 512 cells). So the head
+    width is confirmed against every line with a cheap delimiter count, and only a file
+    that really has wider lines pays for the exact, quote-aware recount.
     """
     width = 1
     for line in _head_lines(text, lines):
         width = max(width, len(re.sub(r'"[^"]*"', "", line).split(delimiter)))
-    return min(width, 512)
+    if _no_line_wider_than(text, delimiter, width):
+        return width
+    return max(width, _exact_width(text, delimiter))
+
+
+def _no_line_wider_than(text: str, delimiter: str, width: int) -> bool:
+    """Can any line hold *more* fields than ``width``?
+
+    Quoted delimiters only inflate the raw count, so a ``True`` here is a proof that no
+    line is wider (extra separators can only make the check fail, never falsely pass).
+    """
+    limit = width - 1
+    return all(line.count(delimiter) <= limit for line in io.StringIO(text))
+
+
+def _exact_width(text: str, delimiter: str) -> int:
+    """The real maximum field count, quote-aware — only called when the cheap check fails."""
+    width = 1
+    for row in csv.reader(io.StringIO(text), delimiter=delimiter):
+        width = max(width, len(row))
+    return width
 
 
 def _read_text_table(path) -> tuple[pd.DataFrame, str, tuple[str, ...]]:
@@ -602,7 +652,15 @@ def _read_text_table(path) -> tuple[pd.DataFrame, str, tuple[str, ...]]:
     except MemoryError as exc:
         raise _memory_error(exc) from exc
     delimiter = _sniff_delimiter(text)
-    names = list(range(_csv_width(text, delimiter)))
+    width = _csv_width(text, delimiter)
+    if width > MAX_CSV_COLUMNS:
+        raise ColumnLimitError(
+            f"این فایل CSV {width:,} ستون دارد و سقف {MAX_CSV_COLUMNS:,} ستون است. "
+            "ستون‌های لازم (مثل بارکد و کد سفارش) را در یک فایل جدا بفرست، "
+            "یا از سامانه خروجی با ستون‌های کمتر بگیر — وگرنه ستون‌ها بی‌خبر از "
+            "میان می‌رفتند."
+        )
+    names = list(range(width))
     notes: list[str] = []
     kwargs: dict[str, Any] = {
         "sep": delimiter, "header": None, "names": names, "dtype": object,
@@ -1343,7 +1401,7 @@ def _guard_rows(count: int) -> None:
         raise RowLimitError(
             f"فایل بیش از {limit:,} ردیف دارد (خواندن روی سقف متوقف شد) و سقف {limit:,} ردیف "
             "(MAX_ROWS) را رد کرده است. فایل را به دو یا چند بخش تقسیم کن؛ "
-            "پردازشِ این حجم، ربات را برای همه slow می‌کند."
+            "پردازشِ این حجم، ربات را برای همه کُند می‌کند."
         )
 
 
@@ -1453,7 +1511,9 @@ def process_file(path, fname=None, *, layout: Layout | dict[str, Any] | None = N
 __all__ = [
     "FIELD_BARCODE",
     "FIELD_CODE",
+    "MAX_CSV_COLUMNS",
     "Column",
+    "ColumnLimitError",
     "Layout",
     "MemoryLimitError",
     "Question",

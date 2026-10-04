@@ -339,11 +339,6 @@ def _clip_line(text: str, limit: int = 48) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
-def _split_lines(text: str) -> list[str]:
-    """Non-empty lines, whitespace-collapsed — the rule parse_blocks uses too."""
-    return [block.text() for block in parse_blocks(text)]
-
-
 #: How a seller writes the stock of a product: a labelled line, or a bare count.
 #: Deliberately literal — a number that is not *called* stock stays a number.
 _STOCK_LABEL_RE = re.compile(r"(?i)^\s*(?:موجودی|موجوديت\s*(?:فعلی)?|stock|quantity)\s*[:=]?\s*(.*)$")

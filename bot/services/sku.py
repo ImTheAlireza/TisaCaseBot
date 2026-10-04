@@ -89,6 +89,7 @@ def remember(prefix: str, last_used: int) -> None:
         jsonstore.write_json(STATE_FILE, state)
 
 
+# Test-only: clears the per-prefix counter so two tests cannot inherit each other's state.
 def forget_for_tests() -> None:
     """Drop the cache (used by the suite and by «history is wrong, rescan» debugging)."""
     jsonstore.invalidate(STATE_FILE)

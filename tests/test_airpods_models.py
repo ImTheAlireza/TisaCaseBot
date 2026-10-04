@@ -247,16 +247,32 @@ class TestAirPodsExtraction(unittest.TestCase):
         self.assertEqual(2, plan_from_dict(data.to_dict()).count)
 
     def test_update_draft_and_structure_support_singleton_mixed_axes(self):
-        from _update_shop import shop_product
+        from _update_shop import shop_product, variation_row
+        from bot.services import product_match
 
-        product = shop_product(models=["iPhone 17"], colors=["مشکی", "سفید"])
+        product = shop_product(attributes=[
+            {"id": 0, "name": "مدل", "position": 0, "visible": True, "variation": True,
+             "options": ["iPhone 17"]},
+            {"id": 0, "name": "رنگ", "position": 1, "visible": True, "variation": True,
+             "options": ["مشکی", "سفید"]},
+        ])
+        product.variations = [
+            product_match.ShopVariation.from_row(variation_row(1, "iPhone 17", "مشکی", price="700000")),
+            product_match.ShopVariation.from_row(variation_row(2, "iPhone 17", "سفید", price="700000")),
+        ]
         result = update_plan.build(product, {
             "models": ["iPhone 17", "AirPod pro2"], "price": 728_000
         }, image_count=0)
         self.assertTrue(result.can_apply, result.errors)
-        self.assertFalse(result.regenerate, "ترکیب‌های مشترک با ID قبلی باقی می‌مانند")
+        # فهرست مدل عوض شده ⇒ بازسازی کامل (docs/UPDATE-FLOW.md): دو واریژن قبلی می‌روند و
+        # شبکهٔ تازه — آیفون‌ها به‌علاوهٔ محور تازهٔ «ایرپاد» — از نو ساخته می‌شود.
+        self.assertTrue(result.regenerate)
+        self.assertEqual(2, len(result.deletes))
+        self.assertEqual(2, len(result.creates))
         self.assertTrue(all(dict(row.combo)[AIRPODS_ATTRIBUTE] == "AirPods Pro 2" for row in result.creates))
         self.assertTrue(all(dict(row.combo)["مدل"] == "iPhone 17" for row in result.creates))
+        self.assertEqual(1, len([item for item in (result.attributes or []) if item.get("name") == "ایرپاد"]),
+                         "محور ایرپاد باید یکی باشد")
 
 
 @needs_flow

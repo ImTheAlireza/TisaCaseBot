@@ -52,6 +52,7 @@ _CATEGORY_CACHE_TTL_SECONDS = 600
 _CATEGORY_ID_CACHE: dict[tuple[str, int, str], tuple[float, int]] = {}
 
 
+# Test-only: drops the category-name cache between two shops/tests.
 def clear_category_cache() -> None:
     """Clear the short-lived category-ID cache (also useful for isolated tests)."""
     _CATEGORY_ID_CACHE.clear()
@@ -138,6 +139,7 @@ def _combinations(attrs: list[dict[str, Any]], restrictions: dict[str, list[str]
     return build_combinations(pairs, restrictions or {})
 
 
+# Test-only: exposes the restriction mapping the preview builder reads.
 def _model_color_restrictions(data: dict[str, Any]) -> dict[str, list[str]]:
     """Read ``model_colors`` from the product data, defensively cleaned."""
     raw = data.get("model_colors") or {}
@@ -533,11 +535,13 @@ def _total_pages(response: httpx.Response) -> int | None:
 
 async def _existing_combos(
     client: WooClient, base: str, product_id: int, audit: Sink
-) -> list[dict[str, Any]]:
-    """Every variation the product already has (``None`` = unreadable).
+) -> list[dict[str, Any]] | None:
+    """Every variation the product already has (``None`` = endpoint missing).
 
     Unknown or malformed reads stop the publish. Raising on a real error is deliberate: double variations are not a
-    cosmetic problem, they are a product whose price/stock is now ambiguous.
+    cosmetic problem, they are a product whose price/stock is now ambiguous. A *missing* endpoint (404/405/501) is
+    not a read error though: some hosts disable that route while the batch endpoint still works, so the caller
+    gets ``None`` and creates the combinations the preview asked for.
     """
     found: list[dict[str, Any]] = []
     page = 1
@@ -552,7 +556,11 @@ async def _existing_combos(
                 f"{base}/{product_id}/variations", params=params
             )
         if response.status_code in (404, 405, 501):
-            raise WooCommerceAPIError(response.status_code, "واریژن‌های قبلی قابل‌خواندن نیستند؛ ساخت دوباره ممنوع است.")
+            audit.log(
+                f"[resume] endpoint واریژن‌های قبلی در این فروشگاه نیست (HTTP {response.status_code})؛ "
+                "همهٔ ترکیب‌های پیش‌نمایش تازه ساخته می‌شوند."
+            )
+            return None
         if not response.is_success:
             raise WooCommerceAPIError(
                 response.status_code,
@@ -654,12 +662,26 @@ async def _create_variations(
             if len(matches) > 1:
                 raise WooCommerceAPIError(409, "ترکیب واریژن تکراری در محصول قبلی هست؛ تکمیل خودکار متوقف شد.")
             if matches:
-                errors = field_errors(variation, matches[0], variation=True)
+                # Money and stock decide whether the existing row really is what this
+                # preview asked for. ``menu_order``/``visible`` are cosmetics of an
+                # earlier run (its combination list may have been shorter) and must not
+                # block finishing what that run started.
+                substance = {
+                    key: value for key, value in variation.items()
+                    if key in {"regular_price", "sale_price", "status",
+                               "manage_stock", "stock_quantity", "stock_status"}
+                }
+                errors = field_errors(substance, matches[0], variation=True)
                 if errors:
                     raise WooCommerceAPIError(409, "واریژن قبلی با پیش‌نمایش جور نیست: " + "، ".join(errors))
                 continue
         payloads.append(variation)
 
+    if existing_combos:
+        audit.log(
+            f"[variation] {len(combos) - len(payloads)} واریژن از تلاش قبلی موجود بود؛ "
+            f"{len(payloads)} ترکیب جاافتاده ساخته می‌شود."
+        )
     endpoint = f"{base}/{product_id}/variations/batch"
     created = 0
     failed = 0
@@ -1083,12 +1105,15 @@ async def _create_draft_unlocked(
                 # colour cannot be ordered, and nobody knows which ones are
                 # missing. Remove it (and its media) and report the real error —
                 # but never a product we did not create in this attempt.
-                if resumed is not None or batch_id:
+                if resumed is not None:
                     audit.log(
                         f"[rollback] انجام نشد: محصول {product_id} از تلاش قبلی است و "
                         "ممکن است کسی رویش کار کرده باشد. "
                         "پیش‌نویسِ نیمه‌کاره در وردپرس باقی می‌ماند."
                     )
+                    raise
+                if dry_run:
+                    # Rehearsal: nothing exists on the shop to delete.
                     raise
                 audit.log(f"[rollback] ساخت واریژن ناموفق بود ({describe_exception(exc)})؛ محصول در حال حذف است.")
                 await _rollback(client, base, product_id, media_ids, audit)
@@ -1124,7 +1149,9 @@ async def _create_draft_unlocked(
         try:
             exc.diagnostics = audit.lines  # type: ignore[attr-defined]
         except Exception:
-            pass
+            # The exception below is logged anyway; this only says the *audit trail* could
+            # not ride along with it.
+            logger.debug("could not attach the audit trail to %s", type(exc).__name__, exc_info=True)
         logger.exception("create_draft failed unexpectedly")
         raise
 
@@ -1138,5 +1165,8 @@ async def create_draft(
     async with publish_lease.hold(products_base(), batch_id if not dry_run else ""):
         return await _create_draft_unlocked(
             data, image_paths, dry_run=dry_run, report=report, batch_id=batch_id,
-            resume_existing=bool(batch_id) or resume_existing, meta=meta, transport=transport,
+            # Honoured as the caller sent it: the local ledger knows whether an earlier
+            # live attempt exists for this batch (it drove ``resume_existing``), and a
+            # first publish must not pay for a recovery search it does not need.
+            resume_existing=resume_existing, meta=meta, transport=transport,
         )

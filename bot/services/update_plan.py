@@ -459,8 +459,8 @@ class UpdatePlan:
             [row.decision() for row in self.creates],
             sorted(variation.variation_id for variation in self.deletes),
         ]
-        return hashlib.sha1(json.dumps(body, ensure_ascii=False, sort_keys=True,
-                                       default=str).encode()).hexdigest()
+        return hashlib.blake2b(json.dumps(body, ensure_ascii=False, sort_keys=True,
+                                           default=str).encode(), digest_size=20).hexdigest()
 
     # — what is shown —
     def rows(self, stage: str = "full") -> list[str]:
@@ -879,7 +879,7 @@ def _plan_variable(plan: UpdatePlan, product: ShopProduct, draft: Draft,
             stock=quantity, status=status, order=order, image_id=picture, post_status=published,
             replaces=old, carried=tuple(carried))
 
-    combos, _rebuild = _grid_to_build(plan, product, axes, new_axes, draft, stated, baseline)
+    combos, rebuild = _grid_to_build(plan, product, axes, new_axes, draft, stated, baseline)
     if combos is None:
         # The lists are the shop's own: no structure moves, only what the draft states is written.
         for variation in product.variations:
@@ -892,23 +892,40 @@ def _plan_variable(plan: UpdatePlan, product: ShopProduct, draft: Draft,
         by_key: dict[tuple[str, ...], list[ShopVariation]] = {}
         for variation in product.variations:
             by_key.setdefault(_variation_key(variation, new_axes), []).append(variation)
-        fresh: list[tuple[int, dict[str, str]]] = []
-        for order, combo in enumerate(combos):
-            bucket = by_key.get(_combo_key(combo, new_axes))
-            if bucket:
-                # Prefer the original, oldest ID. It owns the SKU, custom metadata,
-                # shipping/tax/backorder settings and historical order references.
-                bucket.sort(key=lambda row: row.variation_id, reverse=True)
-                change = update_for(bucket.pop())
-                if change is None:
-                    plan.kept += 1
+        for duplicates in by_key.values():
+            # Of two variations of the same combination, the *newest* survives: a duplicate is
+            # the mark of a rebuild that stopped half-way, and the newer row is the one that
+            # rebuild made with the new lists. The older copy is the leftover and gets deleted
+            # (see docs/UPDATE-FLOW.md — «از هر دو همزاد تازه‌ترین می‌ماند»).
+            duplicates.sort(key=lambda row: row.variation_id)
+        if rebuild:
+            # The seller changed a list (or limited the colours): every variation the shop has
+            # is deleted and the whole grid is generated again. Each combination that existed
+            # hands what the seller did not rewrite to its replacement (``replaces``).
+            plan.regenerate = bool(product.variations)
+            plan.deletes = list(product.variations)
+            plan.creates = []
+            for order, combo in enumerate(combos):
+                bucket = by_key.get(_combo_key(combo, new_axes))
+                plan.creates.append(create_for(order, combo, bucket.pop() if bucket else None))
+        else:
+            # The lists already say what the seller wants; the shop's variations are the leftover
+            # of a write that stopped half-way. Keep what is right, drop the duplicates, make what
+            # is missing — nothing is deleted just because its list was re-sent.
+            fresh: list[tuple[int, dict[str, str]]] = []
+            for order, combo in enumerate(combos):
+                bucket = by_key.get(_combo_key(combo, new_axes))
+                if bucket:
+                    change = update_for(bucket.pop())
+                    if change is None:
+                        plan.kept += 1
+                    else:
+                        plan.updates.append(change)
                 else:
-                    plan.updates.append(change)
-            else:
-                fresh.append((order, combo))
-        left = {id(variation) for bucket in by_key.values() for variation in bucket}
-        plan.deletes = [variation for variation in product.variations if id(variation) in left]
-        plan.creates = [create_for(order, combo, None) for order, combo in fresh]
+                    fresh.append((order, combo))
+            left = {id(variation) for bucket in by_key.values() for variation in bucket}
+            plan.deletes = [variation for variation in product.variations if id(variation) in left]
+            plan.creates = [create_for(order, combo, None) for order, combo in fresh]
     plan.warnings += _variable_warnings(plan, product, draft, inherited_from)
     if price_gaps:
         sample = "، ".join(price_gaps[:3])

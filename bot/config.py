@@ -56,11 +56,6 @@ def _raw(name: str, default: str = "") -> str:
     return (os.getenv(name) or "").strip() or default.strip()
 
 
-def _as_str(name: str, default: str) -> tuple[str, str | None]:
-    value = _raw(name, default)
-    return value, None
-
-
 def _as_float(name: str, default: float) -> tuple[float, str | None]:
     raw = _raw(name, "")
     if not raw:
@@ -171,6 +166,10 @@ class Settings:
     # Flow behaviour.
     flow_timeout_seconds: int = 900
     temp_ttl_hours: int = 12
+    #: Where per-session work directories (downloads, compressed photos) live.
+    #: Default ``<TISA_DATA_DIR>/tmp``; ``TISA_TEMP_DIR`` moves it. Predictable paths
+    #: under the system ``/tmp`` can be created by another account on a shared host.
+    temp_dir: Path = field(default_factory=lambda: data_dir() / "tmp")
     max_file_mb: float = 25.0
     max_rows: int = 200_000
     process_timeout_seconds: float = 120.0
@@ -236,6 +235,9 @@ class Settings:
         if log_chat_id and len(str(abs(log_chat_id))) < 8:
             note(f"LOG_CHAT_ID={log_chat_id} شبیه شناسهٔ معتبر چت نیست؛ خاموش شد.")
             log_chat_id = 0
+
+        temp_raw = _raw("TISA_TEMP_DIR")
+        temp_dir = Path(temp_raw).expanduser() if temp_raw else data_dir() / "tmp"
 
         price_min, problem = _as_int("PRICE_MIN", 1_000)
         note(problem)
@@ -319,6 +321,7 @@ class Settings:
             barcode_lengths=barcode_lengths,
             flow_timeout_seconds=flow_timeout,
             temp_ttl_hours=temp_ttl,
+            temp_dir=temp_dir,
             max_file_mb=max_file_mb,
             max_rows=max_rows,
             process_timeout_seconds=max(5.0, process_timeout),

@@ -93,6 +93,7 @@ required to start.
 | `PRICE_MIN` / `PRICE_MAX` | no | Sanity range for a parsed price in toman (defaults `1000` / `500000000`). Anything outside is reported instead of published. |
 | `REQUIRE_MODELS` | no | Opt-in strict validation: `yes` blocks products with no detected model. Default `no`; model-less products are allowed and can be created as simple products. |
 | `TISA_DATA_DIR` | no | Where the JSON stores live (roles, publish history, learned rules). Default `./data`. On a shared host point it **out of the code directory** (e.g. `/var/lib/tisaposttowp`) so a redeploy or `git clean` cannot delete the shop's history. `python main.py --check-config` prints the resolved path and **fails** if it is not writable — the JSON writers never raise. |
+| `TISA_TEMP_DIR` | no | Where per-session work directories live (downloads, compressed photos). Default `<TISA_DATA_DIR>/tmp`. On a shared host point it at an owner-only directory: a predictable path under `/tmp` can be created first by another account. A symlink is refused on purpose. |
 | `TISA_DRY_RUN` | no | `yes` = rehears every publish: the real payload is built and sent to a fake transport, so **nothing is written on the shop** (default `no`). See [dry-run](#-حالت-آزمایشی-انتشار-dry-run). |
 | `FLOW_TIMEOUT_SECONDS` | no | Idle time before a product flow is closed and its temp files deleted (default `900`). |
 | `TEMP_TTL_HOURS` | no | Age after which leftover `/tmp` workspaces are swept (default `12`). |
@@ -874,6 +875,8 @@ docs/CONTRACT-TESTS.md       # 🧪 چطور تست قرارداد را محلی
 requirements-dev.txt         # ابزار تست: pytest / pytest-cov / ruff / mypy / hypothesis
 plugin/tisa-product-importer/ # 📦 سورس افزونهٔ ZIP (زیپِ رپو خروجیِ همین است)
 scripts/build_plugin_zip.py  # 📦 بیلدِ قطعیِ tisa-product-importer.zip (--check در CI)
+tools/simulate_*.py          # 🧪 شبیه‌سازهای فلوی محصول/اپدیت (ابزار توسعه، نه استقرار)
+docs/archive/                # 🗃️ طرحِ کد-ریویو و گزارش‌های بازبینیِ بسته‌شده (تاریخی)
 bot/
 ├── config.py                # Settings loaded from .env (BOT_TOKEN, SUDO_IDS, …)
 ├── rbac.py                  # role logic: sudo/admin/user + admin persistence
@@ -994,13 +997,13 @@ silently), and enforces **two** coverage floors: ۷۵٪ روی کل `bot` و ۸�
 
 `docs/MANUAL-TEST-CHECKLIST.md` — **چک‌لیستِ تستِ دستی** (فازهای ۰ تا ۹، یک‌جا): هر بند می‌گوید چه بفرستی، روی چه دکمه‌ای بزنی و دقیقاً چه چیزی باید ببینی؛ برای اجرای خودکار چیزهایی که اینجا نمی‌شود آزمود.
 
-`scripts/simulate_product_flow.py` — **شبیه‌سازیِ کاملِ فلوی محصول** بدون تلگرام و
+`tools/simulate_product_flow.py` — **شبیه‌سازیِ کاملِ فلوی محصول** بدون تلگرام و
 بدون سایت: همان هندلرهای واقعی را با یک تلگرامِ ساختگی اجرا می‌کند و گام‌به‌گام
 چاپ می‌کند چه ورودی‌ای پذیرفته شد، کدام بخش تحلیل اجرا شد (پارسر قطعی، ماتریس
 موجودی، AI، اعتبارسنجی)، کارت مرحله‌به‌مرحله چه شد، و در پایان چه چیزی به ووکامرس
 می‌رفت. با `TISA_DRY_RUN` کار می‌کند و هیچ درخواستی به بیرون نمی‌فرستد؛ داده‌ها هم
 در `/tmp/tisa-product-sim` می‌مانند، نه در `data/`. اجرا:
-`.venv/bin/python scripts/simulate_product_flow.py`.
+`.venv/bin/python tools/simulate_product_flow.py`.
 
 تست قرارداد (`tests/test_contract_wordpress.py` + `docker-compose.yml`) بیرون از محیط
 Docker خاموش است؛ اجرا و توضیحش در `docs/CONTRACT-TESTS.md`.
@@ -1036,6 +1039,13 @@ parser test shows a real with/without-rules diff without writing to the corpus.
 `tests/test_phone_parser.py` covers the bare-amount regression: a price line must
 never become a phone model, while genuine model lines (`17`, `17promax`, `7/8`,
 `XSMax`) keep working.
+
+`tests/test_csv_columns.py` covers the wide-export regression: a 600-column CSV keeps all
+600 columns (the old reader silently dropped everything past 512, so a barcode at index 590
+simply was not there), a line wider than the header still counts, and a file past the 4096
+column cap gets a sentence instead of a truncated table. `tests/test_app_gate.py` covers the
+one gate every update passes — group chats are dropped, a stranger is denied before any
+handler, `/start` stays reachable for invites, and an allowed user is not denied.
 
 Both runners stay green with no third-party dependencies installed — the tests
 that need `httpx` or `python-telegram-bot` skip themselves.

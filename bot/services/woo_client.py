@@ -406,8 +406,9 @@ class WooClient:
                 await _sleep(delay)
                 continue
             return response
-        assert response is not None  # pragma: no cover - unreachable with attempts >= 1
-        return response
+        # Unreachable while ``attempts >= 1``, but ``assert`` vanishes under ``python -O``
+        # and the caller would then get ``None`` as if it were a response.
+        raise RuntimeError("no request was attempted (attempts must be at least 1)")  # pragma: no cover
 
     def _retry_network(self, exc: httpx.TransportError) -> bool:
         """May this failed request be sent again?

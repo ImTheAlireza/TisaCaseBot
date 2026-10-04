@@ -1,17 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "tisaposttowp"
-version = "0.14.0"
+# The version lives in exactly one place — ``bot/__init__.py`` — and this reads it, so
+# `pyproject` can never say 0.14.0 while the bot says 0.18.0 (it did).
+dynamic = ["version"]
 description = "Modular, keyboard-driven Telegram bot for TisaCase product & order management"
 requires-python = ">=3.11"
 dependencies = [
     "python-telegram-bot[job-queue]>=21.0,<22",
-    "python-dotenv>=1.0",
-    "pandas>=2.0",
-    "openpyxl>=3.1",
-    "pymupdf>=1.24",
-    "httpx>=0.28",
-    "Pillow>=11.0",
+    "python-dotenv>=1.0,<2",
+    "pandas>=2.0,<3",
+    "openpyxl>=3.1,<4",
+    "pymupdf>=1.24,<2",
+    "httpx>=0.28,<1",
+    "Pillow>=11.0,<13",
 ]
+
+[tool.setuptools]
+# An explicit list: auto-discovery would try to package tests/, scripts/ and the plugin.
+packages = ["bot", "bot.services", "bot.modules", "bot.utils", "bot.keyboards"]
+
+[tool.setuptools.dynamic]
+version = {attr = "bot.__version__"}
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.6", "mypy>=1.8"]
@@ -56,7 +69,7 @@ ignore = [
 "bot/constants.py" = ["RUF012"]
 # شبیه‌سازهای فلو، همان قراردادهای تلگرام/بات را با امضاهای کامل پیاده می‌کنند که
 # بخشی از پارامترهایشان در شبیه‌سازی مصرف نمی‌شود؛ مثل tests، این قاعده‌ها خاموش‌اند.
-"scripts/simulate_*.py" = ["ARG002", "ARG005", "E402"]
+"tools/simulate_*.py" = ["ARG002", "ARG005", "E402"]
 
 [tool.ruff.lint.flake8-bugbear]
 # The codebase catches broad Exception on purpose in handlers/teardown paths:
@@ -80,7 +93,19 @@ filterwarnings = [
 # ---------------------------------------------------------------------- mypy --
 [tool.mypy]
 python_version = "3.11"
-files = ["bot/services", "bot/rbac.py", "bot/buttons.py", "bot/config.py"]
+files = [
+    "bot/services",
+    "bot/utils",
+    "bot/keyboards",
+    "bot/rbac.py",
+    "bot/buttons.py",
+    "bot/config.py",
+    "bot/constants.py",
+]
+# `bot/modules` is not listed yet: mypy 2.x refuses to check any file under it with
+# «bot/__init__.py found twice under different module names», a known quirk triggered by
+# the package's `from bot.modules import (...)` cycle. It needs that import cleaned up
+# first (the handlers themselves are covered by the flow tests).
 ignore_missing_imports = true
 # The services layer is where the real bugs were, so typing is enabled there
 # first; modules/ (Telegram handlers) follows in phase 3.

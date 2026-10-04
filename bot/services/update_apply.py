@@ -199,10 +199,6 @@ async def _write_product(client: WooClient, base: str, plan: update_plan.UpdateP
 
 
 
-def _contradictions(sent: dict[str, Any], got: Any) -> list[str]:
-    return field_errors(sent, got)
-
-
 async def _write_variations(client: WooClient, base: str, plan: update_plan.UpdatePlan,
                             uploads: Sequence[tuple[int, Path]], result: ApplyResult,
                             trace: Audit) -> None:

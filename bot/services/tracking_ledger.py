@@ -51,7 +51,10 @@ def fingerprint(path: str | Path) -> str:
     The hash is of the *bytes*, so renaming a file does not hide a repeat, and
     one re-exported with an extra row does not look like the same file.
     """
-    digest = hashlib.sha1()
+    # blake2b, not sha1: this is a cache key, and sha1 is the one hash whose use the
+    # auditors ask about by name. Same output shape (16 hex chars below) as before —
+    # fingerprints recorded by an older version simply do not match once.
+    digest = hashlib.blake2b(digest_size=8)
     read = 0
     try:
         with open(path, "rb") as handle:

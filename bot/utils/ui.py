@@ -32,13 +32,13 @@ logger = logging.getLogger(__name__)
 _UNCHANGED = "message is not modified"
 
 
-def _answer_call(query: CallbackQuery, toast: str | None, show_alert: bool) -> Awaitable[bool]:
+async def _answer_call(query: CallbackQuery, toast: str | None, show_alert: bool) -> bool:
     kwargs: dict[str, Any] = {}
     if toast:
         kwargs["text"] = toast
     if show_alert:
         kwargs["show_alert"] = True
-    return query.answer(**kwargs)
+    return await query.answer(**kwargs)
 
 
 async def answer_and(
@@ -49,7 +49,7 @@ async def answer_and(
     show_alert: bool = False,
 ) -> T:
     """Answer ``query`` now, run ``work`` (the screen update) in parallel, return its result."""
-    answered = asyncio.create_task(_answer_call(query, toast, show_alert))
+    answered: asyncio.Task[bool] = asyncio.create_task(_answer_call(query, toast, show_alert))
     # One loop tick so the answer is *started* first: callbacks have always been
     # answered before the screen update goes out, and the fake queries in the tests
     # (and anything else watching the wire) rely on that order.
@@ -94,8 +94,14 @@ async def answer_and_edit(
     ``quiet=True`` swallows «message is not modified» (a re-delivered tap on an
     unchanged screen); it does not hide any other error.
     """
-    edit = edit_or_ignore(query, text, **kwargs) if quiet else query.edit_message_text(text, **kwargs)
-    return await answer_and(query, edit, toast=toast, show_alert=show_alert)
+    if quiet:
+        return await answer_and(
+            query, edit_or_ignore(query, text, **kwargs), toast=toast, show_alert=show_alert
+        )
+    # ``edit_message_text`` returns the edited Message; this function's contract is bool
+    # («was the screen replaced»), so say that instead of pretending a Message is one.
+    await answer_and(query, query.edit_message_text(text, **kwargs), toast=toast, show_alert=show_alert)
+    return True
 
 
 __all__ = ["answer_and", "answer_and_edit", "edit_or_ignore"]

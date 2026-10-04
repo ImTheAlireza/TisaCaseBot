@@ -14,7 +14,7 @@
 
 اجرا:
 
-    .venv/bin/python scripts/simulate_update_flow.py
+    .venv/bin/python tools/simulate_update_flow.py
 
 هیچ درخواستی به تلگرام یا سایت نمی‌رود. داده‌های موقت در ``/tmp/tisa-update-sim`` می‌مانند.
 """
