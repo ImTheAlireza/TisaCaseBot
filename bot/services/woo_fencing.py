@@ -59,6 +59,18 @@ def _detail(response: httpx.Response) -> str:
     return f": {reason[:160]}" if reason and reason != f"HTTP {response.status_code}" else ""
 
 
+def _silent_host(error: WooCommerceAPIError) -> WooCommerceAPIError:
+    """Tag an error that means «nothing answered», so the queue can wait it out.
+
+    The queue has to choose between «retry on the usual backoff» and «the host is down; knock
+    every half hour and do not spend the seller's attempts» (:func:`bot.services.outbox.is_silent`).
+    A ``503`` on its own cannot make that call — LiteSpeed answers 503 when it is merely busy —
+    so the branch that *knows* it got silence says so here, once, at the source.
+    """
+    error.host_silent = True
+    return error
+
+
 def _connect_level(exc: BaseException | None) -> bool:
     """Did the failure happen *before* the shop could see anything?
 
@@ -143,25 +155,25 @@ async def require(client: WooClient, base: str) -> None:
     if response is None:
         assert failure is not None  # _health returns exactly one of the two
         if _connect_level(failure):
-            raise WooCommerceAPIError(503, (
+            raise _silent_host(WooCommerceAPIError(503, (
                 "اتصال به فروشگاه برقرار نشد — نه DNS حل می‌شود و نه پورت جواب می‌دهد. هیچ "
                 "درخواستی به سایت نرسیده، پس نیم‌ساخته‌ای هم وجود ندارد؛ انتشار در صفِ تلاشِ "
                 "دوباره می‌ماند. از سمت سرورِ ربات: `curl -m 15 https://…/wp-json/`."
-            )) from failure
+            ))) from failure
         if await _awake(client, base):
-            raise WooCommerceAPIError(503, (
+            raise _silent_host(WooCommerceAPIError(503, (
                 "سایت زنده است ولی مسیر افزونهٔ تیسا (tisa-health) به درخواستی که کلید در آدرس "
                 "دارد پاسخ نداد. این شکلِ کارِ فایروال/ModSecurity میزبان است، نه وردپرس. از همان "
                 "سرورِ ربات امتحان کن: `curl -m 15` همان آدرسِ بررسی ایمنی را با "
                 "`consumer_key`/`consumer_secret` بزن؛ اگر آن هم گیر کرد، قاعدهٔ «consumer» را از "
                 "فایروال بردار."
-            )) from failure
-        raise WooCommerceAPIError(503, (
+            ))) from failure
+        raise _silent_host(WooCommerceAPIError(503, (
             "فروشگاه به هیچ درخواستی پاسخ نداد — نه بررسی ایمنی، نه یک GET سادهٔ بدون کلید. "
             "چیزی نوشته نشده و نیم‌ساخته‌ای وجود ندارد؛ انتشار در صفِ تلاشِ دوباره می‌ماند. "
             "از سمت میزبان ببین: CPU/RAM و سقف «entry processes»، استخر PHP-FPM/LiteSpeed، "
             "و اینکه وردپرس اصلاً به ربات پاسخ می‌دهد یا فایروال/IP را بسته است."
-        )) from failure
+        ))) from failure
     status = response.status_code
     if status in TRANSIENT_STATUS_CODES:
         raise WooCommerceAPIError(503, (

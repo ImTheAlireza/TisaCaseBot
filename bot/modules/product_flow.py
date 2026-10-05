@@ -344,15 +344,16 @@ async def _toast(query: Any, text: str = "", **kwargs: Any) -> None:
         logger.warning("could not answer the tap (%s): %s", type(exc).__name__, exc)
 
 
-async def _note_on_card(query: Any, text: str) -> None:
+async def _note_on_card(query: Any, text: str, markup: Any = None) -> None:
     """Put the outcome on the seller's own card, if Telegram will still take it.
 
     Only ever called once the publish has *finished failing*: the ledger entry and the retry
     queue are written by then, so a lost edit is a cosmetic loss and must not escape into PTB's
     global handler (that is how a handled error used to be reported as «خطای مدیریت‌نشدهٔ بات»).
     """
+    kwargs: dict[str, Any] = {} if markup is None else {"reply_markup": markup}
     try:
-        await _edit_message_if_changed(query, text)
+        await _edit_message_if_changed(query, text, **kwargs)
     except Exception as exc:
         logger.warning("could not update the card after a failure (%s): %s", type(exc).__name__, exc)
 
@@ -2566,6 +2567,48 @@ def _queued_note(queued: bool) -> str:
     return "\n🐇 در صفِ تلاش مجدد است؛ نتیجه را همین‌جا می‌فرستم." if queued else ""
 
 
+def _publish_failure_text(exc: BaseException, reason: str, *, queued: bool, waiting: str = "") -> str:
+    """Say «this did not go through» in the voice of whoever has to act — the shop or the seller.
+
+    One red sentence used to cover both a host that answers nothing and a value WooCommerce
+    refused, and the first is not something a person can fix by retyping the form. A queued,
+    host-silent failure is therefore not shown as an error at all: it is a state with a time on
+    it, and the only thing asked of the seller is to wait — «✅ تأیید و ساخت» still works and
+    only does the same send sooner.
+    """
+    if queued and outbox.is_silent(exc):
+        lines = [
+            "🕐 سایت در این لحظه پاسخ نمی‌دهد — از سمتِ تو هیچ‌چیز غلط نبود.",
+            "🐇 هرچه تأیید کرده بودی در صفِ ارسال است؛ ربات خودش سایت را امتحان می‌کند و "
+            "نتیجه را همین‌جا می‌فرستد.",
+        ]
+        if waiting:
+            lines.append(f"⏱ {waiting}")
+        lines.append(
+            "👤 لازم است کاری نکنی. اگر عجله داری همان «✅ تأیید و ساخت» را دوباره بزن؛ "
+            "«📤 صف من» (یا ‎/queue) هم وضعیتش را نشان می‌دهد."
+        )
+        return "\n\n".join(lines)
+    head = f"❌ ساخت مستقیم محصول ناموفق بود:\n{reason}"
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int) and status:
+        head = f"❌ ساخت مستقیم محصول ناموفق بود (HTTP {status}):\n{reason}"
+    return head + _queued_note(queued)
+
+
+def _queued_keyboard(session: ProductSession, queued: bool) -> InlineKeyboardMarkup | None:
+    """The card's own buttons, plus «📤 صف من» — a failure edit must never eat «تأیید و ساخت».
+
+    Replacing the markup with the two buttons a failure *seems* to need is how a queue turns
+    into «چطور دوباره بزنم؟»: the review keyboard is the retry, so it is kept and only extended.
+    """
+    if not queued:
+        return None
+    rows = list(_keyboard(session).inline_keyboard)
+    rows.append([InlineKeyboardButton("📤 صف من", callback_data=CB.QUEUE_SHOW)])
+    return InlineKeyboardMarkup(rows)
+
+
 
 @guard_feature(_feature_key, on_denial=lambda uid: _cleanup(uid), checker=lambda uid, key: feature_allowed(uid, key))
 @_owned_callback
@@ -2802,7 +2845,8 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             reason = f"HTTP {exc.status_code}: {exc}"
             queued = await _queue_for_retry(exc, user_id=user.id, session=session, data=data,
                                       batch=batch, error=reason, ledger_key=intent_key)
-            message = f"❌ ساخت مستقیم محصول ناموفق بود (HTTP {exc.status_code}):\n{exc}" + _queued_note(queued)
+            waiting = await asyncio.to_thread(outbox_flow.queue_status, batch) if queued else ""
+            message = _publish_failure_text(exc, str(exc), queued=queued, waiting=waiting)
             _record_result(user.id, session, data, status="queued" if queued else "failed",
                            key=intent_key, batch_id=batch, error=reason)
             await _flush_journal(context, status="queued" if queued else "failed", data=data,
@@ -2811,7 +2855,7 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 await product_journal.send_publish_trace(
                     context.bot, audit_lines, dry_run=settings.woo_dry_run
                 )
-            await _note_on_card(query, message)
+            await _note_on_card(query, message, _queued_keyboard(session, queued))
             return REVIEW
         except Exception as exc:
             if publish_returned:
@@ -2838,9 +2882,9 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 await product_journal.send_publish_trace(
                     context.bot, audit_lines, dry_run=settings.woo_dry_run
                 )
-            await _note_on_card(
-                query, f"❌ ساخت مستقیم محصول ناموفق بود:\n{reason}" + _queued_note(queued)
-            )
+            waiting = await asyncio.to_thread(outbox_flow.queue_status, batch) if queued else ""
+            message = _publish_failure_text(exc, reason, queued=queued, waiting=waiting)
+            await _note_on_card(query, message, _queued_keyboard(session, queued))
             return REVIEW
     # Every mode but «new» (REST draft above) and «update» (dispatched at the top) is unknown:
     # the bot no longer builds ZIP files, so there is nothing honest to do with it.

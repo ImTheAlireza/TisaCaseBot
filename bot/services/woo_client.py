@@ -118,6 +118,9 @@ class WooCommerceAPIError(RuntimeError):
         self.status_code = status_code
         self.diagnostics = list(diagnostics or [])
         self.retry_after: float = 0.0
+        #: «nothing answered» — set by the preflight on its own silence, and the only thing that
+        #: lets :func:`bot.services.outbox.is_silent` tell a dead host from a busy one (both 503).
+        self.host_silent: bool = False
         super().__init__(redact(message))
 
 

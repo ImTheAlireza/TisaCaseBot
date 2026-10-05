@@ -27,6 +27,7 @@ from bot.modules import (
     image_compress,
     learning_panel,
     ops,
+    outbox_flow,
     ping,
     product_flow,
     product_tools,
@@ -41,6 +42,7 @@ from bot.modules import (
 ALL_MODULES = (
     tracking_converter,
     product_flow,
+    outbox_flow,
     product_tools,
     image_compress,
     admins,

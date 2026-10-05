@@ -117,6 +117,7 @@ class Preflight(unittest.TestCase):
         assert error is not None
         self.assertEqual(503, error.status_code, "۵۰۳ تنها حالتی است که صف قبول می‌کند")
         self.assertTrue(outbox.is_transient(error), "سایت خوابیده خطای «دستی» نیست")
+        self.assertTrue(outbox.is_silent(error), "«پاسخی نبود» همان حالتی است که صف نیم‌ساعت صبر می‌کند")
         self.assertIn("هیچ درخواستی", str(error))
         self.assertIn("entry processes", str(error), "باید بگوید کجا را نگاه کند")
         self.assertEqual(
@@ -130,6 +131,7 @@ class Preflight(unittest.TestCase):
         error, audit, script, _delays = self._require(dead, dead, httpx.Response(200, json={}))
         assert error is not None
         self.assertEqual(503, error.status_code)
+        self.assertTrue(outbox.is_silent(error), "قاعدهٔ فایروال هم با یک تلاشِ تازه درست نمی‌شود")
         self.assertIn("فایروال", str(error))
         self.assertIn("پاسخ داد", audit, "«سایت بیدار است» باید در ردپا خوانده شود")
         probe = script.requests[-1]
@@ -174,6 +176,7 @@ class Preflight(unittest.TestCase):
         assert error is not None
         self.assertEqual(503, error.status_code)
         self.assertTrue(outbox.is_transient(error))
+        self.assertFalse(outbox.is_silent(error), "۵۰ *پاسخ* است؛ backoff معمولی، نه نیم‌ساعت سکوت")
         self.assertIn("Internal Server Error", str(error), "علتِ خودِ سایت هم باید خوانده شود")
         self.assertEqual(1, script.sends)
 

@@ -230,6 +230,20 @@ class TestWhatCountsAsTransient(unittest.TestCase):
         self.assertFalse(outbox.is_transient(KeyError("images")))
 
 
+    def test_silence_is_not_the_same_as_busyness(self) -> None:
+        """«هاست اصلاً جواب نداد» با «جواب داد و شلوغ بود» یکی نیست: صبرِ بلند، تلاشِ کم‌تر."""
+        import httpx
+
+        self.assertTrue(outbox.is_silent(httpx.ReadTimeout("nothing")))
+        self.assertTrue(outbox.is_silent(httpx.ConnectError("no route")))
+        # 503LiteSpeed یعنی پاسخ آمده؛ فقط پاسخِ ندادن ارزشِ نیم‌ساعت سکوت را دارد.
+        self.assertFalse(outbox.is_silent(WooCommerceAPIError(503, "busy")))
+        self.assertFalse(outbox.is_silent(WooCommerceAPIError(400, "bad")))
+        probe = WooCommerceAPIError(503, "پیش‌آزمون پاسخی نگرفت")
+        probe.host_silent = True
+        self.assertTrue(outbox.is_silent(probe), "خودِ پیش‌آزمون علامت می‌زند؛ کدِ ۵۰۳ تنها کافی نیست")
+
+
 @needs_flow
 class TestQueueIsCreatedFromTheFlow(QueueTestCase):
     """«تأیید و ساخت» روی ۵۰۳: یک کارتِ 🐇، یک ردیفِ صف، هیچ کارت دوم."""
@@ -321,6 +335,40 @@ class TestQueueIsCreatedFromTheFlow(QueueTestCase):
         self.assertIn("تلاش مجدد", text)
         self.assertNotIn(f"{outbox.REMAINING_TRIES_AFTER_FIRST} بار دیگر", text)
         self.assertNotIn("رها شد", text, "در لحظهٔ صف‌گذاری هنوز رها نشده")
+
+    def test_a_silent_shop_is_not_reported_as_an_error_of_the_seller(self) -> None:
+        """کارتِ «هاست جواب نمی‌دهد» نباید با ❌ و «دوباره بزن» شروع شود.
+
+        سه دورِ بی‌نتیجهٔ «ساخت محصول ناموفق بود» دقیقاً همان چیزی بود که فروشنده را وادار
+        کرد فرم را از نو پر کند؛ حال‌وهوا از علت جدا می‌شود، نه از لاگ.
+        """
+        import httpx
+
+        text = PF._publish_failure_text(
+            httpx.ReadTimeout("nothing"), "ReadTimeout: پاسخ فروشگاه نرسید",
+            queued=True, waiting="تلاش ۱ از ۸ · بعدی: ۱۵:۴۰",
+        )
+        self.assertTrue(text.startswith("🕐"), text[:40])
+        self.assertIn("هیچ‌چیز غلط نبود", text)
+        self.assertIn("تلاش ۱ از ", text)
+        self.assertNotIn("❌", text)
+
+        refused = PF._publish_failure_text(
+            WooCommerceAPIError(400, "تصویر مجاز نیست"), "HTTP 400: تصویر مجاز نیست", queued=False
+        )
+        self.assertIn("❌", refused)
+        self.assertIn("HTTP 400", refused)
+        self.assertIn("تصویر مجاز نیست", refused)
+        self.assertNotIn("🐇", refused, "چیزی در صف نیست، پس قولِ صف هم نمی‌دهیم")
+
+    def test_the_failure_card_keeps_the_confirm_button_and_adds_the_queue(self) -> None:
+        """ویرایشِ کارتِ خطا نباید «✅ تأیید و ساخت» را ببلعد؛ فقط یک دکمه اضافه می‌شود."""
+        session = PF.ProductSession(user_id=7)
+        markup = PF._queued_keyboard(session, True)
+        data = [button.callback_data for row in markup.inline_keyboard for button in row]
+        self.assertIn("product:confirm", data)
+        self.assertEqual("queue:show", data[-1])
+        self.assertIsNone(PF._queued_keyboard(session, False), "بی‌صف، دکمهٔ صف نه")
 
 
 @needs_flow
@@ -414,6 +462,36 @@ class TestDrainingTheQueue(QueueTestCase):
         self.assertEqual(before + 1, after.attempts)
         self.assertGreater(after.next_at, time.time(), "با backoff عقب افتاد")
         self.assertEqual([], self.sent, "بین دو تلاش پیام نمی‌فرستیم؛ هر دقیقه یک «هنوز نشد» آدم را دیوانه می‌کند")
+
+    async def test_a_silent_host_is_waited_out_without_spending_an_attempt(self) -> None:
+        """هشتِ وعده‌داده‌شده باید هشتِ واقعی بماند، نه هشتِ سوخته در نیم‌ساعتِ اولِ قطعی."""
+        import httpx
+
+        self.error = httpx.ReadTimeout("nothing answered")
+        self.enqueue(batch="quiet124quie", delay=0.0)
+        before = outbox.due()[0].attempts
+        await self._drain()
+        row = self.row(in_seconds=outbox.SILENT_RETRY_SECONDS)
+        self.assertEqual(before, row.attempts, "سکوتِ هاست تلاشِ فروشنده را کم نمی‌کند")
+        self.assertAlmostEqual(
+            outbox.SILENT_RETRY_SECONDS, row.next_at - time.time(), delta=5,
+            msg="نیم‌ساعت صبر، نه یک دقیقه؛ وگرنه صف پیش از بازگشتِ هاست تمام می‌شود",
+        )
+        self.assertEqual([], self.sent, "بین دو تلاش پیامِ تازه‌ای نمی‌فرستیم")
+        self.assertEqual(1, outbox.pending())
+
+    async def test_silence_near_the_deadline_still_uses_the_ordinary_backoff(self) -> None:
+        """نزدیکِ سقفِ ۲۴ ساعت، تعویقِ نیم‌ساعته جایش را به backoff معمولی می‌دهد."""
+        import httpx
+
+        self.error = httpx.ReadTimeout("nothing answered")
+        self.enqueue(batch="edge124edge1", delay=0.0,
+                     now=time.time() - outbox.MAX_AGE_SECONDS + 600)
+        before = outbox.due()[0].attempts
+        await self._drain()
+        row = self.row(in_seconds=3600)
+        self.assertEqual(before + 1, row.attempts, "تلاش شمرده می‌شود تا آخرِ مهلت معنادار بماند")
+        self.assertLess(row.next_at - time.time(), outbox.SILENT_RETRY_SECONDS)
 
     async def test_a_permanent_error_leaves_the_queue_and_says_why(self) -> None:
         self.error = WooCommerceAPIError(400, "تصویر مجاز نیست")
@@ -513,6 +591,95 @@ class TestNothingElseOpensTheQueue(QueueTestCase):
         if "صف" in text:
             self.assertIn(str(outbox.MAX_ATTEMPTS), text,
                           "اگر عددِ README با کد فرق کند، README دارد دروغ می‌گوید")
+
+
+@needs_flow
+class TestTheSellerSeesTheirOwnQueue(QueueTestCase):
+    """«صف است» باید قابل‌دیدن باشد، نه یک جملهٔ قابل‌باور: /queue و دو دکمه‌اش."""
+
+    class _Query:
+        def __init__(self, data: str) -> None:
+            self.data = data
+            self.answers: list[str] = []
+            self.edits: list[dict] = []
+
+        async def answer(self, text: str = "", *, show_alert: bool = False) -> None:
+            self.answers.append(text)
+
+        async def edit_message_text(self, **kwargs: object) -> None:
+            self.edits.append(kwargs)
+
+    class _Bot:
+        def __init__(self) -> None:
+            self.sent: list[dict] = []
+
+        async def send_message(self, **kwargs: object) -> None:
+            self.sent.append(dict(kwargs))
+
+    def _update(self, data: str, *, user_id: int = 7):
+        query = self._Query(data)
+        user = type("User", (), {"id": user_id})()
+        self.context = type("Ctx", (), {"bot": self._Bot()})()
+        return type("U", (), {"callback_query": query, "effective_user": user})(), query
+
+    def test_the_line_says_exactly_what_the_row_says(self) -> None:
+        from bot.utils import timeutil
+
+        moment = time.time()
+        self.enqueue(batch="line124line1", delay=600, now=moment, error="HTTP 503: busy")
+        row = outbox.get("line124line1")
+        line = outbox_flow.status_line(row, now=moment)
+        self.assertIn(f"تلاش 1 از {outbox.MAX_ATTEMPTS}", line)
+        self.assertIn(f"{outbox.MAX_ATTEMPTS - 1} بار دیگر", line)
+        self.assertIn(timeutil.strftime("%H:%M", moment + 600), line)
+        self.assertIn("بعدی", line)
+
+    def test_an_empty_queue_is_an_answer_not_an_error(self) -> None:
+        self.assertEqual("📤 صفی نداری — چیزی در انتظار ارسال نیست.", outbox_flow.queue_text([]))
+        self.assertIsNone(outbox_flow.queue_markup([]))
+
+    def test_the_card_shows_the_product_and_the_reason_it_is_still_waiting(self) -> None:
+        self.enqueue(batch="show124show1", delay=600, error="503: فروشگاه پاسخ نداد")
+        text = outbox_flow.queue_text(outbox.rows_for(7))
+        self.assertIn("قاب سیلیکونی آیفون 13", text)
+        self.assertIn("🕐", text)
+        self.assertIn("فروشگاه پاسخ نداد", text)
+        markup = outbox_flow.queue_markup(outbox.rows_for(7))
+        data = [button.callback_data for row in markup.inline_keyboard for button in row]
+        self.assertEqual(["queue:now:show124show1", "queue:drop:show124show1"], data)
+
+    def test_a_forged_batch_id_moves_nobody_elses_product(self) -> None:
+        self.enqueue(batch="mine124mine1", delay=600)
+        self.assertFalse(outbox.push_now("mine124mine1", user_id=8))
+        self.assertIsNone(outbox.get("mine124mine1", user_id=8))
+        self.assertTrue(outbox.push_now("mine124mine1", user_id=7))
+        self.assertEqual(1, len(outbox.due()), "«⟳» یعنی همین حالا؛ موعد رد شد")
+
+    def test_the_screen_lists_only_this_sellers_rows(self) -> None:
+        self.enqueue(batch="mine224mine2", delay=600)
+        outbox.enqueue(batch_id="theirs224th", chat_id=9, user_id=42, payload=_payload(), delay=600)
+        self.assertEqual(["mine224mine2"], [row.batch_id for row in outbox.rows_for(7)])
+
+    async def test_now_and_remove_are_the_only_two_writes_the_screen_has(self) -> None:
+        self.enqueue(batch="act124act1", delay=600, error="HTTP 503: busy")
+        key = outbox.get("act124act1").ledger_key or "kk1"
+        with outbox._db() as conn:
+            conn.execute("UPDATE outbox SET payload = ?", (json.dumps({**_payload(), "ledger_key": key}),))
+        products_ledger.record(user_id=7, status="queued", key=key, title="قاب سیلیکونی آیفون 13")
+
+        update, query = self._update("queue:drop:act124act1")
+        await outbox_flow.cb_queue_action(update, self.context)
+        self.assertEqual(0, outbox.pending(), "🗑 یعنی از صف بیرون، نه تعلیق")
+        self.assertEqual(1, outbox.stats()["dropped"])
+        self.assertEqual("failed", products_ledger.recent(1)[0]["status"], "کارتِ تاریخچه بی‌نتیجه نمی‌ماند")
+        self.assertIn("از صف برداشته شد", query.answers[-1])
+
+    async def test_dropping_somebody_elses_row_is_answered_as_nothing_there(self) -> None:
+        self.enqueue(batch="other124oth1", delay=600)
+        update, query = self._update("queue:drop:other124oth1", user_id=99)
+        await outbox_flow.cb_queue_action(update, self.context)
+        self.assertEqual(1, outbox.pending(), "ردیفِ دیگران دست‌نخورده می‌ماند")
+        self.assertIn("دیگر در صف نیست", query.answers[0])
 
 
 if __name__ == "__main__":

@@ -74,10 +74,32 @@ def is_transient(exc: BaseException) -> bool:
     return isinstance(exc, (TimeoutError, ConnectionError, OSError, httpx.TransportError))
 
 
+def is_silent(exc: BaseException) -> bool:
+    """Did the shop fail to *answer*, rather than answer «busy»?
+
+    This is the difference between «the payload may be fine, wait» and «the host is down, come
+    back later». The status code cannot tell them apart on its own: a ``503`` written by
+    :func:`bot.services.woo_fencing.require` means the probe got nothing at all, while a ``503``
+    that came back over the wire means LiteSpeed answered and is busy — so the fence tags its own
+    error (``host_silent``) and everything else is recognised by its transport class.
+    """
+    if getattr(exc, "host_silent", False):
+        return True
+    return isinstance(
+        exc,
+        (TimeoutError, httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError),
+    )
+
+
 #: How many times the queue knocks before it stops. Eight, because the waits grow:
 #: 1m, 2m, 4m, 8m, 16m, 32m, 64m ≈ two hours of trying, which is the window in which a
 #: WooCommerce maintenance break is still "coming back".
 MAX_ATTEMPTS = 8
+#: The wait when the shop did not answer *at all* (:func:`is_silent`). Eight ordinary backoffs
+#: are spent inside the first half-hour of a real outage, after which the product is dropped
+#: while the host is still down — so silence is waited out in half-hour probes that do **not**
+#: consume an attempt. The 24-hour ceiling still decides when the queue stops caring.
+SILENT_RETRY_SECONDS = 30 * 60
 #: Retries the queue still owes after the flow's own failed attempt. ``MAX_ATTEMPTS`` counts
 #: the whole story — the attempt that just failed is number one — and the UI says «X بار دیگر»
 #: from this constant, so a promise on screen and the counter in the database cannot drift.
@@ -541,8 +563,85 @@ def is_queued(batch_id: str) -> bool:
     return row is not None
 
 
+def get(batch_id: str, *, user_id: int | str | None = None) -> QueuedPublish | None:
+    """One queued item, or ``None``. Asked with a ``user_id``, somebody else's row is absent.
+
+    The seller's «📤 صف من» button needs exactly this: the row *and* the proof that the batch id
+    in the callback data is theirs. A foreign or unknown id is answered as «چیزی در صف نیست»,
+    which is the honest reply and the only safe one to build a button out of.
+    """
+    if not batch_id:
+        return None
+    try:
+        with _db() as conn:
+            row = conn.execute("SELECT * FROM outbox WHERE batch_id = ?", (batch_id,)).fetchone()
+    except (sqlite3.Error, OSError):
+        return None
+    if row is None or (user_id is not None and str(row["user_id"]) != str(user_id)):
+        return None
+    return _row_to_entry(row)
+
+
+def rows_for(user_id: int | str, *, limit: int = 10) -> list[QueuedPublish]:
+    """What this one seller has waiting, newest first — the queue seen from their side."""
+    try:
+        with _db() as conn:
+            rows = conn.execute(
+                "SELECT * FROM outbox WHERE user_id = ? ORDER BY created_at DESC LIMIT ?",
+                (str(user_id), max(1, int(limit))),
+            ).fetchall()
+    except (sqlite3.Error, OSError):
+        return []
+    return [_row_to_entry(row) for row in rows]
+
+
+def defer(entry: QueuedPublish, error: str, *, now: float | None = None) -> QueuedPublish:
+    """Wait out a silent host without spending one of the promised attempts.
+
+    ``attempts`` stays where it was on purpose: the eight tries the seller was told about are
+    then still eight *real* tries, instead of eight knocks inside the first half-hour of an
+    outage after which the product is dropped while the shop is still down.
+    """
+    moment = time.time() if now is None else now
+    next_at = moment + SILENT_RETRY_SECONDS
+    with _db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "UPDATE outbox SET next_at = ?, last_error = ?, updated_at = ?, claim_token = '',"
+            " lease_until = 0 WHERE batch_id = ? AND status = ?",
+            (next_at, (error or "")[:400], moment, entry.batch_id, STATUS_PENDING),
+        )
+    return replace(entry, next_at=next_at, last_error=(error or "")[:400], updated_at=moment)
+
+
+def push_now(batch_id: str, *, user_id: int | str | None = None) -> bool:
+    """Make a waiting item due immediately — «همین حالا» — and report whether it was there.
+
+    Only an unclaimed row is touched: a drain that is mid-flight has a lease, and cutting that
+    lease would let a second attempt publish the same batch while the first is still waiting for
+    the shop. ``False`` therefore also means «الان دارد تلاش می‌شود», and the caller says so.
+    """
+    if not batch_id:
+        return False
+    moment = time.time()
+    sql = ("UPDATE outbox SET next_at = ?, updated_at = ?"
+           " WHERE batch_id = ? AND status = ? AND lease_until <= ?")
+    params: list[Any] = [moment - 1, moment, batch_id, STATUS_PENDING, moment]
+    if user_id is not None:
+        sql += " AND user_id = ?"
+        params.append(str(user_id))
+    try:
+        with _db() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            changed = conn.execute(sql, params).rowcount
+    except (sqlite3.Error, OSError):
+        return False
+    return bool(changed)
+
+
 def stats(*, now: float | None = None) -> dict[str, Any]:
     """What «چند توی صف مونده؟» should answer, and what ``--check-config`` prints."""
+
     moment = time.time() if now is None else now
     try:
         with _db() as conn:

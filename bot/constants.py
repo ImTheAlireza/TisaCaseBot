@@ -20,6 +20,10 @@ class CB:
     WOO_PRODUCT_PING = "ping:woocommerce-product"
     # چهار پرسشِ خواندنیِ سایت، برای کسی که ترمینالِ هاست را ندارد (bot/services/shop_network.py)
     SHOP_NETWORK_PING = "ping:shop-network"
+    # 📤 صفِ ارسالِ خودِ ناشر، با «همین حالا» و «از صف بردار» (bot/modules/outbox_flow.py)
+    QUEUE_SHOW = "queue:show"
+    QUEUE_NOW = "queue:now"
+    QUEUE_DROP = "queue:drop"
     # 📊 وضعیت / 🩺 عیب‌یابی / 📥 متریک‌ها (bot/modules/ops.py)
     OPS_STATUS = "ops:status"
     OPS_DIAGNOSE = "ops:diagnose"
