@@ -80,8 +80,8 @@ def close_for(user_id: int) -> bool:
 INSTRUCTION = (
     "🗜️ <b>فشرده‌سازی عکس‌ها</b>\n\n"
     "پیام‌های عکس‌دار را فوروارد کن؛ عکس فشرده می‌شود و مدل‌ها و ویژگی‌ها از کپشن/متن همراه استخراج می‌شوند.\n"
-    "خروجی همان پارسرِ «📦 ساخت محصول» است — با رنگِ هر مدل، تعداد واریژن، و کلمه‌هایی که "
-    "<i>مدل نشد</i>؛ تا «پیدا نشد» با «خوانده شد و رد شد» یکی به نظر نرسد.\n\n"
+    "کارت همان پارسرِ «📦 ساخت محصول» است، ولی فقط <i>مقادیر</i> را می‌گوید: مدل‌ها و ویژگی‌ها، "
+    "و هر جا چیزی را نخوانده باشد. جزئیاتِ واریژن در لاگِ گروه ثبت می‌شود.\n\n"
     "برای پایان: /cancel"
 )
 
@@ -149,10 +149,10 @@ async def _send_analysis(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> No
     if report_source == context.user_data.get(ANALYSIS_SOURCE_KEY):
         return
     context.user_data[ANALYSIS_SOURCE_KEY] = report_source
-    # Reuse the product-creation flow verbatim: its parser/AI normalization,
-    # learned vocabulary, color matrix, and accessory handling all stay in sync — and the
-    # *whole* answer is shown, including what the parser refused, so a wrong detection is
-    # distinguishable from an empty one.
+    # Reuse the product-creation flow verbatim: its parser/AI normalization, learned vocabulary,
+    # color matrix and accessory handling all stay in sync. The card then states the *values* and
+    # what the parser refused — enough to answer «درست خواند؟» at a glance — while the variation
+    # plan and the rest go to the log below, because this screen writes nothing to the shop.
     from bot.modules.product_flow import analyze_text
 
     extraction_started = time.perf_counter()
@@ -172,8 +172,8 @@ async def _send_analysis(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> No
     folded = analysis.detail()
     if folded:
         # The card is written to be skimmed in three seconds; the log is written to be audited.
-        # Whatever the report folded away — a uniform palette across dozens of models, an AI call
-        # that succeeded, a note about something this screen cannot act on — lands here instead.
+        # Whatever the card leaves out — the variation count, the palette of every model, the AI
+        # chatter, a note about a field this screen cannot act on — lands here instead.
         audit_text += "\nجزئیات (فشرده‌شده در کارت):\n" + folded
     await _log_to_group(context, audit_text, parse_mode="HTML")
     context.user_data[ANALYSIS_REPORT_KEY] = report
