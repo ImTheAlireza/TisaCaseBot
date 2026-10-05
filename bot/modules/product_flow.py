@@ -48,6 +48,7 @@ from bot.config import settings
 from bot.constants import CB
 from bot.services.conversations import FlowConversationHandler
 from bot.keyboards import main_menu_keyboard, main_menu_text, result_card, result_keyboard
+from bot.utils import timeutil
 from bot.modules import outbox_flow, restock_flow
 from bot.services import (
     draft_edits,
@@ -107,7 +108,7 @@ REVIEW = 2
 #: the collecting state, named the way the older handlers speak it
 WAITING = COLLECT
 
-TEMP_DIR = Path("/tmp/tisaposttowp-products")
+TEMP_DIR = settings.temp_dir / "products"
 
 #: How many steps back the card can go. Each snapshot is one draft plus two
 #: short texts — small enough that a handful never matters, deep enough that a
@@ -254,6 +255,11 @@ def _owned_callback(callback):
                 message_id = getattr(query.message, "message_id", None)
                 valid = getattr(session, "status_message_id", None) is None or message_id == session.status_message_id
             if not valid:
+                if session is None and action == "product:force":
+                    # There is no card to go back to (the flow is gone), so the handler's
+                    # own «این جریان بسته شده است» is the honest answer; blaming an «old
+                    # preview» would point the seller at a card that does not exist.
+                    return await callback(update, context)
                 await query.answer("این دکمه متعلق به پیش‌نمایش قبلی است؛ از کارت تازه استفاده کن.", show_alert=True)
                 return None
         if isinstance(session, ProductSession) and user and _pending_media(user.id, session):
@@ -554,6 +560,7 @@ async def _flush_journal(
     )
 
 
+# Test-only: the flow tests render the chat audit with this exact function.
 def _audit_for_chat(lines: list[str]) -> str:
     """Condense the WooCommerce audit into a short diagnostic for operator text.
 
@@ -623,6 +630,7 @@ def _audit_for_chat(lines: list[str]) -> str:
     return "\n".join(parts)
 
 
+# Test-only: the dry-run card builder; the tests check the real renderer, not a copy.
 def _dry_run_report(lines: Sequence[str], budget: int = 3600) -> str:
     """Compatibility wrapper for the dry-run trace format (sent to the log group)."""
     return product_journal.publish_trace_report(lines, dry_run=True, budget=budget)
@@ -635,7 +643,7 @@ def _already_published_note(entry: dict[str, object]) -> str:
     already made — otherwise the answer is «بزن دوباره تا درست شود» and a second
     product, which is the exact bug this gate exists to prevent.
     """
-    when = time.strftime("%Y/%m/%d %H:%M", time.localtime(float(entry.get("ts") or 0)))
+    when = timeutil.strftime("%Y/%m/%d %H:%M", float(entry.get("ts") or 0))
     title = html.escape(str(entry.get("title") or "—"), quote=False)
     ident = entry.get("product_id")
     url = str(entry.get("edit_url") or "")
@@ -754,7 +762,7 @@ def _record_result(
     request (plan 4.3) instead of appending a second card for the same attempt —
     one attempt, one card, whatever the outcome.
     """
-    fields: dict[str, object] = {
+    fields: dict[str, Any] = {
         "status": status,
         "product_id": product_id,
         "edit_url": edit_url,
@@ -782,7 +790,7 @@ def _record_result(
         finished = products_ledger.update(key, **fields)
         if finished is not None:
             return finished
-    return products_ledger.record(user_id=user_id, batch_id=batch_id, key=key, **fields)  # type: ignore[arg-type]
+    return products_ledger.record(user_id=user_id, batch_id=batch_id, key=key, **fields)
 
 
 @guard_feature(_feature_key, on_denial=lambda uid: _cleanup(uid), checker=lambda uid, key: feature_allowed(uid, key))
@@ -800,6 +808,8 @@ async def show_preview(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     return REVIEW
 
 
+# The plugin's contract, not a leftover: `docs/IMPORTER-CONTRACT.md` tells the site
+# to read this manifest out of the uploaded zip.
 def _zip_manifest(
     data: ProductData, *, usable_attributes: dict[str, list[str]], image_mode: str, batch: str,
     mode: str = "new",
@@ -1434,8 +1444,9 @@ def _canonical_category_paths(categories: Sequence[str]) -> list[str]:
 
 def _extract_fingerprint(session: ProductSession) -> str:
     """Stable cache key for parser inputs and learned rules."""
-    return hashlib.sha1(
-        f"{session.model_text}|{session.info_text}|{learning.revision()}".encode()
+    return hashlib.blake2b(
+        f"{session.model_text}|{session.info_text}|{learning.revision()}".encode(),
+        digest_size=20,
     ).hexdigest()
 
 
@@ -2437,10 +2448,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return REVIEW
 
 
-def _target(session: ProductSession | None, fallback: int) -> dict[str, object]:
+def _target(session: ProductSession | None, fallback: int) -> dict[str, Any]:
     """Proactive messages go to the chat (and thread) that started the flow."""
     chat = session.chat_id if session is not None and session.chat_id else fallback
-    kwargs: dict[str, object] = {"chat_id": chat}
+    kwargs: dict[str, Any] = {"chat_id": chat}
     if session is not None and session.thread_id:
         kwargs["message_thread_id"] = session.thread_id
     return kwargs
@@ -2584,7 +2595,7 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             text=_already_published_note(prior),
             reply_markup=_bound(session, InlineKeyboardMarkup([[InlineKeyboardButton(
                 "🔁 با این حال دوباره بساز", callback_data="product:force")]])),
-            **_target(session, user.id),  # type: ignore[arg-type]
+            **_target(session, user.id),
         )
         return REVIEW
     session.force_publish = False

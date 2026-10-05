@@ -168,7 +168,9 @@ async def ai_normalize(
             try:
                 job_log.add(level, message, *args)
             except Exception:
-                pass
+                # The log line below is the primary channel; if the *job* log cannot take
+                # it, say so in the debug log instead of failing (or hiding) silently.
+                logger.debug("could not write to the job log", exc_info=True)
         logger.log(level, message, *args)
 
     if not AI_BASE_URL or not AI_TOKEN or not AI_MODEL:

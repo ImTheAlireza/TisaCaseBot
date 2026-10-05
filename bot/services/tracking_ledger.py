@@ -20,13 +20,13 @@ from __future__ import annotations
 import hashlib
 import logging
 import threading
-import time
 import json
 from pathlib import Path
 from typing import Any
 
 from bot.config import data_dir
 from bot.services.jsonstore import lock_for, read_json, write_json
+from bot.utils import timeutil
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +51,10 @@ def fingerprint(path: str | Path) -> str:
     The hash is of the *bytes*, so renaming a file does not hide a repeat, and
     one re-exported with an extra row does not look like the same file.
     """
-    digest = hashlib.sha1()
+    # blake2b, not sha1: this is a cache key, and sha1 is the one hash whose use the
+    # auditors ask about by name. Same output shape (16 hex chars below) as before —
+    # fingerprints recorded by an older version simply do not match once.
+    digest = hashlib.blake2b(digest_size=8)
     read = 0
     try:
         with open(path, "rb") as handle:
@@ -88,7 +91,7 @@ def remember(fingerprint_value: str, *, user_id: object, fname: str, report: dic
         return None
     entry = {
         "fp": fingerprint_value,
-        "ts": time.time(),
+        "ts": timeutil.now(),
         "user_id": _owner_id(user_id),
         "file": fname,
         "rows": int(report.get("rows") or 0),
@@ -156,7 +159,7 @@ def probe() -> tuple[int, str]:
 
 def describe(entry: dict[str, Any]) -> str:
     """One line a human can decide on: when, what, how clean."""
-    moment = time.strftime("%Y/%m/%d %H:%M", time.localtime(float(entry.get("ts") or 0)))
+    moment = timeutil.strftime("%Y/%m/%d %H:%M", float(entry.get("ts") or 0))
     bits = [
         f'🕒 {moment}',
         f'📄 {entry.get("file") or "?"}',

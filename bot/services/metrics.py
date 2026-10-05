@@ -18,11 +18,13 @@ import logging
 import sqlite3
 import threading
 import time
+import contextlib
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
 from bot.config import data_dir
+from bot.utils import timeutil
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +36,13 @@ _warned = False
 _lock = threading.Lock()
 _schema_lock = threading.Lock()
 _initialized: dict[Path, tuple[int, int]] = {}
+
+#: One connection per thread, kept open. Opening + configuring + closing a connection
+#: for every single counter was 1.5–1.7 ms of *event-loop* time per number — cheap on a
+#: fast disk, a real stall on a shared host, and even the status screen paid it. The key
+#: is (path, file identity), so a replaced or swapped database (tests, a fresh install)
+#: reconnects instead of writing into a deleted inode.
+_local = threading.local()
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS counters (
@@ -99,6 +108,9 @@ RATIOS: dict[str, tuple[str, str, str]] = {
 def _initialize(connection: sqlite3.Connection) -> None:
     """Configure a newly created/replaced database file once."""
     connection.execute("PRAGMA journal_mode=WAL")
+    # Numbers, not money: a power cut losing the last few counters is acceptable, and
+    # FULL would fsync on every increment — the very cost this module used to pay.
+    connection.execute("PRAGMA synchronous=NORMAL")
     connection.executescript(_SCHEMA)
 
 
@@ -123,18 +135,57 @@ def _connect() -> sqlite3.Connection:
     return connection
 
 
+def _key() -> tuple[str, tuple[int, int] | None]:
+    """(path, identity) of the database file — ``None`` while it does not exist yet."""
+    path = Path(DB_PATH)
+    try:
+        stat = path.stat()
+        return str(path), (stat.st_dev, stat.st_ino)
+    except OSError:
+        return str(path), None
+
+
+def _drop() -> None:
+    """Forget this thread's connection (broken handle, or replaced database file)."""
+    connection = getattr(_local, "connection", None)
+    if connection is not None:
+        with contextlib.suppress(sqlite3.Error):
+            connection.close()
+    _local.connection = None
+    _local.key = None
+
+
+def _connection() -> sqlite3.Connection:
+    """This thread's long-lived connection, opened or replaced as needed."""
+    key = _key()
+    connection = getattr(_local, "connection", None)
+    if connection is not None and getattr(_local, "key", None) != key:
+        _drop()
+        connection = None
+    if connection is None:
+        connection = _connect()
+        _local.connection = connection
+        # Read the key *after* connecting: the first call creates the file, and a key
+        # captured before that could never match the next call's.
+        _local.key = _key()
+    return connection
+
+
+def close() -> None:
+    """Close this thread's connection (shutdown, or a test swapping ``DB_PATH``)."""
+    _drop()
+
+
 @contextmanager
 def _db():
-    """Close the short-lived connection; sqlite3's native context only commits."""
-    connection = _connect()
+    """The kept connection: commit on success, forget it on failure."""
+    connection = _connection()
     try:
         yield connection
         connection.commit()
     except Exception:
-        connection.rollback()
+        _drop()
         raise
-    finally:
-        connection.close()
 
 
 def _fail_once(exc: Exception) -> None:
@@ -163,6 +214,7 @@ def _write(key: str, *, by: int, value: float) -> None:
                 (key, by, value, value, time.time()),
             )
     except (sqlite3.Error, OSError) as exc:
+        _drop()
         _fail_once(exc)
 
 
@@ -274,7 +326,7 @@ def export_csv() -> str:
     lines = ["key,counter,n,total,peak,updated_iso"]
     for key, counter in COUNTERS.items():
         n, total, peak, updated = seen.get(key, (0, 0.0, 0.0, 0.0))
-        when = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(updated)) if updated else ""
+        when = timeutil.strftime("%Y-%m-%dT%H:%M:%S", updated) if updated else ""
         lines.append(f'{key},"{counter.label}",{n},{total:g},{peak:g},{when}')
     for name, (numerator, denominator, label) in RATIOS.items():
         value = rate(numerator, denominator)
@@ -306,6 +358,7 @@ __all__ = [
     "COUNTERS",
     "DB_PATH",
     "RATIOS",
+    "close",
     "elapsed",
     "export_csv",
     "incr",

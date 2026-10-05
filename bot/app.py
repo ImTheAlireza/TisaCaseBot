@@ -10,12 +10,12 @@ from telegram.request import HTTPXRequest
 
 from bot import rbac
 from bot.config import settings
-from bot.services import flow_guard
-from bot.services.update_processor import PerUserUpdateProcessor, lock_for_user
-from bot.modules import register_all
+from bot.modules import image_compress, maintenance, product_flow, register_all
 from bot.modules.outbox_flow import start as start_outbox
 from bot.modules.product_flow import notify_interrupted_flows
 from bot.modules.restart import notify_restart_complete
+from bot.services import flow_guard, metrics, worker
+from bot.services.update_processor import PerUserUpdateProcessor, lock_for_user
 from bot.utils.logging import set_current_user
 
 logger = logging.getLogger(__name__)
@@ -98,12 +98,15 @@ async def _post_init(app: Application) -> None:
     # A publish the shop refused (429/5xx) waits in data/outbox.sqlite3 and is retried by
     # itself — including the ones left over from before this restart.
     await start_outbox(app)
+    # Daily zip backup + daily ops report (catch-up at startup if a backup is due).
+    await maintenance.start(app)
 
 
 async def _post_stop(app: Application) -> None:
-    from bot.modules import image_compress, product_flow
     await product_flow.shutdown()
     await image_compress.shutdown()
+    await worker.shutdown()
+    metrics.close()
 
 
 def build_application() -> Application:
@@ -132,6 +135,9 @@ def build_application() -> Application:
         .request(api_request)
         .get_updates_request(polling_request)
         .application_class(PrivateOnlyApplication)
+        # 8 handlers may *run* at once; a tap waiting for its own user's earlier tap
+        # waits in a cheap dispatch slot instead of parking one of those 8 (the reason
+        # «یک نفر چند بار پشت‌سرهم بزند» no longer freezes everyone else).
         .concurrent_updates(PerUserUpdateProcessor(8))
         .post_init(_post_init)
         .post_stop(_post_stop)

@@ -624,7 +624,8 @@ class TestWiring(unittest.TestCase):
         self.assertIn("export_metrics", names)
         readme = (REPO / "README.md").read_text(encoding="utf-8")
         self.assertIn("/export_metrics", readme)
-        for path in ("README.md", "CHANGELOG.md", "docs/runbook.md", "docs/CODE-REVIEW-AND-UPGRADE-PLAN.md"):
+        for path in ("README.md", "CHANGELOG.md", "docs/runbook.md",
+                     "docs/archive/CODE-REVIEW-AND-UPGRADE-PLAN.md"):
             full = REPO / path
             if not full.exists():
                 continue

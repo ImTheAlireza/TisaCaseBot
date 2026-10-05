@@ -93,10 +93,16 @@ required to start.
 | `PRICE_MIN` / `PRICE_MAX` | no | Sanity range for a parsed price in toman (defaults `1000` / `500000000`). Anything outside is reported instead of published. |
 | `REQUIRE_MODELS` | no | Opt-in strict validation: `yes` blocks products with no detected model. Default `no`; model-less products are allowed and can be created as simple products. |
 | `TISA_DATA_DIR` | no | Where the JSON stores live (roles, publish history, learned rules). Default `./data`. On a shared host point it **out of the code directory** (e.g. `/var/lib/tisaposttowp`) so a redeploy or `git clean` cannot delete the shop's history. `python main.py --check-config` prints the resolved path and **fails** if it is not writable — the JSON writers never raise. |
+| `TISA_TEMP_DIR` | no | Where per-session work directories live (downloads, compressed photos). Default `<TISA_DATA_DIR>/tmp`. On a shared host point it at an owner-only directory: a predictable path under `/tmp` can be created first by another account. A symlink is refused on purpose. |
+| `TISA_BACKUP_DIR` | no | Where daily rotating zip backups land (state JSONs + both SQLite DBs + the outbox file queue). Default `<TISA_DATA_DIR>/backups`. The directory is created `0700` and each zip is `0600` — these are the shop's data. |
+| `TISA_BACKUP_KEEP` | no | How many daily zips to keep before rotation (default `7`, clamped to `1..365`). |
+| `TISA_DAILY_REPORT_HOUR` | no | Hour (0–23, in `TISA_TZ`) at which a short ops report is sent to `LOG_CHAT_ID` (default `9`; `0` disables the report; backups still run at 04:00). Requires `LOG_CHAT_ID` to be set. |
+| `TISA_TZ` | no | IANA time zone for all user-visible timestamps and daily jobs (default `Asia/Tehran`). A misspelled name falls back to the default and is reported in the start log. |
 | `TISA_DRY_RUN` | no | `yes` = rehears every publish: the real payload is built and sent to a fake transport, so **nothing is written on the shop** (default `no`). See [dry-run](#-حالت-آزمایشی-انتشار-dry-run). |
 | `FLOW_TIMEOUT_SECONDS` | no | Idle time before a product flow is closed and its temp files deleted (default `900`). |
 | `TEMP_TTL_HOURS` | no | Age after which leftover `/tmp` workspaces are swept (default `12`). |
 | `MAX_FILE_MB` / `MAX_ROWS` / `PROCESS_TIMEOUT_SECONDS` | no | Limits for the tracking-file converter. |
+| `WORKER_MEMORY_MB` | no | Memory (MB) **one file** may spend in the converter's worker process, *on top of* what that process already holds (python + pandas + the host's own limit). Default `768`. Not a ceiling for the whole process — that is what made a 22 KB file fail with `MemoryError` on a host whose imports already filled the old absolute cap. Raise it if a file is refused with «حافظهٔ پردازش پر شد»; `logs/bot.log` prints baseline + budget + cap + headroom for every worker. |
 | `BARCODE_LENGTHS` | no | Accepted barcode digit counts, comma-separated (default `24`). |
 | `WOOCOMMERCE_URL` | no | Store URL used by the WooCommerce REST connection test. |
 | `WOOCOMMERCE_CONSUMER_KEY` / `WOOCOMMERCE_CONSUMER_SECRET` | no | WooCommerce REST API credentials used by the Ping diagnostic and the direct product writer. |
@@ -109,7 +115,7 @@ required to start.
 
 ### 📦 تبدیل فایل کد رهگیری (tracking-file converter)
 
-فایل سفارش (اکسل / CSV / PDF خروجی سامانه تیساکیس و تیسا چاپ) را می‌گیرد و:
+فایل سفارش (اکسل `xlsx`/`xlsm` / CSV / PDF خروجی سامانه تیساکیس و تیسا چاپ) را می‌گیرد و:
 
 1. ستون‌های **بارکد** و **کد سفارش** را از سطر عنوان پیدا می‌کند. اگر دو ستون محتمل
    باشد (مثلاً هم «بارکد» و هم «کد رهگیری») **می‌پرسد** و حدس نمی‌زند — حدس یعنی
@@ -128,6 +134,24 @@ required to start.
 
 > کد سفارش‌های خالی در CSV **خالی** می‌مانند تا خودت تکمیل کنی.
 
+**فایل همان‌طور که از سامانه می‌آید خوانده می‌شود، نه آن‌طور که ما انتظار داریم:**
+
+| ورودی | قبلاً | حالا |
+|---|---|---|
+| CSV با جداکنندهٔ `;` یا tab (اکسل فارسی همین را می‌نویسد) | «ستون بارکد پیدا نشد» | همان جدول خوانده می‌شود و خلاصه می‌گوید جداکننده‌اش چه بود |
+| CSV با کدگذاری cp1256 یا utf-16 («Unicode Text») | «خطا در پردازش» | خوانده می‌شود |
+| اکسل چندبرگه‌ای که جدولش در برگهٔ دوم است | سؤال از ستون‌های برگهٔ اول | برگهٔ جدول پیدا می‌شود و لینکِ سطرها (`سفارش‌ها!B2`) به همان برگه اشاره می‌کند |
+| فایلی که پنل به‌نام اکسل می‌دهد ولی جدولِ HTML/XML است | «File is not a zip file» | جدولش خوانده می‌شود و خلاصه می‌گوید چطور |
+| PDF با حاشیه/چیدمانِ متفاوت (تنظیمِ چاپ عوض شده) | «ساختار PDF شناخته نشد» | بارکد از خودِ سند پیدا می‌شود (طولِ عدد، نه مختصاتِ ثابت) |
+| فایل خراب/نصفه‌دانلودشده یا xlsِ قدیمی | متنِ انگلیسیِ pandas | جملهٔ فارسی + راه‌حل: چه بفرست |
+| فایل `.xls` (اکسل ۹۷–۲۰۰۳) | «فقط xlsx / csv / pdf» و بدونِ راهِ حل | جملهٔ «Save As → xlsx» (فایل‌های `.xlsm` هم حالا پذیرفته می‌شوند) |
+| فایلِ **کوچک** روی هاستی که سقفِ حافظه‌اش پر است | «خطای فنی: MemoryError» (یا `MemoryError` خام) — در هر سه فرمت | «حافظهٔ پردازشِ ربات پر است…» + دو کارِ دقیق: `WORKER_MEMORY_MB` و سقفِ خودِ هاست؛ عددها در `logs/bot.log` |
+
+هر خطای این جریان با **راه‌حل** تمام می‌شود (ذخیرهٔ دوباره به xlsx، گرفتنِ خروجیِ CSV/PDF از
+سامانه، یا تقسیمِ فایل) — «❌ خطا در پردازش» تنها جواب نیست. اگر پردازش وسطِ کار بمیرد
+(حافظهٔ ورکر یا ری‌استارتِ ربات) پیام می‌گوید فایل را به بخش‌های کوچک‌تر تقسیم کن. یک PDF
+اسکن‌شده (بی‌عدد) هم با همین جملهٔ روشن رد می‌شود، نه با `tracking.csv` خالی و ✅.
+
 **`needs-review.xlsx` فرم است، نه فقط گزارش:** ستون بارکدش «متن» است (پس اکسل دوباره
 رقم‌هایش را نمی‌خورد)، بارکدی که کلاً از دست رفته سلولش **خالی** است، و سطر عنوانش
 قالبی است که خودِ ربات می‌فهمد — یعنی اصلاحش کن و **همین فایل را دوباره بفرست** تا
@@ -143,8 +167,14 @@ required to start.
 ردیف، و `PROCESS_TIMEOUT_SECONDS` (پیش‌فرض ۱۲۰) زمان پردازش. رد شدن یعنی **پیام با
 دلیل و راهِ حل**، نه فایل نصفه‌نیمه یا بی‌خبر رفتن.
 
+**حافظهٔ پردازش:** هر فایل در یک پردازهٔ جدای محدود پردازش می‌شود و سقفش
+«آن‌چه آن پردازه همین حالا دارد + `WORKER_MEMORY_MB`» است — یعنی بودجهٔ *فایل*، نه سقفِ کلِ
+پردازه. اگر سرور/سوپروایزر سقفِ خودش را داشته باشد (`ulimit -v`، systemd `LimitAS`) همان
+برنده است و پیامِ خطا همان را نام می‌برد. عددهای واقعی (پایه، بودجه، سقف، فضای آزاد) برای
+هر کارگر در `logs/bot.log` نوشته می‌شوند.
+
 **جریان کار:** دکمه «📦 تبدیل فایل کد رهگیری» → فایل را به‌صورت Document بفرست
-(`.xlsx` / `.csv` / `.pdf`) → خروجی‌ها را بگیر → فایل بعدی، یا «⬅️ بازگشت به منو» /
+(`.xlsx` / `.xlsm` / `.csv` / `.pdf`) → خروجی‌ها را بگیر → فایل بعدی، یا «⬅️ بازگشت به منو» /
 `/cancel`. اگر بعد از سؤال ۱۵ دقیقه (`FLOW_TIMEOUT_SECONDS`) خبری نشود، جریان بسته
 می‌شود و فایلِ دانلود‌شدهٔ پردازش‌نشده پاک می‌شود؛ دایرکتوری
 `/tmp/tisaposttowp-tracking` هم ساعتی یک‌بار جارو می‌شود.
@@ -849,6 +879,8 @@ docs/CONTRACT-TESTS.md       # 🧪 چطور تست قرارداد را محلی
 requirements-dev.txt         # ابزار تست: pytest / pytest-cov / ruff / mypy / hypothesis
 plugin/tisa-product-importer/ # 📦 سورس افزونهٔ ZIP (زیپِ رپو خروجیِ همین است)
 scripts/build_plugin_zip.py  # 📦 بیلدِ قطعیِ tisa-product-importer.zip (--check در CI)
+tools/simulate_*.py          # 🧪 شبیه‌سازهای فلوی محصول/اپدیت (ابزار توسعه، نه استقرار)
+docs/archive/                # 🗃️ طرحِ کد-ریویو و گزارش‌های بازبینیِ بسته‌شده (تاریخی)
 bot/
 ├── config.py                # Settings loaded from .env (BOT_TOKEN, SUDO_IDS, …)
 ├── rbac.py                  # role logic: sudo/admin/user + admin persistence
@@ -969,13 +1001,13 @@ silently), and enforces **two** coverage floors: ۷۵٪ روی کل `bot` و ۸�
 
 `docs/MANUAL-TEST-CHECKLIST.md` — **چک‌لیستِ تستِ دستی** (فازهای ۰ تا ۹، یک‌جا): هر بند می‌گوید چه بفرستی، روی چه دکمه‌ای بزنی و دقیقاً چه چیزی باید ببینی؛ برای اجرای خودکار چیزهایی که اینجا نمی‌شود آزمود.
 
-`scripts/simulate_product_flow.py` — **شبیه‌سازیِ کاملِ فلوی محصول** بدون تلگرام و
+`tools/simulate_product_flow.py` — **شبیه‌سازیِ کاملِ فلوی محصول** بدون تلگرام و
 بدون سایت: همان هندلرهای واقعی را با یک تلگرامِ ساختگی اجرا می‌کند و گام‌به‌گام
 چاپ می‌کند چه ورودی‌ای پذیرفته شد، کدام بخش تحلیل اجرا شد (پارسر قطعی، ماتریس
 موجودی، AI، اعتبارسنجی)، کارت مرحله‌به‌مرحله چه شد، و در پایان چه چیزی به ووکامرس
 می‌رفت. با `TISA_DRY_RUN` کار می‌کند و هیچ درخواستی به بیرون نمی‌فرستد؛ داده‌ها هم
 در `/tmp/tisa-product-sim` می‌مانند، نه در `data/`. اجرا:
-`.venv/bin/python scripts/simulate_product_flow.py`.
+`.venv/bin/python tools/simulate_product_flow.py`.
 
 تست قرارداد (`tests/test_contract_wordpress.py` + `docker-compose.yml`) بیرون از محیط
 Docker خاموش است؛ اجرا و توضیحش در `docs/CONTRACT-TESTS.md`.
@@ -1011,6 +1043,13 @@ parser test shows a real with/without-rules diff without writing to the corpus.
 `tests/test_phone_parser.py` covers the bare-amount regression: a price line must
 never become a phone model, while genuine model lines (`17`, `17promax`, `7/8`,
 `XSMax`) keep working.
+
+`tests/test_csv_columns.py` covers the wide-export regression: a 600-column CSV keeps all
+600 columns (the old reader silently dropped everything past 512, so a barcode at index 590
+simply was not there), a line wider than the header still counts, and a file past the 4096
+column cap gets a sentence instead of a truncated table. `tests/test_app_gate.py` covers the
+one gate every update passes — group chats are dropped, a stranger is denied before any
+handler, `/start` stays reachable for invites, and an allowed user is not denied.
 
 Both runners stay green with no third-party dependencies installed — the tests
 that need `httpx` or `python-telegram-bot` skip themselves.

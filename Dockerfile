@@ -28,9 +28,9 @@ USER tisa
 
 # همان دریچه‌ای که CI می‌گذراند: با .env ناقص (SUDO_IDS خالی، دیسکِ نوشتنی نبودن)
 # کانتینر «سالم» بالا نمی‌آید — healthcheck قرمز می‌شود و `docker ps` آن را نشان می‌دهد.
-# توجه: این بررسی هیچ درخواست شبکه‌ای نمی‌زند.
+# --build-app همهٔ هندلرها را می‌سازد ولی هیچ درخواستِ تلگرامی/ووکامرس نمی‌زند.
 HEALTHCHECK --interval=60s --timeout=25s --start-period=20s --retries=3 \
-    CMD ["python", "main.py", "--check-config"]
+    CMD ["python", "main.py", "--build-app"]
 
 VOLUME ["/var/lib/tisaposttowp"]
 

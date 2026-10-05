@@ -343,13 +343,28 @@ def test_A29_english_airpods_axis_is_reused_not_duplicated():
     assert len([axis for axis in (result.attributes or current.attributes) if airpods_parser.is_airpods_attribute(axis["name"])]) == 1
 
 
-def test_A30_common_variation_ids_keep_all_unmentioned_metadata():
+def test_A30_common_combinations_keep_the_values_the_seller_did_not_rewrite():
+    """فهرستِ عوض‌شده = بازسازی (docs/UPDATE-FLOW.md)، پس شناسه‌ها عوض می‌شوند.
+
+    چیزی که نمی‌نویسی گم نمی‌شود: هر ترکیبِ ازقبل‌موجود مقادیرش (قیمت، موجودی، وضعیت، عکس)
+    را به نسخهٔ تازهٔ همان ترکیب می‌دهد. متادیتای دستیِ واریژن (SKU/وزن/توضیح) — همان‌طور که
+    در سند نوشته شده — هزینهٔ «پاک و از نو» است و منتقل نمی‌شود.
+    """
     current = product()
     result = update_plan.build(current, {"models": ["iPhone 13", "iPhone 14", "iPhone 15"]})
-    assert not result.deletes and not result.regenerate
-    assert result.kept == 2 and len(result.creates) == 1
-    assert result.creates[0].model == "iPhone 15"
-    assert not result.updates
+    assert result.regenerate and not result.updates and result.kept == 0
+    assert sorted(row.variation_id for row in result.deletes) == [80, 81]
+    assert [row.model for row in result.creates] == ["iPhone 13", "iPhone 14", "iPhone 15"]
+    common = {row.model: row for row in result.creates if row.model != "iPhone 15"}
+    for label, old_id in (("iPhone 13", 80), ("iPhone 14", 81)):
+        row = common[label]
+        assert row.replaces is not None and row.replaces.variation_id == old_id
+        assert (row.price, row.stock, row.post_status) == (600000, 5, "publish")
+        assert {"price", "stock", "status"} <= set(row.carried)
+    fresh = next(row for row in result.creates if row.model == "iPhone 15")
+    assert fresh.replaces is None and fresh.stock is None, "ترکیبِ تازه بدون شمارش ساخته می‌شود"
+    assert fresh.price == 600000, "قیمت ترکیبِ تازه از گروهش می‌آید و هشدار داده می‌شود"
+    assert any("ننوشتی" in warning for warning in result.warnings)
 
 
 def test_A31_review_files_do_not_execute_input_formulas():
@@ -435,6 +450,25 @@ def test_B09_active_workspaces_survive_the_janitor(isolated):
     assert workspace.sweep(root, 1) == 0 and directory.is_dir()
     workspace.remove(directory)
     assert not directory.exists()
+
+
+def test_B09b_a_symlinked_work_root_is_refused_not_trusted(isolated):
+    """روی هاست اشتراکی، مسیرِ قابل‌حدس را می‌شود از قبل ساخت — یا symlink کرد."""
+    root = isolated / "temp"
+    elsewhere = isolated / "elsewhere"
+    elsewhere.mkdir()
+    root.symlink_to(elsewhere, target_is_directory=True)
+    with pytest.raises(PermissionError):
+        workspace.new_dir(root, 7)
+
+
+def test_B09c_an_old_shared_work_root_is_tightened(isolated):
+    root = isolated / "temp"
+    root.mkdir()
+    root.chmod(0o777)
+    child = workspace.new_dir(root, 7)
+    assert (root.stat().st_mode & 0o077) == 0, "ریشهٔ کار باید ۰۷۰۰ شود"
+    assert (child.stat().st_mode & 0o077) == 0, "پوشهٔ هر کاربر هم ۰۷۰۰ می‌ماند"
 
 
 def test_C03_matrix_is_bounded_before_allocating_millions_of_rows():

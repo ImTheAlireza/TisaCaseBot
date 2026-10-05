@@ -483,7 +483,8 @@ class TestFlowDryRun(unittest.IsolatedAsyncioTestCase):
         update, _seen = query_update("product:confirm", user_id=7, chat_id=9)
         ctx = make_context(Bot())  # type: ignore[arg-type]
         log_chat_id = -1001234567890
-        with patched_settings(_dry_settings(log_chat_id=log_chat_id)):
+        # temp_ledger() نقشِ ادمینِ کاربر ۷ را می‌سازد تا «ادمینِ غیر sudo» واقعاً ادمین باشد.
+        with temp_ledger(), patched_settings(_dry_settings(log_chat_id=log_chat_id)):
             result = await PF.confirm(update, ctx)
         self.assertEqual(PF.ConversationHandler.END, result)
         sent = bot.messages

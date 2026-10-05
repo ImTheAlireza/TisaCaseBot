@@ -449,13 +449,16 @@ class TestDrainingTheQueue(QueueTestCase):
             self.assertEqual(0, await self._drain())
         self.assertEqual(1, outbox.pending(), "در حالت آزمایشی صف دست‌نخورده می‌ماند")
 
-    async def test_start_schedules_and_runs_once_after_a_restart(self) -> None:
+    async def test_start_schedules_a_boot_pass_and_a_repeating_sweep(self) -> None:
         self.enqueue(batch="boot1234boot", delay=0.0)
         jobs: list[dict] = []
 
         class Queue:
+            def run_once(self, callback, **kwargs):
+                jobs.append({"callback": callback, "name": kwargs.get("name")})
+
             def run_repeating(self, callback, **kwargs):
-                jobs.append({"callback": callback, **kwargs})
+                jobs.append({"callback": callback, "name": kwargs.get("name")})
 
         app = type("App", (), {})()
         app.job_queue = Queue()
@@ -466,9 +469,11 @@ class TestDrainingTheQueue(QueueTestCase):
 
         app.bot.send_message = send_message
         await outbox_flow.start(app)
-        self.assertEqual(1, len(jobs), "صف باید زمان‌بندی شود")
-        self.assertEqual("outbox_drain", jobs[0]["name"])
-        self.assertEqual(0, outbox.pending(), "موردِ رسیده در لحظهٔ استارت معطل نمی‌ماند")
+        self.assertEqual(["outbox_drain_boot", "outbox_drain"], [job["name"] for job in jobs],
+                         "استارت: یک پاسِ بی‌فاصله + یک جاروی تکرارشونده")
+        # PTB پاسِ when=0 را در نخستین تیک اجرا می‌کند؛ همان پاس باید موردِ رسیده را بفرستد.
+        await jobs[0]["callback"](type("Ctx", (), {"application": app})())
+        self.assertEqual(0, outbox.pending(), "موردِ رسیده در نخستین پاسِ استارت معطل نمی‌ماند")
         self.assertEqual(1, len(self._calls))
 
 

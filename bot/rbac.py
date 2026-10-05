@@ -77,20 +77,45 @@ def _load() -> dict:
     return data
 
 
-def _save(data: dict) -> None:
-    with _lock:
-        checked_write(ROLES_FILE, data, write_json)
-
-
 # --- Admins -------------------------------------------------------------------
 
-def admins() -> dict:
-    """Confirmed admins as ``{str(id): record}`` (pending invites excluded)."""
-    return {
+#: ``(ROLES_FILE, signature, {id: record})`` — see :func:`_confirmed_admins`.
+_admin_cache: tuple[object, object, dict[str, dict]] | None = None
+
+
+def _roles_signature() -> tuple[int, int, int, int] | None:
+    try:
+        info = ROLES_FILE.stat()
+    except OSError:
+        return None
+    return info.st_mtime_ns, info.st_ctime_ns, info.st_size, info.st_ino
+
+
+def _confirmed_admins() -> dict[str, dict]:
+    """Confirmed admins, re-derived only when ``roles.json`` really changed.
+
+    The signature is the freshness rule :mod:`jsonstore` already uses for its own read
+    cache (mtime/ctime/size/inode), so this cannot serve stale *security* state: any
+    write — ours or an editor's — changes the signature and the next call reloads. What
+    it saves is the per-call deepcopy + dict build for the menus and the button policy,
+    which ask the same question once per button.
+    """
+    global _admin_cache
+    signature = _roles_signature()
+    if _admin_cache is not None and _admin_cache[0] == ROLES_FILE and _admin_cache[1] == signature:
+        return _admin_cache[2]
+    admins = {
         str(uid): dict(record or {})
         for uid, record in _load()["admins"].items()
         if isinstance(record, dict) and not record.get("pending")
     }
+    _admin_cache = (ROLES_FILE, signature, admins)
+    return admins
+
+
+def admins() -> dict:
+    """Confirmed admins as ``{str(id): record}`` (pending invites excluded)."""
+    return {uid: dict(record) for uid, record in _confirmed_admins().items()}
 
 
 def pending_invites() -> dict:
@@ -108,8 +133,7 @@ def pending_invites() -> dict:
 def is_admin(user_id: int | None) -> bool:
     if not user_id:
         return False
-    record = _load()["admins"].get(str(user_id))
-    return isinstance(record, dict) and not record.get("pending")
+    return str(user_id) in _confirmed_admins()
 
 
 def role(user_id: int | None) -> str:

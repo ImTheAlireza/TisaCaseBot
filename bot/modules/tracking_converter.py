@@ -51,6 +51,7 @@ from bot.services.conversations import FlowConversationHandler
 from bot.keyboards import main_menu_keyboard, main_menu_text
 from bot.services import flow_guard, metrics, processor, tracking_ledger, worker, workspace
 from bot.services.access import guard_feature
+from bot.utils.ui import answer_and, answer_and_edit
 
 logger = logging.getLogger(__name__)
 
@@ -59,9 +60,18 @@ ASK_FILE = 0
 MAP_COLUMNS = 1
 DUPLICATE_FILE = 2
 
-ALLOWED_EXTS = {".xlsx", ".csv", ".pdf"}
+ALLOWED_EXTS = {".xlsx", ".xlsm", ".csv", ".pdf"}
+
+#: پسوندهایی که نمی‌پذیریم — با راهِ حلِ خودشان. «دوباره بفرست» برای فایل xls یعنی
+#: فرستادنِ همان فایلِ xls؛ جمله باید بگوید چطور xlsx شود.
+_UNSUPPORTED_HINTS = {
+    ".xls": "این فایل اکسل قدیمی (xls) است؛ در اکسل بازش کن و «Save As → Excel Workbook (*.xlsx)» بزن.",
+    ".ods": "این فایل LibreOffice است؛ در همان برنامه «Save As → xlsx» بزن.",
+    ".txt": "این فایل متنی است؛ پسوندش را به csv تغییر بده (اگر جدولِ جداکننده‌دار است).",
+    ".numbers": "این فایل Numbers است؛ از آن «Export → Excel» بگیر.",
+}
 #: Where a download waits between messages (swept, like the product flow's workspace).
-TEMP_DIR = Path("/tmp/tisaposttowp-tracking")
+TEMP_DIR = settings.temp_dir / "tracking"
 PENDING_KEY = "tisa_tracking_pending"
 _active_contexts: dict[int, ContextTypes.DEFAULT_TYPE] = {}
 
@@ -86,24 +96,39 @@ def _limits_line() -> str:
     return f"سقف‌ها: {settings.limits_line}"
 
 
+#: پیامِ ورودِ جریان: فقط «چه بفرست». توضیحِ گام‌ها، هشدارها و خطِ سقف‌ها حذف شد
+#: (خواستهٔ صاحب ربات: «خیلی توضیح اضافه دارد»). همین سقف‌ها همان‌جایی گفته می‌شوند که
+#: به کار می‌آیند — «🚧 …» کنارِ خودِ خطا و «📊 وضعیت» — تا دو نسخهٔ مختلف از یک قول نداشته باشیم.
 INSTRUCTIONS = (
     "📦 <b>تبدیل فایل کد رهگیری</b>\n\n"
     "یک فایل با یکی از این فرمت‌ها بفرست (به‌صورت Document، نه عکس):\n"
-    "📊 اکسل (<code>.xlsx</code>) — خروجی جدول سفارش‌ها\n"
+    "📊 اکسل (<code>.xlsx</code> / <code>.xlsm</code>) — خروجی جدول سفارش‌ها\n"
     "📄 CSV (<code>.csv</code>)\n"
-    "📑 PDF (<code>.pdf</code>) — خروجی مستقیم سامانه تیساکیس / تیسا چاپ\n\n"
-    "ربات این کارها را می‌کند:\n"
-    "1️⃣ ستون «بارکد» و «کد سفارش» را پیدا می‌کند؛ اگر دو ستون محتمل باشد، <b>می‌پرسد</b>\n"
-    "2️⃣ مشکلات را گزارش می‌دهد (خالی، تکراری، فرمت اشتباه، بارکد خراب‌شده در اکسل)\n"
-    "3️⃣ فایل <code>tracking.csv</code> با ستون‌های <code>order_id,tracking_code</code> می‌سازد\n"
-    "4️⃣ سطرهایی که باید بررسی شوند در <code>needs-review.xlsx</code> می‌آیند — اصلاحش کن و "
-    "همان فایل را دوباره بفرست\n\n"
-    "⚠️ کد سفارش‌های خالی در CSV خالی می‌مانند تا خودت تکمیل کنی.\n"
-    "⚠️ بارکدی که اکسل عددش کرده و رقم‌هایش را خورده، هرگز در CSV نوشته نمی‌شود.\n\n"
-    f"🚧 {_limits_line()}"
+    "📑 PDF (<code>.pdf</code>) — خروجی مستقیم سامانه تیساکیس / تیسا چاپ"
 )
 
 NEXT_FILE_TEXT = "📤 فایل بعدی را بفرست، یا برگرد به منو."
+
+#: راهِ حلِ هر پسوند — «چه بفرستم» به‌جای «دوباره امتحان کن». Every functional error in
+#: this flow ends with one of these, because «خطا در پردازش» alone sends the warehouse
+#: back to the same file.
+_EXCEL_HINT = (
+    "راه‌حل: فایل را در اکسل باز کن و «Save As → Excel Workbook (*.xlsx)» بزن، "
+    "یا همان گزارش را از سامانه به‌صورت CSV/PDF بگیر."
+)
+_RECOVERY_HINTS = {
+    ".xlsx": _EXCEL_HINT,
+    ".xlsm": _EXCEL_HINT,
+    ".csv": (
+        "راه‌حل: خروجی CSV را دوباره از سامانه بگیر (جداکننده یا کدگذاری‌اش ممکن است خراب شده باشد)، "
+        "یا همان گزارش را به‌صورت اکسل/PDF بفرست."
+    ),
+    ".pdf": "راه‌حل: اگر PDF اسکن‌شده یا عکس است، خروجیِ متنی (اکسل/CSV) همان گزارش را از سامانه بگیر.",
+}
+
+
+def _recovery_hint(path) -> str:
+    return _RECOVERY_HINTS.get(Path(path).suffix.lower() or "", _RECOVERY_HINTS[".xlsx"])
 
 
 def _cancel_keyboard() -> InlineKeyboardMarkup:
@@ -153,9 +178,8 @@ async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     flow_guard.close_others("tracking", user.id)
     close_for(user.id)
     _active_contexts[user.id] = context
-    await query.answer()
     logger.info("User %s entered tracking-converter flow", user.id)
-    await query.edit_message_text(INSTRUCTIONS, reply_markup=_cancel_keyboard(), parse_mode="HTML")
+    await answer_and_edit(query, INSTRUCTIONS, reply_markup=_cancel_keyboard(), parse_mode="HTML")
     return ASK_FILE
 
 
@@ -171,8 +195,10 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 
     _release(context)  # an abandoned question from the previous file is gone now
     if ext not in ALLOWED_EXTS:
+        hint = _UNSUPPORTED_HINTS.get(ext)
         await msg.reply_text(
-            "❌ فقط فایل‌های xlsx / csv / pdf پشتیبانی می‌شوند. دوباره بفرست.",
+            "❌ فقط فایل‌های xlsx / xlsm / csv / pdf پشتیبانی می‌شوند."
+            + (f"\n{hint}" if hint else " دوباره بفرست."),
             reply_markup=_cancel_keyboard(),
         )
         return ASK_FILE
@@ -237,9 +263,35 @@ async def _run(path: Path, fname: str, layout: processor.Layout | None = None):
         )
     except processor.RowLimitError as exc:
         return f"🚧 {exc}\n\nسقف‌ها در .env قابل تغییرند (MAX_ROWS / MAX_FILE_MB)."
+    except (worker.WorkerNoMemory, MemoryError) as exc:
+        # خودِ ربات جا ندارد، نه فایل: تا امروز این حالت یک «❌ خطا در پردازش: MemoryError»
+        # بی‌توضیح بود (فایل ۲۲KB هم همین را می‌گرفت). حالا جمله می‌گوید چه چیزی را بالا ببرد.
+        logger.error("tracking worker is out of memory: %s", exc)
+        return (
+            "🚧 حافظهٔ پردازشِ ربات پر است و این فایل — هرچقدر هم کوچک — جا نشد.\n"
+            "دو کار: ۱) WORKER_MEMORY_MB را در .env بالا ببر (و ربات را ری‌استارت کن)؛ "
+            "۲) اگر سرور/سوپروایزر خودش سقف دارد (`ulimit -v`، systemd `LimitAS`)، همان را "
+            "بالا ببر.\n"
+            "اعدادِ دقیق — پایه، سقف و فضای آزادِ کارگر — در logs/bot.log نوشته شده‌اند."
+        )
+    except worker.WorkerCrash:
+        # The child died (memory/CPU cap) or the bot was restarted mid-file. There is no
+        # sentence to translate, only something to do: split the file.
+        logger.exception("tracking worker stopped mid-file: %s", fname)
+        return (
+            "🚧 پردازش این فایل وسطِ کار متوقف شد — فایل برای حافظهٔ ربات سنگین بود یا ربات "
+            "ری‌استارت شد.\n"
+            "فایل را به دو یا چند بخش کوچک‌تر تقسیم کن و هر بخش را جدا بفرست؛ "
+            "یا از سامانه خروجی CSV بگیر (سبک‌تر از اکسل است).\n\n"
+            f"🚧 {_limits_line()}"
+        )
     except Exception as exc:  # pragma: no cover — parser-level
         logger.exception("tracking file failed: %s", fname)
-        return f"❌ خطا در پردازش:\n{exc}\n\nفایل دیگری بفرست یا برگرد به منو."
+        reason = str(exc).strip() or type(exc).__name__
+        return (
+            f"❌ خطا در پردازش:\n{reason}\n\n{_recovery_hint(path)}\n"
+            f"(جزئیاتِ فنی در logs/bot.log)\n{NEXT_FILE_TEXT}"
+        )
 
 
 def _record(context: ContextTypes.DEFAULT_TYPE, report: processor.Report) -> None:
@@ -260,10 +312,16 @@ def _record(context: ContextTypes.DEFAULT_TYPE, report: processor.Report) -> Non
 
 
 async def _drop_status(status) -> None:
+    """Remove the «⏳ پردازش…» bubble — cosmetic, so a refusal is not an error.
+
+    It is still *counted*: a steady stream of failures means something is wrong with the
+    chat (a deleted message, no permission), and that used to be completely invisible.
+    """
     try:
         await status.delete()
     except Exception:  # pragma: no cover — best effort
-        pass
+        metrics.incr("status_delete_failed")
+        logger.debug("could not remove the progress message", exc_info=True)
 
 
 async def _send_report(msg, status, report: processor.Report) -> None:
@@ -444,9 +502,8 @@ async def on_retry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def on_send_another(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """«📤 فایل دیگری بفرست» → drop this one, stay in the flow."""
     query = update.callback_query
-    await query.answer()
     _release(context)
-    await query.message.reply_text(NEXT_FILE_TEXT, reply_markup=_cancel_keyboard())
+    await answer_and(query, query.message.reply_text(NEXT_FILE_TEXT, reply_markup=_cancel_keyboard()))
     return ASK_FILE
 
 
@@ -467,14 +524,15 @@ async def cb_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """«بازگشت به منو» button → end flow, show main menu."""
     query = update.callback_query
     user = update.effective_user
-    await query.answer()
     if user:
         close_for(user.id)
     _release(context)
-    await query.edit_message_text(
+    await answer_and_edit(
+        query,
         main_menu_text(user.id if user else None, user),
         reply_markup=main_menu_keyboard(user.id if user else None),
         parse_mode="HTML",
+        quiet=True,
     )
     return ConversationHandler.END
 

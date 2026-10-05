@@ -432,6 +432,7 @@ def parse_sources(sources: list[tuple[str, str]]) -> list[Block]:
     return out
 
 
+# Test-only: builds role-filtered blocks for the parser tests.
 def with_role(blocks: list[Block], role: str) -> list[Block]:
     return [block for block in blocks if block.has(role)]
 

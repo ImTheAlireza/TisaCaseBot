@@ -66,20 +66,36 @@ def _data(**over: object) -> ProductData:
     return data
 
 
+_GHOST_ATTRIBUTES = [
+    {"name": "مدل", "visible": True, "variation": True, "options": ["iPhone 15", "S24 Ultra"]},
+    {"name": "رنگ", "visible": True, "variation": True, "options": ["مشکی", "سفید"]},
+]
+
+
 def _ghost(batch: str, *, product_id: int = 5555) -> dict:
-    """محصولی که از تلاش قبلی مانده: همان محتوا، همان برچسب تلاش."""
+    """محصولی که از تلاش قبلی مانده: همان محتوا، همان برچسب تلاش.
+
+    یک ردیفِ کاملِ ووکامرس است، چون کدِ resume پیش از پذیرفتنش، نوع/وضعیت/ویژگی‌ها و
+    گالری را با پیش‌نمایش جور می‌کند (نگهبانِ «محصول عوض شده»).
+    """
     return {
         "id": product_id,
         "name": "قاب گوشی اپل",
+        "type": "variable",
         "sku": "IP151",
         "status": "draft",
+        "attributes": _GHOST_ATTRIBUTES,
+        "images": [],
         "meta_data": [{"key": publish_batch.META_BATCH, "value": batch}],
     }
 
 
-def _variation(model: str, color: str) -> dict:
+def _variation(model: str, color: str, *, variation_id: int = 7000) -> dict:
+    """واریژنی که از تلاش قبلی مانده — با قیمت/وضعیتی که آن تلاش نوشته بود."""
     return {
-        "id": 7000,
+        "id": variation_id,
+        "status": "publish",
+        "regular_price": "100000",
         "attributes": [{"name": "مدل", "option": model}, {"name": "رنگ", "option": color}],
     }
 
@@ -253,6 +269,9 @@ class TestResumeOnTheShop(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([], store.product_searches, "تلاش اول نه جستجوی resume دارد نه GET تأیید SKU")
         self.assertEqual(
             [
+                # The native fence is checked first; it is deliberately a read, not a
+                # write, and it is the only health probe of the whole publish.
+                ("GET", "/wp-json/wc/v3/tisa-health"),
                 ("GET", "/wp-json/wc/v3/products/categories"),
                 ("POST", "/wp-json/wc/v3/products"),
                 ("POST", "/wp-json/wc/v3/products/4321/variations/batch"),
@@ -263,7 +282,8 @@ class TestResumeOnTheShop(unittest.IsolatedAsyncioTestCase):
     async def test_half_made_product_is_toppped_up_not_duplicated(self) -> None:
         batch = publish_batch.batch_id(_data().to_dict(), [], chat_id=9)
         store = _Store(products=[_ghost(batch)],
-                       variations=[_variation("iPhone 15", "مشکی"), _variation("iPhone 15", "سفید")])
+                       variations=[_variation("iPhone 15", "مشکی", variation_id=7000),
+                                   _variation("iPhone 15", "سفید", variation_id=7001)])
         report: list[str] = []
         product_id, edit_url = await self._create(store, batch, report)
         self.assertEqual(5555, product_id, "id محصولِ موجود برگردانده می‌شود، نه یک id تازه")
@@ -454,7 +474,9 @@ class TestFlowGate(unittest.IsolatedAsyncioTestCase):
         self.assertIn("post.php?post=4321", text, "و لینکش را بدهد تا همان را باز کند")
         self.assertIn("SKU تازه", text, "باید بگوید تکراری یعنی چه: محصول دوم با SKU دوم")
         self.assertEqual(9, messages[-1].get("chat_id"), "پیام به همان چت، نه چت خصوصی")
-        buttons = [b.callback_data for row in messages[-1]["reply_markup"].inline_keyboard for b in row]
+        # دکمه‌ها با nonce/revision نشست امضا می‌شوند؛ تپ باید *کنش* را بسنجد.
+        buttons = [str(b.callback_data).split("|", 1)[0]
+                   for row in messages[-1]["reply_markup"].inline_keyboard for b in row]
         self.assertEqual(["product:force"], buttons)
         answers = [item for item in seen2 if item[0] == "answer"]
         self.assertTrue(answers and "پیش‌تر" in str(answers[-1][1]))

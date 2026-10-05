@@ -661,7 +661,7 @@ class _Suspended:
         return self
 
     def __exit__(self, *exc: object) -> None:
-        _SUSPENSION.reset(self._token)  # type: ignore[arg-type]
+        _SUSPENSION.reset(self._token)
 
 
 def suspended() -> _Suspended:

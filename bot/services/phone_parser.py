@@ -564,27 +564,6 @@ def extract_phone_models(text: str) -> list[PhoneModel]:
     )
 
 
-def _model_key_of(line: str) -> str:
-    """Numbers + variant words of a line, order-insensitive.
-
-    Two lines with the same key really are the same model; same label but
-    different keys means we merged two different models into one name.
-    """
-    low = _clean(line).lower()
-    numbers = re.findall(r"\d{1,3}", low)
-    marks = {
-        marker
-        for marker in _VARIANT_MARKERS
-        if re.search(r"(?<![a-z])" + re.escape(marker) + r"(?![a-z])", low)
-    }
-    # «13 max», «13 promax» and «13 پرو مکس» are one model, so they must share a
-    # key — otherwise the conflict detector cries wolf on every post.
-    if marks & {"max", "promax", "pro max"}:
-        marks -= {"max", "promax", "pro max", "pro"}
-        marks.add("pro max")
-    return " ".join(numbers + sorted(marks))
-
-
 # Words that always mean «part of a model name». If one of them survives on a
 # model line without appearing in the canonical label, the parser met a variant
 # it could not apply — e.g. «13 پرو پلاس» (pro plus is not an iPhone) or a new

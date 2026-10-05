@@ -37,8 +37,7 @@ def check_config() -> int:
     print(f"log chat : {settings.log_chat_id or '— (غیرفعال)'}")
     print(f"woo      : {settings.woocommerce_url or '—'}")
     print(f"wp media : {settings.wordpress_url or '—'}")
-    print(f"ai       : {settings.ai_model or '—'} @ {settings.ai_base_url or '—'}")
-    # The JSON stores are where roles and publish history live, and every writer
+    print(f"ai       : {settings.ai_model or '—'} @ {settings.ai_base_url or '—'}")    # The JSON stores are where roles and publish history live, and every writer
     # swallows its own OSError (a failed save must not kill a flow) — so an
     # unwritable directory used to mean "nothing is remembered", silently, forever.
     state = data_dir()
@@ -91,6 +90,7 @@ def check_config() -> int:
 def main() -> None:
     parser = argparse.ArgumentParser(prog="main.py", description="TisaCase management bot")
     parser.add_argument("--check-config", action="store_true", help="validate .env and exit")
+    parser.add_argument("--build-app", action="store_true", help="build the application (no network) and exit; used by Docker HEALTHCHECK")
     parser.add_argument("--version", action="store_true", help="print the bot version and exit")
     args = parser.parse_args()
 
@@ -99,6 +99,21 @@ def main() -> None:
         return
     if args.check_config:
         sys.exit(check_config())
+    if args.build_app:
+        # healthcheck: همهٔ هندلرها ساختن می‌شود ولی تلگرام صدا زده نمی‌شود.
+        # تضمین می‌کند که یک import شکسته یا register بد در جریان آپدیتِ بعدی
+        # به کراش حلقه نمی‌رسد.
+        try:
+            rc = check_config()
+            if rc != 0:
+                sys.exit(rc)
+            from bot.app import build_application
+            build_application()
+            print("✅ application build ok (no network calls made).")
+        except Exception as exc:
+            print(f"⚠️ build_application failed: {exc}", file=sys.stderr)
+            sys.exit(1)
+        return
 
     try:
         from bot.config import settings  # late: --version works without .env

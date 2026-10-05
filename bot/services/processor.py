@@ -21,16 +21,23 @@ processor.py — هسته‌ی پردازش فایل سفارش برای ربا�
 
 from __future__ import annotations
 
+import codecs
+import csv
 import io
+import logging
 import os
 import re
 from dataclasses import dataclass, field, fields
+from html.parser import HTMLParser
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
 
 from bot.config import settings
 from bot.services import barcodes
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # نرمال‌سازی متن (ارقام فارسی/عربی → انگلیسی، حذف فاصله/نیم‌فاصله/کاما)
@@ -126,8 +133,38 @@ _RE_CODE_IN_TEXT = re.compile(r"(?<![0-9])([0-9]{5,6})(?![0-9])")
 MAX_OPTIONS = 8
 
 
+#: How many columns a CSV may have before the reader says so out loud. A frame is
+#: rows×columns cells in memory, and 4096-wide is already a system dump, not an order
+#: export — but the point is that a file past the cap gets a *sentence*, never a
+#: silently narrower table.
+MAX_CSV_COLUMNS = 4096
+
+
 class RowLimitError(ValueError):
     """More rows than ``MAX_ROWS`` — refuse instead of grinding the bot to dust."""
+
+
+class ColumnLimitError(RowLimitError):
+    """A CSV wider than :data:`MAX_CSV_COLUMNS` — refuse, and name the real number.
+
+    The reader used to cap the column count at 512 *silently*: pandas keeps the first
+    N fields of every line and drops the rest without a word, so a 600-column export
+    whose «بارکد» column sat at index 590 came back as a 512-column table and the bot
+    asked about the wrong columns. A refusal the seller can act on beats a wrong answer.
+
+    A ``RowLimitError`` on purpose: the flow already answers that family with «🚧 …».
+    """
+
+
+class MemoryLimitError(RowLimitError):
+    """The file could not be read because the worker ran out of memory.
+
+    A ``RowLimitError`` on purpose: the flow already answers that family with «🚧 …» and
+    something to *do*, which is exactly the right channel. The sentence itself names both
+    causes — a file that is genuinely too big, and a host whose memory ceiling is too low
+    for even a small file — because from inside the parser the two look identical, and only
+    the shop can tell which one it is (the worker log prints the numbers).
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -250,37 +287,417 @@ def _col_letter(index: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# خواندن فایل
+# خواندن فایل — همان چیزی که از سامانه می‌آید، نه ایده‌آلِ ما
 # ---------------------------------------------------------------------------
-def _read_excel_or_csv(path, ext):
-    if ext == ".xlsx":
-        import zipfile
+class UnreadableFileError(ValueError):
+    """فایل خوانده نشد — با دلیلی که کاربر بتواند کاری کند.
+
+    Every parser-level failure (a truncated zip, a web panel's HTML named ``.xlsx``, a
+    scanned PDF) is turned into one Persian sentence here; the English/technical text
+    stays in the log, where a developer can find it.
+    """
+
+
+#: Delimiters a Persian Windows export can use. Excel in a Persian locale writes «;» —
+#: reading that as one column is how a full order file became «ستون بارکد پیدا نشد».
+_DELIMITERS = (",", ";", "\t", "|")
+#: Shorter than this cannot be a barcode: Tisa's are 24 digits, GTINs 8/12/13/14.
+_MIN_BARCODE_DIGITS = 8
+#: How many sheets are previewed before one is chosen (a 300-sheet workbook must not
+#: turn one upload into 300 reads).
+_SHEET_PREVIEWS = 12
+#: Lines of a printed table share a baseline within this many points. Rounding to 0.1pt
+#: (the previous version) split one row into several «lines» whenever a cell's font
+#: differed, and the row disappeared from the output.
+_LINE_TOLERANCE = 3.0
+
+
+def _decode_bytes(raw: bytes) -> str:
+    """متنِ فایل با هر کدگذاری‌ای که خروجی‌های واقعی دارند.
+
+    cp1256 is what a Persian Windows tool writes; utf-16 (with or without a BOM) is what
+    «Unicode Text» and several web panels write; utf-8 is tried first because a cp1256
+    byte string that happens to be valid utf-8 is far rarer than the reverse.
+    """
+    try:
+        if raw.startswith(codecs.BOM_UTF8):
+            return raw.decode("utf-8-sig")
+        if raw.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+            return raw.decode("utf-16")
+        if raw.find(b"\x00") >= 0:  # UTF-16 without a BOM (ASCII text has NUL bytes)
+            for encoding in ("utf-16-le", "utf-16-be"):
+                try:
+                    return raw.decode(encoding)
+                except UnicodeDecodeError:
+                    continue
+    except UnicodeDecodeError:  # a BOM that lies about the bytes behind it
+        pass
+    for encoding in ("utf-8", "cp1256", "cp1252"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("latin-1")  # every byte maps — a last resort that cannot fail
+
+
+def _head_lines(text: str, limit: int) -> list[str]:
+    """The first ``limit`` non-empty lines — without materialising a million-line list.
+
+    A 25 MB export is also a list of a million strings if we let ``splitlines()`` build
+    one; the delimiter and the width only need the top of the file.
+    """
+    lines: list[str] = []
+    for line in io.StringIO(text):
+        if line.strip():
+            lines.append(line)
+            if len(lines) >= limit:
+                break
+    return lines
+
+
+def _sniff_delimiter(text: str) -> str:
+    """جداکنندهٔ واقعی فایل: «,» و «;» و tab و «|».
+
+    Counting beats ``csv.Sniffer`` for this job: the sniffer guesses from one sample and
+    gives up on a short sheet, while the delimiter that appears the same number of times
+    on most lines is what «CSV» means in practice. Comma wins ties, because it is the
+    default in every tool.
+    """
+    sample = _head_lines(text, 8)
+    if not sample:
+        return ","
+    best, best_score = ",", (0.0, 0)
+    for delimiter in _DELIMITERS:
+        counts = [len(re.sub(r'"[^"]*"', "", line).split(delimiter)) - 1 for line in sample]
+        present_counts = [count for count in counts if count > 0]
+        if not present_counts:
+            continue
+        mode = max(set(present_counts), key=present_counts.count)
+        score = (
+            len(present_counts) / len(counts) + present_counts.count(mode) / len(counts),
+            len(present_counts),
+        )
+        if score > best_score:
+            best, best_score = delimiter, score
+    return best
+
+
+def _rows_to_frame(rows: list[list[str]]) -> pd.DataFrame:
+    """A grid of text → DataFrame; ragged rows are padded, because exports are ragged."""
+    width = max((len(row) for row in rows), default=0)
+    if width == 0:
+        return pd.DataFrame()
+    return pd.DataFrame([row + [""] * (width - len(row)) for row in rows], dtype=object)
+
+
+class _HtmlTableParser(HTMLParser):
+    """جدول‌های یک فایل HTML را به گرید تبدیل می‌کند (stdlib؛ بدون lxml).
+
+    Web panels in this market export «Excel» that is really an HTML table, and some
+    banks and print services hand back the same. pandas cannot read those without
+    lxml/html5lib — and the order file must not be refused because of it.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.tables: list[list[list[str]]] = []
+        self._table: list[list[str]] | None = None
+        self._row: list[str] | None = None
+        self._cell: list[str] | None = None
+        self._colspan = 1
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attributes = dict(attrs)
+        if tag == "table":
+            self._table = []
+        elif tag == "tr" and self._table is not None:
+            self._row = []
+        elif tag in ("td", "th") and self._row is not None:
+            self._cell = []
+            try:
+                self._colspan = max(1, int(str(attributes.get("colspan") or "1")))
+            except ValueError:
+                self._colspan = 1
+        elif tag == "br" and self._cell is not None:
+            self._cell.append(" ")
+
+    def handle_data(self, data: str) -> None:
+        if self._cell is not None:
+            self._cell.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in ("td", "th") and self._cell is not None and self._row is not None:
+            # Cell text is collapsed to one line: a wrapped address is still one cell.
+            text = " ".join("".join(self._cell).split())
+            self._row.extend([text] + [""] * (self._colspan - 1))
+            self._cell = None
+        elif tag == "tr" and self._row is not None and self._table is not None:
+            if any(cell.strip() for cell in self._row):
+                self._table.append(self._row)
+            self._row = None
+        elif tag == "table" and self._table is not None:
+            if self._table:
+                self.tables.append(self._table)
+            self._table = None
+
+
+def _html_rows(text: str) -> list[list[str]] | None:
+    """The biggest table of an HTML document — the order table is the long one."""
+    parser = _HtmlTableParser()
+    try:
+        parser.feed(text)
+        parser.close()
+    except Exception as exc:  # pragma: no cover — a malformed tag soup, not a file we can use
+        logger.debug("html table parser choked on tag soup: %s", exc)
+        return None
+    if not parser.tables:
+        return None
+    return max(parser.tables, key=len)
+
+
+def _spreadsheetml_rows(text: str) -> list[list[str]] | None:
+    """Excel 2003 XML (SpreadsheetML) — «ذخیره به‌صورت XML» در پنل‌های قدیمی."""
+    import xml.etree.ElementTree as ET
+
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError:
+        return None
+    namespace = "urn:schemas-microsoft-com:office:spreadsheet"
+    best: list[list[str]] = []
+    for table in root.iter(f"{{{namespace}}}Table"):
+        rows: list[list[str]] = []
+        for row in table.findall(f"{{{namespace}}}Row"):
+            cells: list[str] = []
+            for cell in row.findall(f"{{{namespace}}}Cell"):
+                index = cell.get(f"{{{namespace}}}Index")
+                if index and index.isdigit() and int(index) > len(cells) + 1:
+                    cells.extend([""] * (int(index) - len(cells) - 1))
+                data = cell.find(f"{{{namespace}}}Data")
+                cells.append("".join(data.itertext()) if data is not None else "")
+            if any(cell.strip() for cell in cells):
+                rows.append(cells)
+        if len(rows) > len(best):
+            best = rows
+    return best or None
+
+
+def _unreadable(what: str, exc: Exception) -> UnreadableFileError:
+    """یک خطای پارسر → جملهٔ فارسی؛ نوع خطا هم می‌آید تا قابل گزارش باشد.
+
+    «راه‌حل» این‌جا نیست: جریانِ چت آن را با توجه به پسوند فایل اضافه می‌کند تا هر
+    پیامِ خطا دقیقاً یک جملهٔ «چه بفرست» داشته باشد.
+    """
+    return UnreadableFileError(f"{what} (خطای فنی: {type(exc).__name__}).")
+
+
+def _memory_error(exc: BaseException) -> MemoryLimitError:
+    """«MemoryError» خام → جملهٔ صریح با هر دو علتِ ممکن.
+
+    از داخلِ پارسر، «فایل واقعاً بزرگ است» و «سقفِ حافظهٔ کارگر برای همین هاست کم است»
+    یک‌شکل دیده می‌شوند؛ پس هر دو گفته می‌شوند و عددها در ``logs/bot.log`` می‌مانند.
+    کاربری که فایلِ ۲۲KB فرستاده بود، این‌جا دیگر «خطای فنی: MemoryError» نمی‌بیند.
+    """
+    return MemoryLimitError(
+        "حافظهٔ پردازشِ ربات برای خواندن این فایل پر شد. "
+        f"(خطای فنی: {type(exc).__name__})\n"
+        "• اگر فایل بزرگ است: به دو یا چند بخش تقسیمش کن، یا همان گزارش را CSV/PDF بگیر.\n"
+        "• اگر فایل کوچک است: سقفِ حافظهٔ کارگر کم است — WORKER_MEMORY_MB را در .env "
+        "بالا ببر (یا حافظهٔ سرور را). اعدادِ دقیق در logs/bot.log نوشته شده‌اند."
+    )
+
+
+def _pick_sheet(book: pd.ExcelFile, names: list[str]) -> tuple[str, tuple[str, ...]]:
+    """برگه‌ای که جدول سفارش‌ها در آن است — نه همیشه برگهٔ اول.
+
+    A multi-sheet export is normal (a «راهنما» sheet first, the orders on the second),
+    and reading sheet 1 blindly answered «ستون بارکد پیدا نشد» for a file whose table
+    was one tab away. A sheet with the shop's own headers beats one with more rows.
+    """
+    best_name, best_score = names[0], -1
+    for name in names[:_SHEET_PREVIEWS]:
+        try:
+            preview = pd.read_excel(book, sheet_name=name, header=None, dtype=object, nrows=25)
+        except Exception:  # pragma: no cover — one broken sheet must not lose the file
+            logger.debug("sheet %r preview failed", name, exc_info=True)
+            continue
+        header_points, data_rows = 0, 0
+        for cells in preview.to_numpy().tolist():
+            normed = [_norm(cell) for cell in cells]
+            if any(cell in _BARCODE_HEADERS for cell in normed):
+                header_points += 2
+            if any(cell in _CODE_HEADERS for cell in normed):
+                header_points += 1
+            if any(str(cell).strip() for cell in cells):
+                data_rows += 1
+        if not data_rows:
+            continue  # an empty sheet is never the answer
+        score = header_points * 1000 + min(data_rows, 999)
+        if score > best_score:
+            best_name, best_score = name, score
+    if best_name == names[0]:
+        return best_name, ()
+    return best_name, (f"جدول در برگهٔ «{best_name}» بود (نه «{names[0]}»).",)
+
+
+def _read_not_really_xlsx(path, exc: Exception) -> tuple[pd.DataFrame, str, tuple[str, ...]]:
+    """A file named ``.xlsx`` that is not a zip: HTML, XML, an old ``xls``, or broken.
+
+    Before this, every one of those reached the warehouse as «File is not a zip file» —
+    a sentence that tells nobody what to send instead.
+    """
+    try:
+        raw = Path(path).read_bytes()
+        text = _decode_bytes(raw)
+        rows = _spreadsheetml_rows(text) if "spreadsheet" in text[:3000].lower() else None
+        if rows is None:
+            rows = _html_rows(text)
+    except MemoryError as oom:  # a web panel's HTML export can be absurdly large
+        raise _memory_error(oom) from oom
+    if rows is not None:
+        logger.info("xlsx is really an HTML/XML table; read as a table: %s", path)
+        return (
+            _rows_to_frame(rows),
+            "",
+            ("فایل پسوند اکسل داشت ولی محتوایش جدول HTML/XML بود؛ همان جدول خوانده شد.",),
+        )
+    if raw[:4] == b"\xd0\xcf\x11\xe0":
+        raise UnreadableFileError("این فایل اکسل قدیمی (xls 97-2003) است، نه xlsx/xlsm.")
+    raise _unreadable("فایل اکسل سالم نیست — خراب یا نصفه دانلود شده", exc)
+
+
+def _read_excel(path) -> tuple[pd.DataFrame, str, tuple[str, ...]]:
+    """برگهٔ درستِ فایل اکسل، به‌همراه نامش (برای لینک سلول‌ها) و یادداشت‌های خواندن."""
+    import zipfile
+
+    try:
         with zipfile.ZipFile(path) as archive:
             members = archive.infolist()
             if len(members) > 2000 or sum(item.file_size for item in members) > 128 * 1024 * 1024:
-                raise RowLimitError("حجم بازشده/تعداد فایل‌های XLSX از سقف ایمن بیشتر است")
-        return pd.read_excel(path, header=None, dtype=object, nrows=settings.max_rows + 1)
-    last_err = None
-    for enc in ("utf-8-sig", "utf-8", "cp1256"):
-        try:
-            return pd.read_csv(path, header=None, dtype=object, keep_default_na=False, encoding=enc, nrows=settings.max_rows + 1)
-        except (UnicodeDecodeError, pd.errors.ParserError) as e:
-            last_err = e
-    raise ValueError(f"فایل CSV قابل خواندن نیست: {last_err}")
-
-
-def _sheet_name(path: str) -> str:
-    """The first sheet's name, for the row links (never fatal)."""
+                raise RowLimitError(
+                    "این فایل اکسل وقتی باز می‌شود بیش از حد بزرگ است — بیش از ۱۲۸ مگابایت "
+                    "محتوا یا ۲۰۰۰ فایل داخلی. برگه‌های اضافی/تصاویر را حذف کن، فایل را به "
+                    "چند بخش تقسیم کن، یا همان گزارش را CSV/PDF بگیر."
+                )
+    except zipfile.BadZipFile as exc:
+        return _read_not_really_xlsx(path, exc)
+    except MemoryError as exc:
+        raise _memory_error(exc) from exc
     try:
-        from openpyxl import load_workbook
-
-        wb = load_workbook(path, read_only=True)
+        book = pd.ExcelFile(path, engine="openpyxl")
+    except MemoryError as exc:
+        raise _memory_error(exc) from exc
+    except Exception as exc:
+        logger.warning("xlsx could not be opened: %s", path, exc_info=True)
+        raise _unreadable("این فایل به‌عنوان اکسل باز نشد", exc) from exc
+    with book:
+        names = [str(name) for name in book.sheet_names]
+        if not names:
+            raise UnreadableFileError("این فایل اکسل هیچ برگه‌ای ندارد.")
+        chosen, notes = _pick_sheet(book, names)
         try:
-            return str(wb.sheetnames[0])
-        finally:
-            wb.close()
-    except Exception:  # pragma: no cover
-        return "Sheet1"
+            frame = pd.read_excel(
+                book, sheet_name=chosen, header=None, dtype=object, nrows=settings.max_rows + 1
+            )
+        except MemoryError as exc:
+            raise _memory_error(exc) from exc
+        except Exception as exc:  # pragma: no cover — a broken sheet in a readable book
+            logger.warning("sheet %r could not be read: %s", chosen, path, exc_info=True)
+            raise _unreadable(f"خواندن برگهٔ «{chosen}» ممکن نشد", exc) from exc
+    return frame, chosen, notes
+
+
+def _csv_width(text: str, delimiter: str, lines: int = 200) -> int:
+    """How many fields this CSV really has — counted, so short rows are padded, not lost.
+
+    Without an explicit width pandas takes the *first* line as the truth: a report whose
+    first line is a title («گزارش سفارش‌ها») then reads every later row as a broken line
+    and the whole table disappears.
+
+    The head sample is not enough on its own: pandas does not complain when a line has
+    *more* fields than ``names`` — it keeps the first N and drops the rest silently
+    (measured: 600 fields with ``names=range(512)`` came back as 512 cells). So the head
+    width is confirmed against every line with a cheap delimiter count, and only a file
+    that really has wider lines pays for the exact, quote-aware recount.
+    """
+    width = 1
+    for line in _head_lines(text, lines):
+        width = max(width, len(re.sub(r'"[^"]*"', "", line).split(delimiter)))
+    if _no_line_wider_than(text, delimiter, width):
+        return width
+    return max(width, _exact_width(text, delimiter))
+
+
+def _no_line_wider_than(text: str, delimiter: str, width: int) -> bool:
+    """Can any line hold *more* fields than ``width``?
+
+    Quoted delimiters only inflate the raw count, so a ``True`` here is a proof that no
+    line is wider (extra separators can only make the check fail, never falsely pass).
+    """
+    limit = width - 1
+    return all(line.count(delimiter) <= limit for line in io.StringIO(text))
+
+
+def _exact_width(text: str, delimiter: str) -> int:
+    """The real maximum field count, quote-aware — only called when the cheap check fails."""
+    width = 1
+    for row in csv.reader(io.StringIO(text), delimiter=delimiter):
+        width = max(width, len(row))
+    return width
+
+
+def _read_text_table(path) -> tuple[pd.DataFrame, str, tuple[str, ...]]:
+    """CSV با هر کدگذاری/جداکننده‌ای که خروجی‌های فارسی دارند."""
+    try:
+        text = _decode_bytes(Path(path).read_bytes())
+    except MemoryError as exc:
+        raise _memory_error(exc) from exc
+    delimiter = _sniff_delimiter(text)
+    width = _csv_width(text, delimiter)
+    if width > MAX_CSV_COLUMNS:
+        raise ColumnLimitError(
+            f"این فایل CSV {width:,} ستون دارد و سقف {MAX_CSV_COLUMNS:,} ستون است. "
+            "ستون‌های لازم (مثل بارکد و کد سفارش) را در یک فایل جدا بفرست، "
+            "یا از سامانه خروجی با ستون‌های کمتر بگیر — وگرنه ستون‌ها بی‌خبر از "
+            "میان می‌رفتند."
+        )
+    names = list(range(width))
+    notes: list[str] = []
+    kwargs: dict[str, Any] = {
+        "sep": delimiter, "header": None, "names": names, "dtype": object,
+        "keep_default_na": False, "nrows": settings.max_rows + 1,
+    }
+    try:
+        frame = pd.read_csv(io.StringIO(text), **kwargs)
+    except MemoryError as exc:
+        raise _memory_error(exc) from exc
+    except pd.errors.ParserError:
+        # A ragged export is common (a note row with two fields). Long lines are the one
+        # thing this cannot repair, so they are skipped — and the report says so.
+        logger.warning("csv has broken lines, skipping them: %s", path, exc_info=True)
+        try:
+            frame = pd.read_csv(io.StringIO(text), engine="python", on_bad_lines="skip", **kwargs)
+        except MemoryError as inner:
+            raise _memory_error(inner) from inner
+        except Exception as inner:
+            raise _unreadable("فایل CSV خوانده نشد", inner) from inner
+        notes.append("چند خط شکستهٔ فایل CSV خوانده نشد؛ بهتر است خروجی را دوباره از سامانه بگیری.")
+    except Exception as exc:
+        logger.warning("csv could not be read: %s", path, exc_info=True)
+        raise _unreadable("فایل CSV خوانده نشد (کدگذاری یا جداکنندهٔ ناشناس)", exc) from exc
+    frame = frame.fillna("")  # fields a short row did not have are empty cells, not «nan»
+    if delimiter != ",":
+        # Tab in a chat bubble reads as nothing at all; name it.
+        shown = "tab" if delimiter == "\t" else delimiter
+        notes.append(f"جداکنندهٔ فایل «{shown}» بود و همان‌طور خوانده شد.")
+    return frame, "", tuple(notes)
+
+
+def _read_table(path, ext: str) -> tuple[pd.DataFrame, str, tuple[str, ...]]:
+    """One entry point for both file kinds: (frame, sheet name, notes)."""
+    if ext in (".xlsx", ".xlsm"):
+        return _read_excel(path)
+    return _read_text_table(path)
 
 
 def _shape_score(df: pd.DataFrame, col: int, header_row: int) -> tuple[int, str]:
@@ -473,58 +890,112 @@ def _collect_rows(
     return rows
 
 
+def _page_lines(page) -> list[list[tuple[float, float, str]]]:
+    """Spans of one page, grouped into visual lines: ``(x0, x1, text)`` left→right.
+
+    Grouping a line by its baseline is what makes this layout-independent; rounding y to
+    0.1pt (the previous version) split one row into several «lines» whenever a cell used
+    a different font or size, and those rows vanished from the output.
+    """
+    spans: list[tuple[float, float, float, str]] = []
+    for block in page.get_text("rawdict").get("blocks", []):
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                text = "".join(ch["c"] for ch in span.get("chars", [])).strip().translate(_FA2EN_TABLE)
+                if text:
+                    x0, y0, x1 = (float(value) for value in span["bbox"][:3])
+                    spans.append((y0, x0, x1, text))
+    spans.sort(key=lambda item: (item[0], item[1]))
+    lines: list[tuple[float, list[tuple[float, float, str]]]] = []
+    for y0, x0, x1, text in spans:
+        if lines and abs(lines[-1][0] - y0) <= _LINE_TOLERANCE:
+            lines[-1][1].append((x0, x1, text))
+        else:
+            lines.append((y0, [(x0, x1, text)]))
+    return [sorted(items) for _, items in lines]
+
+
+def _pdf_barcode_index(line: list[tuple[float, float, str]]) -> int | None:
+    """Which span of the line is the tracking barcode: the longest digit run.
+
+    The previous version read fixed x bands (the printed form's own geometry). One
+    changed margin, printer setting or form revision moved every cell, and the file came
+    back as «ساختار PDF شناخته نشد» — while the 24-digit barcode was sitting right
+    there. A length the shop calls a barcode wins over a longer run; then the longest
+    run wins, so an order code or a phone number never becomes the barcode.
+    """
+    best_index, best_key = None, (0, 0)
+    for index, (_x0, _x1, text) in enumerate(line):
+        if not re.fullmatch(r"[0-9]+", text) or len(text) < _MIN_BARCODE_DIGITS:
+            continue
+        key = (int(len(text) in settings.barcode_lengths), len(text))
+        if key > best_key:
+            best_index, best_key = index, key
+    return best_index
+
+
+def _pdf_row(line: list[tuple[float, float, str]], index: int, page_number: int, count: int):
+    """One printed table row → the same record shape the spreadsheet path produces."""
+    _x0, _x1, barcode = line[index]
+    number = ""
+    number_index: int | None = None
+    for position in range(len(line) - 1, index, -1):
+        # ستون «ردیف» سمت راستِ بارکد است: عددِ کوتاهِ آخرِ سطر.
+        if re.fullmatch(r"[0-9]{1,4}", line[position][2]):
+            number, number_index = line[position][2], position
+            break
+    # کد سفارش در متنِ همان سطر است، هر جا که چاپ شده باشد (چیدمان‌ها فرق می‌کنند);
+    # فقط خودِ بارکد و ستون ردیف کنار گذاشته می‌شوند.
+    middle = " ".join(
+        text for position, (_x0, _x1, text) in enumerate(line) if position not in (index, number_index)
+    )
+    mid_clean = _RE_DATE.sub("", middle)  # حذف تاریخ
+    m = _RE_CODE_IN_TEXT.search(mid_clean)  # کد سفارش
+    return {
+        "rownum": number or str(count + 1),
+        "barcode": barcode,
+        "code": m.group(1) if m else "",
+        "barcode_numeric": False,
+        "barcode_raw": barcode,
+        "code_from_name": False,
+        "page": page_number,
+        "sheet_row": None,
+    }
+
+
 def _read_pdf(path) -> list[dict[str, Any]]:
-    """استخراج جدول از PDF خروجی سامانه (چیدمان ثابت ستون‌ها)"""
+    """استخراج جدول از PDF خروجی سامانه — با هندسهٔ *خودِ* فایل، نه مختصات ثابت."""
     import pymupdf
 
-    doc = pymupdf.open(path)
-    if len(doc) > 500:
-        doc.close()
-        raise RowLimitError("بیش از ۵۰۰ صفحه در PDF؛ فایل را تقسیم کن")
+    try:
+        doc = pymupdf.open(path)
+    except MemoryError as exc:
+        raise _memory_error(exc) from exc
+    except Exception as exc:
+        logger.warning("pdf could not be opened: %s", path, exc_info=True)
+        raise _unreadable("این فایل PDF سالم نیست — خراب یا نصفه دانلود شده", exc) from exc
     rows: list[dict[str, Any]] = []
-    for pno in range(len(doc)):
-        page = doc[pno]
-        d = page.get_text("rawdict")
-        spans_by_y: dict[float, list[tuple[float, float, str]]] = {}
-        for block in d.get("blocks", []):
-            for line in block.get("lines", []):
-                for span in line.get("spans", []):
-                    x0, y0, x1 = span["bbox"][0], span["bbox"][1], span["bbox"][2]
-                    text = "".join(ch["c"] for ch in span.get("chars", [])).strip().translate(_FA2EN_TABLE)
-                    if not text:
-                        continue
-                    key = round(y0, 1)
-                    spans_by_y.setdefault(key, []).append((x0, x1, text))
-        for _y, spans in spans_by_y.items():
-            # یک سطر می‌تواند هم سلول متنی و هم فهرست سلول‌های میانی داشته باشد
-            _guard_rows(len(rows))
-            rec: dict[str, Any] = {}
-            for x0, x1, t in spans:
-                if x0 > 535 and t.isdigit() and len(t) <= 4:
-                    rec["n"] = t
-                elif 420 <= x0 <= 535 and len(t) >= 12 and t.isdigit():
-                    rec["bc"] = t
-                elif 235 <= x0 <= 420 and x1 <= 425 and not t.isdigit():
-                    rec.setdefault("mid", []).append(t)
-            if "bc" in rec and "n" in rec:
-                mid = "".join(rec.get("mid") or [])
-                mid_clean = _RE_DATE.sub("", mid)  # حذف تاریخ
-                m = _RE_CODE_IN_TEXT.search(mid_clean)  # کد سفارش
-                rows.append(
-                    {
-                        "rownum": rec["n"],
-                        "barcode": rec["bc"],
-                        "code": m.group(1) if m else "",
-                        "barcode_numeric": False,
-                        "barcode_raw": rec["bc"],
-                        "code_from_name": False,
-                        "page": pno + 1,
-                        "sheet_row": None,
-                    }
-                )
-    doc.close()
+    try:
+        if len(doc) > 500:
+            raise RowLimitError("بیش از ۵۰۰ صفحه در PDF؛ فایل را تقسیم کن")
+        for page_number in range(len(doc)):
+            for line in _page_lines(doc[page_number]):
+                index = _pdf_barcode_index(line)
+                if index is None:
+                    continue
+                _guard_rows(len(rows))
+                rows.append(_pdf_row(line, index, page_number + 1, len(rows)))
+    except MemoryError as exc:
+        # «rawdict» یک صفحهٔ پرمتن می‌تواند صدها مگابایت شیء پایتون بسازد؛ پیش‌تر این
+        # خطا بدون هیچ ترجمه‌ای به کاربر می‌رسید: «❌ خطا در پردازش: MemoryError».
+        raise _memory_error(exc) from exc
+    finally:
+        doc.close()
     if not rows:
-        raise ValueError("ساختار PDF شناخته نشد (ستون‌های جدول پیدا نشد)")
+        raise UnreadableFileError(
+            "در این PDF هیچ عدد بلندی (حداقل ۸ رقم) که بشود کد رهگیری باشد پیدا نشد. "
+            "اگر PDF اسکن‌شده یا عکس است، خروجیِ متنی/جدولی همان گزارش را از سامانه بگیر."
+        )
     return rows
 
 
@@ -920,11 +1391,18 @@ class Report:
 # نقطه‌ی ورود اصلی
 # ---------------------------------------------------------------------------
 def _guard_rows(count: int) -> None:
+    """رد کردنِ فایلِ بزرگ، با عددی که راست است.
+
+    Reading stops at ``MAX_ROWS + 1`` rows on purpose (a 25 MB xlsx can expand to
+    gigabytes), so the honest sentence is «بیش از N ردیف» — the previous message printed
+    the truncated count («حداقل ۴») as if it were the file's real size.
+    """
     limit = int(settings.max_rows)
     if limit > 0 and count > limit:
         raise RowLimitError(
-            f"فایل حداقل {count:,} ردیف دارد و سقف {limit:,} ردیف (MAX_ROWS) را رد کرده است. "
-            "فایل را به دو یا چند بخش تقسیم کن؛ پردازشِ این حجم، ربات را برای همه slow می‌کند."
+            f"فایل بیش از {limit:,} ردیف دارد (خواندن روی سقف متوقف شد) و سقف {limit:,} ردیف "
+            "(MAX_ROWS) را رد کرده است. فایل را به دو یا چند بخش تقسیم کن؛ "
+            "پردازشِ این حجم، ربات را برای همه کُند می‌کند."
         )
 
 
@@ -942,10 +1420,11 @@ def process_file(path, fname=None, *, layout: Layout | dict[str, Any] | None = N
     if ext == ".pdf":
         rows = _read_pdf(path)
         _guard_rows(len(rows))
+        reader_notes: tuple[str, ...] = ()
         report_layout = chosen or Layout(header_row=-1)
         questions: tuple[Question, ...] = ()
-    elif ext in (".xlsx", ".csv"):
-        df = _read_excel_or_csv(path, ext)
+    elif ext in (".xlsx", ".xlsm", ".csv"):
+        df, sheet, reader_notes = _read_table(path, ext)
         _guard_rows(len(df))
         answers: dict[str, int | None] = {}
         if chosen is not None:
@@ -958,7 +1437,6 @@ def process_file(path, fname=None, *, layout: Layout | dict[str, Any] | None = N
                     answers[field] = column
                 elif field in dict(chosen.decided):
                     answers[field] = -1
-        sheet = _sheet_name(path) if ext == ".xlsx" else ""
         report_layout, questions = scan_table(
             df, answers, sheet=sheet, prior_labels=dict(chosen.decided) if chosen else None
         )
@@ -984,12 +1462,14 @@ def process_file(path, fname=None, *, layout: Layout | dict[str, Any] | None = N
             name_for_code=not skipped_code,
         )
     else:
-        raise ValueError(f"فرمت «{ext}» پشتیبانی نمی‌شود (فقط xlsx / csv / pdf).")
+        raise ValueError(f"فرمت «{ext}» پشتیبانی نمی‌شود (فقط xlsx / xlsm / csv / pdf).")
 
     if not rows:
         raise ValueError("هیچ ردیف داده‌ای در فایل پیدا نشد.")
 
-    notes: list[str] = []
+    # یادداشت‌های خودِ خواندن (کدگذاری/جداکننده/برگه) اول می‌آیند: کاربر باید بداند
+    # فایلش چطور خوانده شد، نه فقط اینکه چه چیزی داخلش بود.
+    notes: list[str] = list(reader_notes)
     if report_layout.barcode_col is not None and report_layout.code_col is None:
         lifted = sum(1 for r in rows if r.get("code_from_name"))
         if skipped_code:
@@ -1032,11 +1512,15 @@ def process_file(path, fname=None, *, layout: Layout | dict[str, Any] | None = N
 __all__ = [
     "FIELD_BARCODE",
     "FIELD_CODE",
+    "MAX_CSV_COLUMNS",
     "Column",
+    "ColumnLimitError",
     "Layout",
+    "MemoryLimitError",
     "Question",
     "Report",
     "RowLimitError",
+    "UnreadableFileError",
     "build_csv",
     "build_problems_csv",
     "build_review_csv",

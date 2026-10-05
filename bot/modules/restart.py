@@ -23,6 +23,7 @@ from telegram.ext import Application, CallbackQueryHandler, ContextTypes
 from bot import rbac
 from bot.config import data_dir, settings
 from bot.constants import CB
+from bot.utils.ui import answer_and, answer_and_edit
 from dotenv import dotenv_values
 
 logger = logging.getLogger(__name__)
@@ -42,12 +43,19 @@ _COMMON_CONFS = (
     str(Path.home() / "etc" / "supervisord.conf"),
     str(Path.home() / ".supervisord.conf"),
 )
-_COMMON_SOCKETS = (
-    "/var/run/supervisor.sock",
-    "/run/supervisor.sock",
-    "/var/run/supervisord.sock",
-    "/tmp/supervisor.sock",
-)
+#: مکان‌های رایج سوکت سوپروایزر. به /tmp آخر نگاه می‌کنیم چون در هاست‌های با
+#: PrivateTmp یا TMPDIR متفاوت، سوکت همنامِ قابل‌پیش‌بینی در /tmp می‌تواند متعلق
+#: به حساب دیگری باشد (و آن وقت supervisorctl فقط خطای اتصال می‌دهد و امنیتی
+#: شکسته نمی‌شود، اما پیدا کردنش کند می‌شود). مسیر سیستم اول می‌آید.
+def _common_sockets() -> tuple[str, ...]:
+    import tempfile
+    tmp = tempfile.gettempdir()  # به TMPDIR/TMP احترام می‌گذارد
+    return (
+        "/var/run/supervisor.sock",
+        "/run/supervisor.sock",
+        "/var/run/supervisord.sock",
+        str(Path(tmp) / "supervisor.sock"),
+    )
 
 
 def _runtime_supervisor_config() -> tuple[str, str, str, str]:
@@ -87,7 +95,7 @@ def _candidate_commands() -> list[list[str]]:
     for conf in _COMMON_CONFS:
         if Path(conf).is_file():
             candidates.append([bin_, "-c", conf, *tail])
-    for sock in _COMMON_SOCKETS:
+    for sock in _common_sockets():
         if Path(sock).exists():
             candidates.append([bin_, "-s", f"unix://{sock}", *tail])
     return candidates
@@ -116,8 +124,8 @@ async def cb_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await query.answer("⛔ دسترسی ندارید.", show_alert=True)
         return
 
-    await query.answer()
-    await query.edit_message_text(
+    await answer_and_edit(
+        query,
         "🔄 <b>ری‌استارت ربات</b>\n\n"
         f"ربات از طریق supervisor ری‌استارت می‌شود:\n"
         f"<code>{' '.join(_candidate_commands()[0])}</code>\n\n"
@@ -135,10 +143,9 @@ async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await query.answer("⛔ دسترسی ندارید.", show_alert=True)
         return
 
-    await query.answer()
     logger.warning("Restart requested by user %s via supervisor", user.id if user else "?")
 
-    msg = await query.edit_message_text("♻️ در حال ری‌استارت از طریق supervisor…")
+    msg = await answer_and(query, query.edit_message_text("♻️ در حال ری‌استارت از طریق supervisor…"))
 
     # Marker so the freshly-started process can confirm success in this chat.
     PENDING_FILE.parent.mkdir(parents=True, exist_ok=True)

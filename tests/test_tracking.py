@@ -370,6 +370,12 @@ class TestDuplicates(FileFixture):
 @needs_xlsx
 class TestLimits(FileFixture):
     def test_too_many_rows_is_refused_with_the_limit_named(self):
+        """The message must be *true*, not flattering.
+
+        Reading stops at ``MAX_ROWS + 1`` rows (a 25 MB xlsx can expand to gigabytes), so
+        the old «حداقل ۴ ردیف» printed the truncated count as if it were the file's size
+        — and a test pinned that. The honest sentence is «بیش از N ردیف».
+        """
         rows = [HEADER] + [[i, GOOD, "1403-01-01", f"گیرنده {i}", "123456", "x"] for i in range(1, 6)]
         path = self.xlsx(rows)
         small = h.settings_with(max_rows=3)
@@ -377,7 +383,8 @@ class TestLimits(FileFixture):
             processor.process_file(path, path.name)
         message = str(caught.exception)
         self.assertIn("MAX_ROWS", message)
-        self.assertIn("6", message)  # what the file holds
+        self.assertIn("بیش از 3 ردیف", message)  # 6 rows in the file, read stopped at 4
+        self.assertIn("تقسیم", message)          # and what to do about it
 
     def test_the_same_file_is_fine_under_a_bigger_limit(self):
         rows = [HEADER] + [[i, GOOD, "1403-01-01", f"گیرنده {i}", "123456", "x"] for i in range(1, 6)]
@@ -385,6 +392,130 @@ class TestLimits(FileFixture):
         with h.patched_settings(h.settings_with(max_rows=100)):
             report = processor.process_file(path, path.name)
         self.assertEqual(report.rows, 5)
+
+
+# ---------------------------------------------------------------------------
+# 7.3b exports that used to answer «❌ خطا در پردازش»
+# ---------------------------------------------------------------------------
+
+
+@needs_xlsx
+class TestRealWorldExports(FileFixture):
+    """The shapes a file actually arrives in — not the shape a spec promises.
+
+    Each case here used to end in «❌ خطا در پردازش» or in a question about the wrong
+    sheet, and each one is a normal export: Persian Excel writes «;», web panels call an
+    HTML table «xlsx», «Unicode Text» is utf-16, and an interrupted download is a broken
+    zip. The reader now meets the file where it is.
+    """
+
+    def _text_file(self, name: str, body: str, encoding: str = "utf-8") -> Path:
+        path = self.dir / name
+        path.write_text(body, encoding=encoding)
+        return path
+
+    def test_a_semicolon_csv_from_persian_excel_is_read(self):
+        import csv as _csv
+
+        path = self.dir / "semi.csv"
+        with open(path, "w", encoding="cp1256", newline="") as handle:
+            writer = _csv.writer(handle, delimiter=";")
+            # cp1256 has no U+06CC, so a real export carries the Arabic yeh — as here.
+            writer.writerow([cell.translate(str.maketrans("یک", "يك")) for cell in HEADER])
+            row = [1, GOOD, "1403-01-01", "امیر 123456", "123456", "تهران"]
+            writer.writerow([str(cell).translate(str.maketrans("یک", "يك")) for cell in row])
+        report = processor.process_file(path, path.name)
+        self.assertEqual(csv_rows(report)[1:], ["123456," + GOOD])
+        self.assertIn("جداکننده", report.summary)
+
+    def test_a_utf16_csv_is_read(self):
+        import csv as _csv
+
+        path = self.dir / "unicode.csv"
+        with open(path, "w", encoding="utf-16", newline="") as handle:
+            writer = _csv.writer(handle)
+            writer.writerow(HEADER)
+            writer.writerow([1, GOOD, "1403-01-01", "امیر 123456", "123456", "تهران"])
+        report = processor.process_file(path, path.name)
+        self.assertEqual(csv_rows(report)[1:], ["123456," + GOOD])
+
+    def test_a_ragged_csv_loses_no_row(self):
+        """A title line above the header used to make every later row «broken».
+
+        pandas takes the first line as the column count: «گزارش سفارشها» is one field,
+        so the four-field header and rows after it were dropped and the file looked empty.
+        """
+        path = self._text_file(
+            "ragged.csv",
+            "گزارش سفارش‌ها\n"
+            "ردیف,بارکد,نام گیرنده,کد سفارش\n"
+            f"1,{GOOD},امیر 123456,123456\n"
+            f"2,{GOOD2},رضا 654321,654321\n",
+        )
+        report = processor.process_file(path, path.name)
+        self.assertEqual(csv_rows(report)[1:], ["123456," + GOOD, "654321," + GOOD2])
+
+    def test_the_table_may_be_on_a_second_sheet(self):
+        from openpyxl import Workbook
+
+        path = self.dir / "multi.xlsx"
+        wb = Workbook()
+        wb.active.title = "راهنما"
+        wb.active.append(["این برگه فقط توضیح است"])
+        sheet = wb.create_sheet("سفارش‌ها")
+        sheet.append(HEADER)
+        sheet.append([1, GOOD, "1403-01-01", "امیر 123456", "123456", "تهران"])
+        wb.save(path)
+
+        report = processor.process_file(path, path.name)
+        self.assertEqual(csv_rows(report)[1:], ["123456," + GOOD])
+        self.assertEqual("سفارش‌ها", report.layout.sheet, "لینک سطرها به برگهٔ درست اشاره کند")
+        self.assertIn("سفارش‌ها", report.summary)  # and the report says which sheet it read
+
+    def test_an_html_export_named_xlsx_is_read(self):
+        """What several panels hand out as «Excel» is an HTML table with an xlsx name."""
+        path = self._text_file(
+            "panel.xlsx",
+            "<html><body><table>"
+            "<tr><td>ردیف</td><td>بارکد</td><td>نام گیرنده</td><td>کد سفارش</td></tr>"
+            f"<tr><td>1</td><td>{GOOD}</td><td>امیر 123456</td><td>123456</td></tr>"
+            "</table></body></html>",
+        )
+        report = processor.process_file(path, path.name)
+        self.assertEqual(csv_rows(report)[1:], ["123456," + GOOD])
+        self.assertIn("HTML", report.summary)  # how it was read is not a secret
+
+    def test_spreadsheetml_xml_named_xlsx_is_read(self):
+        path = self._text_file(
+            "old.xml.xlsx",
+            '<?xml version="1.0"?>'
+            '<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet">'
+            "<Worksheet><Table>"
+            "<Row><Cell><Data>ردیف</Data></Cell><Cell><Data>بارکد</Data></Cell>"
+            "<Cell><Data>کد سفارش</Data></Cell></Row>"
+            f"<Row><Cell><Data>1</Data></Cell><Cell><Data>{GOOD}</Data></Cell>"
+            "<Cell><Data>123456</Data></Cell></Row>"
+            "</Table></Worksheet></Workbook>",
+        )
+        report = processor.process_file(path, path.name)
+        self.assertEqual(csv_rows(report)[1:], ["123456," + GOOD])
+
+    def test_a_broken_zip_names_the_problem_not_pandas(self):
+        source = self.xlsx([HEADER, [1, GOOD, "1403-01-01", "امیر 123456", "123456", "x"]])
+        path = self.dir / "half-downloaded.xlsx"
+        path.write_bytes(source.read_bytes()[:40])  # an interrupted download
+        with self.assertRaises(processor.UnreadableFileError) as caught:
+            processor.process_file(path, path.name)
+        message = str(caught.exception)
+        self.assertIn("خراب یا نصفه", message)
+        self.assertNotIn("not a zip file", message, "متن انگلیسی pandas به کاربر نشان داده نشود")
+
+    def test_an_old_xls_named_xlsx_is_named_as_such(self):
+        path = self.dir / "old.xlsx"
+        path.write_bytes(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 64)
+        with self.assertRaises(processor.UnreadableFileError) as caught:
+            processor.process_file(path, path.name)
+        self.assertIn("اکسل قدیمی", str(caught.exception))
 
 
 # ---------------------------------------------------------------------------
@@ -482,22 +613,55 @@ class TestPdf(FileFixture):
         self.assertIn("19 رقم", report.problems_csv or "")  # the length rule, named
         self.assertIn("صفحهٔ 1", (report.problems_csv or "") + report.summary + (report.review_csv or ""))
 
-    def test_a_moved_layout_is_refused_instead_of_returning_nothing(self):
-        # The silent version of this bug was an empty tracking.csv: the row exists,
-        # the columns are somewhere else, and the warehouse gets "0 ردیف" with a ✅.
+    def test_a_moved_layout_is_read_by_its_geometry_not_by_fixed_columns(self):
+        """A printer setting used to turn the whole file into «ساختار PDF شناخته نشد».
+
+        The old reader took the barcode from a fixed x band; this file has every column
+        somewhere else — and the row is still there to be read, so it must come out.
+        """
         path = self.dir / "shifted.pdf"
         doc = pymupdf.open()
         page = doc.new_page(width=595, height=842)
-        for index, (number, barcode, middle) in enumerate([("1", GOOD, "Ali 123456 1403-01-01")]):
-            y = 90 + index * 16
-            page.insert_text((60, y), number, fontsize=9)
-            page.insert_text((120, y), barcode, fontsize=9)
-            page.insert_text((300, y), middle, fontsize=9)
+        y = 90
+        page.insert_text((60, y), "1", fontsize=9)
+        page.insert_text((150, y), GOOD, fontsize=9)
+        page.insert_text((330, y), "Ali 123456 1403-01-01", fontsize=9)
         doc.save(path)
         doc.close()
-        with self.assertRaises(ValueError) as caught:
+        report = processor.process_file(path, path.name)
+        self.assertEqual(csv_rows(report)[1:], ["123456," + GOOD])
+
+    def test_a_pdf_without_a_barcode_number_is_refused_loudly(self):
+        # The promise that matters is unchanged: a page we cannot read is *said*, not
+        # answered with an empty tracking.csv and a ✅.
+        path = self.dir / "scanned.pdf"
+        doc = pymupdf.open()
+        page = doc.new_page(width=595, height=842)
+        page.insert_text((60, 90), "Order list", fontsize=10)
+        page.insert_text((60, 110), "Ali 123 1403-01-01", fontsize=10)
+        doc.save(path)
+        doc.close()
+        with self.assertRaises(processor.UnreadableFileError) as caught:
             processor.process_file(path, path.name)
-        self.assertIn("ساختار PDF شناخته نشد", str(caught.exception))
+        message = str(caught.exception)
+        self.assertIn("هیچ عدد بلندی", message)
+        self.assertIn("سامانه", message)  # what to send instead
+
+    def test_columns_can_be_in_another_order(self):
+        # Landscape export: barcode on the left, receiver text on the right, «ردیف» far
+        # right. Nothing here is where the printed form in other tests puts it.
+        path = self.dir / "landscape.pdf"
+        doc = pymupdf.open()
+        page = doc.new_page(width=842, height=595)
+        y = 90
+        for number, barcode, middle in (("1", GOOD, "Ali 123456 1403-01-01"),):
+            page.insert_text((60, y), barcode, fontsize=9)
+            page.insert_text((260, y), middle, fontsize=9)
+            page.insert_text((800, y), number, fontsize=9)
+        doc.save(path)
+        doc.close()
+        report = processor.process_file(path, path.name)
+        self.assertEqual(csv_rows(report)[1:], ["123456," + GOOD])
 
 
 # ---------------------------------------------------------------------------
@@ -697,21 +861,87 @@ class TestTrackingFlow(FileFixture):
         documents = repeat_update.effective_message.documents()
         self.assertEqual([name for name, _ in documents], ["tracking.csv"])
 
+    def test_an_unreadable_file_answers_with_what_to_send_instead(self):
+        """«❌ خطا در پردازش» alone sent the warehouse back to the same broken file.
+
+        Every functional error now ends with a way out: the extension's own hint and the
+        next step of the flow.
+        """
+        source = self.xlsx([HEADER, [1, GOOD, "1403-01-01", "امیر 123456", "123456", "x"]])
+        path = self.dir / "half.xlsx"
+        path.write_bytes(source.read_bytes()[:40])  # the download was interrupted
+        context = h.context()
+        update, sent = h.document_update("half.xlsx", path, user_id=SUDO)
+        self.assertEqual(self.run_flow(update, context), TC.ASK_FILE)
+        text = "\n".join(str(entry[1]) for entry in sent if entry[0] == "text")
+        self.assertIn("خطا در پردازش", text)
+        self.assertIn("Save As", text, text)  # the hint for .xlsx
+        self.assertIn(TC.NEXT_FILE_TEXT, text)
+        self.assertFalse(any(Path(TC.TEMP_DIR).iterdir()), "بعد از خطا چیزی روی دیسک نمی‌ماند")
+
+    def test_a_worker_that_dies_mid_file_says_to_split_the_file(self):
+        """Memory cap or a restart: there is no parsers' sentence to translate, only to-dos."""
+        from bot.services import worker
+
+        path = self.xlsx([HEADER, [1, GOOD, "1403-01-01", "امیر 123456", "123456", "x"]])
+
+        async def dies(*args, **kwargs):
+            raise worker.WorkerCrash("resource limit")
+
+        context = h.context()
+        update, sent = h.document_update("big.xlsx", path, user_id=SUDO)
+        with mock.patch.object(TC.worker, "run", dies):
+            self.assertEqual(self.run_flow(update, context), TC.ASK_FILE)
+        text = "\n".join(str(entry[1]) for entry in sent if entry[0] == "text")
+        self.assertIn("تقسیم", text, text)
+        self.assertIn("سقف‌ها", text)
+        self.assertNotIn("resource limit", text, "متن انگلیسیِ ورکر به کاربر نشان داده نشود")
+
     def test_a_wrong_file_type_is_refused_before_anything_is_downloaded(self):
         path = self.dir / "orders.txt"
         path.write_text("بارکد\n", encoding="utf-8")
         context = h.context()
         update, sent = h.document_update("orders.txt", path, user_id=SUDO)
         self.assertEqual(self.run_flow(update, context), TC.ASK_FILE)
-        self.assertIn("فقط فایل‌های xlsx / csv / pdf", str(sent[-1][1]))
+        self.assertIn("فقط فایل‌های xlsx / xlsm / csv / pdf", str(sent[-1][1]))
 
-    def test_the_instructions_carry_the_limits_the_code_enforces(self):
+    def test_an_xls_file_says_how_to_make_it_an_xlsx(self):
+        # Refusing a file is fine; refusing it with «دوباره بفرست» means the user sends
+        # the same .xls again. The message names the fix instead.
+        path = self.dir / "orders.xls"
+        path.write_bytes(b"\xd0\xcf\x11\xe0" + b"\x00" * 32)
+        context = h.context()
+        update, sent = h.document_update("orders.xls", path, user_id=SUDO)
+        self.assertEqual(self.run_flow(update, context), TC.ASK_FILE)
+        text = str(sent[-1][1])
+        self.assertIn("xls", text)
+        self.assertIn("Save As", text)
+
+    def test_a_macro_enabled_workbook_is_accepted(self):
+        source = self.xlsx([HEADER, [1, GOOD, "1403-01-01", "امیر 123456", "123456", "x"]])
+        path = self.dir / "orders.xlsm"
+        path.write_bytes(source.read_bytes())  # the same zip, the other extension
+        context = h.context()
+        update, sent = h.document_update("orders.xlsm", path, user_id=SUDO)
+        self.assertEqual(self.run_flow(update, context), TC.ASK_FILE)
+        documents = dict(update.effective_message.documents())
+        self.assertIn("123456," + GOOD, documents["tracking.csv"].decode("utf-8-sig"))
+
+    def test_the_limits_are_told_where_they_matter_not_in_the_intro(self):
         with h.patched_settings(h.settings_with(max_rows=1234, max_file_mb=7.5)):
             # از `TC.settings` خوانده می‌شود، نه `settings` تست: patched_settings همان
             # نامِ ماژول را عوض می‌کند، و ما می‌خواهیم ببینیم صفحه چه عددی نشان می‌دهد.
-            text = TC.INSTRUCTIONS + "\n" + f"سقف‌ها: {TC.settings.limits_line}"
-        self.assertIn("1,234", text)
-        self.assertIn("7.5 MB", text)
+            limits = TC._limits_line()
+            intro = TC.INSTRUCTIONS
+        # سقف‌ها کنارِ خودِ خطا («🚧 …») و در «📊 وضعیت» گفته می‌شوند…
+        self.assertIn("1,234", limits)
+        self.assertIn("7.5 MB", limits)
+        # …و پیامِ ورود فقط «چه بفرست» است: بدونِ گام‌ها، هشدارها و تکرارِ سقف‌ها.
+        for token in ("xlsx", "xlsm", "csv", "pdf"):
+            self.assertIn(token, intro)
+        self.assertNotIn("ربات این کارها را می‌کند", intro)
+        self.assertNotIn("1,234", intro)
+        self.assertNotIn("7.5 MB", intro)
 
     def test_leaving_the_flow_releases_the_download(self):
         import asyncio

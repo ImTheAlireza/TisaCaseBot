@@ -11,7 +11,7 @@
 
 اجرا:
 
-    .venv/bin/python scripts/simulate_product_flow.py
+    .venv/bin/python tools/simulate_product_flow.py
 
 هیچ درخواستی به تلگرام یا سایت نمی‌رود: نه شبکه‌ای خوانده می‌شود و نه چیزی نوشته
 می‌شود. داده‌های موقت در ``/tmp/tisa-product-sim`` می‌مانند، نه در ``data/`` مخزن.

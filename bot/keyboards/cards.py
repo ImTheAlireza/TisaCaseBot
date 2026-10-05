@@ -66,18 +66,19 @@ def result_card(entry: dict[str, object]) -> str:
         f"🎨 {entry.get('variations', 0)} واریژن · 🖼 {entry.get('images', 0)} تصویر · "
         f"💰 {price_line(entry)}"
     )
-    if int(entry.get("sale_price") or 0):
-        lines.append(f"🏷 قیمت ویژه: {int(entry['sale_price']):,} تومان")
+    sale = _as_int(entry.get("sale_price"))
+    if sale:
+        lines.append(f"🏷 قیمت ویژه: {sale:,} تومان")
     model_prices = entry.get("model_prices")
     if isinstance(model_prices, dict) and model_prices:
         lines.append(
             "🧩 قیمت مدل‌های خاص: " + " | ".join(
-                f"{html.escape(str(model), quote=False)}: {int(value):,}"
+                f"{html.escape(str(model), quote=False)}: {_as_int(value):,}"
                 for model, value in model_prices.items()
             )
         )
     if entry.get("stock") is not None:
-        lines.append(f"📦 موجودی: {int(entry['stock']):,} عدد"
+        lines.append(f"📦 موجودی: {_as_int(entry.get('stock')):,} عدد"
                      + (f" ({entry['stock_status']})" if entry.get("stock_status") else ""))
     matrix = entry.get("stock_matrix")
     if isinstance(matrix, dict) and matrix:
@@ -95,7 +96,7 @@ def result_card(entry: dict[str, object]) -> str:
         )
     if entry.get("sku_prefix"):
         lines.append(f"🏷 پیشوند SKU: <code>{html.escape(str(entry['sku_prefix']), quote=False)}</code>")
-    warnings = [str(x) for x in (entry.get("warnings") or [])]
+    warnings = [str(x) for x in _as_list(entry.get("warnings"))]
     if warnings:
         lines.append("")
         lines.append(f"📎 {len(warnings)} نکته‌ای که باید بدانی:")
@@ -103,16 +104,33 @@ def result_card(entry: dict[str, object]) -> str:
     return "\n".join(lines)
 
 
+def _as_int(value: object) -> int:
+    """A ledger value as an int; anything unexpected is 0, never a crash in a card."""
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return 0
+    try:
+        return int(value)
+    except ValueError:
+        return 0
+
+
+def _as_list(value: object) -> list[object]:
+    """A ledger value as a list — a scalar counts as one item, ``None`` as none."""
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return [] if value is None else [value]
+
+
 def _update_body(entry: dict[str, object], lines: list[str]) -> list[str]:
     """An update's card says what *changed* — the generic «price · stock · SKU» block would
     show the draft's numbers, and for an update the draft is mostly silence."""
-    changes = [str(x) for x in (entry.get("changes") or [])]
+    changes = [str(x) for x in _as_list(entry.get("changes"))]
     if changes:
         lines.append("تغییرها:")
         lines.extend(f"• {html.escape(text, quote=False)}" for text in changes)
     if entry.get("variations"):
         lines.append(f"🎨 {entry.get('variations', 0)} واریژن")
-    warnings = [str(x) for x in (entry.get("warnings") or [])]
+    warnings = [str(x) for x in _as_list(entry.get("warnings"))]
     if warnings:
         lines.append("")
         lines.append(f"📎 {len(warnings)} نکته‌ای که باید بدانی:")

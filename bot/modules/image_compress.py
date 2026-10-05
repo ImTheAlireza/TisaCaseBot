@@ -41,11 +41,12 @@ from bot.services.conversations import FlowConversationHandler
 from bot.keyboards import main_menu_keyboard, main_menu_text
 from bot.services.image_compressor import compress_image
 from bot.services.product_text_summary import format_product_summary
+from bot.utils.ui import answer_and_edit
 
 logger = logging.getLogger(__name__)
 
 WAITING = 0
-TEMP_DIR = Path("/tmp/tisaposttowp-compress")
+TEMP_DIR = settings.temp_dir / "compress"
 
 
 def close_for(user_id: int) -> bool:
@@ -281,8 +282,8 @@ async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data[COMPRESS_RETRIES_KEY] = 0
     # «one thing at a time»: any other open flow of this user is closed first.
     closed = flow_guard.close_others("compress", user.id)
-    if closed:
-        await query.message.reply_text(  # type: ignore[union-attr]
+    if closed and query.message is not None:
+        await query.message.reply_text(
             "↩️ جریان «" + "»، «".join(closed) + "» قبلی‌ات بسته شد."
         )
     await query.edit_message_text(
@@ -573,14 +574,15 @@ async def cb_back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     """The in-flow «بازگشت به منو» button."""
     query = update.callback_query
     user = update.effective_user
-    await query.answer()
     if user:
         close_for(user.id)
     _clear_analysis(context)
-    await query.edit_message_text(
+    await answer_and_edit(
+        query,
         main_menu_text(user.id if user else None, user),
         reply_markup=main_menu_keyboard(user.id if user else None),
         parse_mode="HTML",
+        quiet=True,
     )
     return ConversationHandler.END
 

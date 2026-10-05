@@ -180,7 +180,10 @@ class FakeStore:
             page, per_page = int(params.get("page", 1)), int(params.get("per_page", 100))
             return httpx.Response(200, json=self.variations[(page-1)*per_page:page*per_page])
         if method == "GET" and path.endswith("/products"):
-            if self.search_status != 200:
+            # Some hosts reject ``status=any`` on the products route (HTTP 400) but accept
+            # the same query without it — the fallback only makes sense if the fake
+            # blames the parameter, not the request as a whole.
+            if self.search_status != 200 and "status" in params:
                 return httpx.Response(self.search_status, json={"code": "rest_invalid_param"})
             page, per_page = int(params.get("page", 1)), int(params.get("per_page", 100))
             return httpx.Response(200, json=self.products[(page-1)*per_page:page*per_page])

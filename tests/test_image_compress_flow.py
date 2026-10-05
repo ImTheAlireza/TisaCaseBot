@@ -180,9 +180,18 @@ class TestImageCompressAnalysis(unittest.IsolatedAsyncioTestCase):
             compressed_ids.append(source.read_text())
             return output
 
+        from _flow_harness import temp_ledger
+
+        async def run_inline(function, *args, **kwargs):
+            """همان فراخوانی، ولی در همین پروسه: تابعِ patchشدهٔ محلی به ورکر pickle نمی‌شود."""
+            kwargs.pop("timeout", None)
+            return function(*args, **kwargs)
+
         with (
+            temp_ledger(),        # کاربر ۷ ادمین است؛ دروازهٔ دسترسی واقعاً اجرا می‌شود
             TemporaryDirectory() as directory,
             patch.object(image_compress, "TEMP_DIR", Path(directory)),
+            patch.object(image_compress.worker, "run", new=run_inline),
             patch.object(image_compress, "_download", new=downloaded),
             patch.object(image_compress, "compress_image", new=compressed),
             patch.object(image_compress, "_log_to_group", new=AsyncMock()) as log,
@@ -236,9 +245,18 @@ class TestImageCompressAnalysis(unittest.IsolatedAsyncioTestCase):
             output.write_bytes(b"compressed")
             return output
 
+        from _flow_harness import temp_ledger
+
+        async def run_inline(function, *args, **kwargs):
+            """همان فراخوانی، ولی در همین پروسه: تابعِ patchشدهٔ محلی به ورکر pickle نمی‌شود."""
+            kwargs.pop("timeout", None)
+            return function(*args, **kwargs)
+
         with (
+            temp_ledger(),        # کاربر ۷ ادمین است؛ دروازهٔ دسترسی واقعاً اجرا می‌شود
             TemporaryDirectory() as directory,
             patch.object(image_compress, "TEMP_DIR", Path(directory)),
+            patch.object(image_compress.worker, "run", new=run_inline),
             patch.object(image_compress, "_download", new=downloaded),
             patch.object(image_compress, "compress_image", new=compressed),
             patch.object(image_compress, "_log_to_group", new=AsyncMock()),

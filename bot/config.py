@@ -21,6 +21,9 @@ logger = logging.getLogger(__name__)
 # (supervisor does not always set `directory=`).
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
+#: منطقه زمانیِ پیش‌فرض برای مُهر زمانی‌ها و کارهای روزانه (وقتی TISA_TZ خالی است).
+_DEFAULT_TZ = "Asia/Tehran"
+
 
 def _load_env_file(path: Path) -> None:
     """Read `.env` if python-dotenv is installed — a convenience, never a need.
@@ -54,11 +57,6 @@ def data_dir() -> Path:
 
 def _raw(name: str, default: str = "") -> str:
     return (os.getenv(name) or "").strip() or default.strip()
-
-
-def _as_str(name: str, default: str) -> tuple[str, str | None]:
-    value = _raw(name, default)
-    return value, None
 
 
 def _as_float(name: str, default: float) -> tuple[float, str | None]:
@@ -171,9 +169,28 @@ class Settings:
     # Flow behaviour.
     flow_timeout_seconds: int = 900
     temp_ttl_hours: int = 12
+    #: Where per-session work directories (downloads, compressed photos) live.
+    #: Default ``<TISA_DATA_DIR>/tmp``; ``TISA_TEMP_DIR`` moves it. Predictable paths
+    #: under the system ``/tmp`` can be created by another account on a shared host.
+    temp_dir: Path = field(default_factory=lambda: data_dir() / "tmp")
+    #: Daily state backups (JSON stores + both SQLite databases + the send queue).
+    #: One zip per day, rotated; see bot/services/backup.py.
+    backup_dir: Path = field(default_factory=lambda: data_dir() / "backups")
+    backup_keep: int = 7
+    #: Hour (in TISA_TZ, default Asia/Tehran) of the daily «📊 گزارش روزانه» in
+    #: the log chat; 0 = off.
+    daily_report_hour: int = 9
+    #: Time zone for all user-visible timestamps and daily jobs. Default ``Asia/Tehran``.
+    #: Falls back to the default if the name is unknown (a warning goes to logs).
+    timezone: str = _DEFAULT_TZ
     max_file_mb: float = 25.0
     max_rows: int = 200_000
     process_timeout_seconds: float = 120.0
+    #: حافظه‌ای که کارگرِ فایل می‌تواند *روی پایهٔ خودش* خرج کند (MB). سقفِ کلِ
+    #: پردازه نیست: ایمپورت‌های خودِ کارگر (pandas و…) روی همین عدد سوار می‌شوند.
+    #: روی هاستِ کوچک، کمکردنش فایل‌ها را زودتر و صادقانه رد می‌کند؛ بالا بردنش
+    #: اجازه می‌دهد فایل‌های بزرگ‌تر خوانده شوند. جزئیات در bot/services/worker.py.
+    worker_memory_mb: float = 768.0
     #: VERBOSE_LOG=1 → besides the one product card, the full line-by-line trace of
     #: that product is sent to the log chat too (and written to the log file). Off by
     #: default on purpose: the card is what you read on a normal day.
@@ -232,6 +249,26 @@ class Settings:
             note(f"LOG_CHAT_ID={log_chat_id} شبیه شناسهٔ معتبر چت نیست؛ خاموش شد.")
             log_chat_id = 0
 
+        temp_raw = _raw("TISA_TEMP_DIR")
+        temp_dir = Path(temp_raw).expanduser() if temp_raw else data_dir() / "tmp"
+        backup_raw = _raw("TISA_BACKUP_DIR")
+        backup_dir = Path(backup_raw).expanduser() if backup_raw else data_dir() / "backups"
+        backup_keep, problem = _as_int("TISA_BACKUP_KEEP", 7)
+        note(problem)
+        backup_keep = max(1, min(365, backup_keep))
+        report_hour, problem = _as_int("TISA_DAILY_REPORT_HOUR", 9)
+        note(problem)
+        if not 0 <= report_hour <= 23:
+            note("TISA_DAILY_REPORT_HOUR باید بین ۰ و ۲۳ باشد؛ گزارش خاموش شد.")
+            report_hour = 0
+        tz_name = _raw("TISA_TZ", _DEFAULT_TZ) or _DEFAULT_TZ
+        try:
+            from zoneinfo import ZoneInfo
+            ZoneInfo(tz_name)
+        except Exception:  # ImportError یا ZoneInfoNotFoundError
+            note(f"TISA_TZ={tz_name!r} منطقهٔ شناخته‌شده‌ای نیست؛ به {_DEFAULT_TZ} برگشت.")
+            tz_name = _DEFAULT_TZ
+
         price_min, problem = _as_int("PRICE_MIN", 1_000)
         note(problem)
         price_max, problem = _as_int("PRICE_MAX", 500_000_000)
@@ -271,6 +308,11 @@ class Settings:
             note("MAX_ROWS باید مثبت باشد؛ پیش‌فرض ۲۰۰٬۰۰۰ استفاده شد.")
         process_timeout, problem = _as_float("PROCESS_TIMEOUT_SECONDS", 120.0)
         note(problem)
+        worker_memory, problem = _as_float("WORKER_MEMORY_MB", 768.0)
+        note(problem)
+        if not (worker_memory >= 64):
+            worker_memory = 768.0
+            note("WORKER_MEMORY_MB باید حداقل ۶۴ باشد؛ پیش‌فرض ۷۶۸ استفاده شد.")
 
         log_level = _raw("LOG_LEVEL", "INFO").upper()
         if log_level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
@@ -309,9 +351,15 @@ class Settings:
             barcode_lengths=barcode_lengths,
             flow_timeout_seconds=flow_timeout,
             temp_ttl_hours=temp_ttl,
+            temp_dir=temp_dir,
+            backup_dir=backup_dir,
+            backup_keep=backup_keep,
+            daily_report_hour=report_hour,
+            timezone=tz_name,
             max_file_mb=max_file_mb,
             max_rows=max_rows,
             process_timeout_seconds=max(5.0, process_timeout),
+            worker_memory_mb=worker_memory,
             problems=tuple(problems),
         )
         for problem in problems:

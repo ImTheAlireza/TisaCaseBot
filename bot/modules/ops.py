@@ -36,7 +36,9 @@ from bot.services import flow_state, importer_contract, metrics, outbox, sku, tr
 from bot.services.woo_client import WooClient
 from bot.services.woocommerce import ping_woocommerce
 from bot.services.wordpress_media import test_wordpress_media
+from bot.utils import timeutil
 from bot.utils.text import clip_html
+from bot.utils.ui import answer_and
 
 logger = logging.getLogger(__name__)
 
@@ -379,8 +381,7 @@ async def cb_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if denied:
         await query.answer(denied, show_alert=True)
         return
-    await query.answer()
-    await query.message.reply_html(status_text(), reply_markup=_keyboard())
+    await answer_and(query, query.message.reply_html(status_text(), reply_markup=_keyboard()))
 
 
 async def cb_diagnose(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -390,8 +391,7 @@ async def cb_diagnose(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if denied:
         await query.answer(denied, show_alert=True)
         return
-    await query.answer()
-    status = await query.message.reply_text("⏳ دارم هم‌زمان چند جا را چک می‌کنم…")
+    status = await answer_and(query, query.message.reply_text("⏳ دارم هم‌زمان چند جا را چک می‌کنم…"))
     started = time.perf_counter()
     text = diagnose_text(await run_checks(context.bot), seconds=time.perf_counter() - started)
     try:
@@ -407,7 +407,7 @@ async def send_metrics_file(context: ContextTypes.DEFAULT_TYPE, chat_id: int) ->
     await context.bot.send_document(
         chat_id=chat_id,
         document=io.BytesIO(metrics.export_csv().encode("utf-8-sig")),
-        filename=f"tisa-metrics-{time.strftime('%Y%m%d-%H%M')}.csv",
+        filename=f"tisa-metrics-{timeutil.strftime('%Y%m%d-%H%M')}.csv",
         caption="📈 شمارنده‌ها از وقتی `data/metrics.sqlite3` ساخته شده می‌آیند، نه فقط دیشب. "
                 "نسبت‌ها از خودِ شمارنده‌ها حساب شده‌اند.",
     )
