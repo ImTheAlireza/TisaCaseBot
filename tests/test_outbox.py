@@ -493,6 +493,26 @@ class TestDrainingTheQueue(QueueTestCase):
         self.assertEqual(before + 1, row.attempts, "تلاش شمرده می‌شود تا آخرِ مهلت معنادار بماند")
         self.assertLess(row.next_at - time.time(), outbox.SILENT_RETRY_SECONDS)
 
+    async def test_the_day_that_passes_ends_as_an_expiry_not_an_error(self) -> None:
+        """۲۴ ساعت که بگذرد پیام باید «انقضای صف» باشد، نه «خطای تکراری».
+
+        گیرندهٔ این جمله کسی است که فرم را اشتباه نزده؛ «این را باید دستی درست کنی» او را
+        دنبالِ خطایی می‌فرستد که وجود ندارد.
+        """
+        import httpx
+
+        self.error = httpx.ReadTimeout("nothing answered")   # بی‌اثر: انقضا پیش از نوشتن می‌آید
+        self.enqueue(batch="day124day123", delay=0.0, now=time.time() - outbox.MAX_AGE_SECONDS - 60)
+        await self._drain()
+        self.assertEqual(0, outbox.pending(), "ردیفِ منقضی در صف نمی‌ماند")
+        self.assertEqual(1, outbox.stats()["dropped"])
+        texts = [str(item.get("text")) for item in self.sent]
+        expiry = [text for text in texts if "بیست‌وچهار ساعت" in text]
+        self.assertEqual(1, len(expiry), texts)
+        self.assertNotIn("خطای تکراری", expiry[0])
+        self.assertIn("تاریخچه", expiry[0], "باید بگوید کجای ربات ادامه بدهی")
+        self.assertEqual("failed", products_ledger.recent(1)[0]["status"], "کارتِ تاریخچه باز می‌ماند")
+
     async def test_a_permanent_error_leaves_the_queue_and_says_why(self) -> None:
         self.error = WooCommerceAPIError(400, "تصویر مجاز نیست")
         self.enqueue(batch="perm1234perm", delay=0.0)

@@ -121,6 +121,10 @@ class WooCommerceAPIError(RuntimeError):
         #: «nothing answered» — set by the preflight on its own silence, and the only thing that
         #: lets :func:`bot.services.outbox.is_silent` tell a dead host from a busy one (both 503).
         self.host_silent: bool = False
+        #: The queue's own deadline, said on the error: «مهلت ۲۴ ساعت/تلاش‌ها تمام شد». Only the
+        #: queue sets it, so the message can tell that expiry apart from a 410 the shop itself
+        #: answered for some other reason.
+        self.queue_expired: bool = False
         super().__init__(redact(message))
 
 

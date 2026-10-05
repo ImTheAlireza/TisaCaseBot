@@ -112,7 +112,11 @@ async def _attempt(app: Application, entry: outbox.QueuedPublish) -> None:
     report: list[str] = []
     try:
         if outbox.expired(entry):
-            raise WooCommerceAPIError(410, "مهلت ۲۴ ساعته/تعداد تلاش این بسته تمام شده؛ بدون ارسال به فروشگاه رها شد.")
+            error = WooCommerceAPIError(
+                410, "مهلت ۲۴ ساعته و ۸ تلاشِ این بسته تمام شده؛ بدون ارسال به فروشگاه رها شد."
+            )
+            error.queue_expired = True
+            raise error
         try:
             actor = int(entry.user_id)
         except (TypeError, ValueError):
@@ -163,12 +167,33 @@ async def _attempt(app: Application, entry: outbox.QueuedPublish) -> None:
                 await _notify(
                     app, entry,
                     f"❌ بعد از {updated.attempts} تلاش این محصول در صف ماند و رها شد:\n{reason}\n"
-                    "هرچه در پیش‌نمایش تأیید کرده بودی ذخیره شده؛ دوباره «تأیید و ساخت» را بزن.",
+                    "هرچه در پیش‌نمایش تأیید کرده بودی در «🧾 تاریخچهٔ محصولات» مانده. اگر جریان هنوز "
+                    "باز است همان «✅ تأیید و ساخت» را بزن؛ اگر بسته شده، از «📦 ساخت محصول» با "
+                    "همان عکس‌ها دوباره شروع کن.",
                 )
             else:
                 wait = max(0, int(updated.next_at - time.time()))
                 logger.info("outbox: تلاش %s/%s برای %s پس از %ss", updated.attempts,
                             outbox.MAX_ATTEMPTS, updated.batch_id, wait)
+            return
+        if getattr(exc, "queue_expired", False):
+            # The queue's own deadline, not a verdict about the product. It has to read
+            # differently: «رهایش کردم» is a decision the bot made, and the seller's next move
+            # (open the flow again) is a different move than «fix this error».
+            await asyncio.to_thread(_finish_card, entry, status="failed", error=reason)
+            await asyncio.to_thread(
+                outbox.abandon, entry.batch_id, reason,
+                expected_updated_at=entry.updated_at or None,
+                expected_generation=entry.generation or None,
+                claim_token=entry.claim_token or None,
+            )
+            await _notify(
+                app, entry,
+                "⌛ بیست‌وچهار ساعت از صف این محصول گذشت و سایت هنوز جواب نمی‌داد؛ رهایش کردم تا "
+                "بی‌آخر تلاش نکند — هیچ‌چیز روی فروشگاه نوشته نشد.\n\n"
+                "پیش‌نمایش و علتش در «🧾 تاریخچهٔ محصولات» مانده؛ برای ساختنش جریان «📦 ساخت محصول» "
+                "را دوباره باز کن و عکس‌ها را از نو بفرست (پس از رهاکردن، صف کپیِ خودش را پاک می‌کند).",
+            )
             return
         # A 400 will answer the same way tomorrow: saying why now is kinder than a silent queue.
         await asyncio.to_thread(_finish_card, entry, status="failed", error=reason)
