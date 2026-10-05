@@ -67,7 +67,9 @@ def test_the_compress_report_shows_colors_variations_and_refusals(monkeypatch):
     report = _call(monkeypatch, factory, caption="قاب چرم مشکی").report()
 
     assert "<b>مدل گوشی:</b> iPhone 13 | iPhone 14" in report
-    assert "<b>رنگ هر مدل:</b>" in report and "iPhone 13: مشکی" in report
+    assert "<b>رنگ هر مدل:</b> مشکی: iPhone 13 · مشکی/سفید: iPhone 14" in report
+    # The flow's own summary sentence must not restate the same palette a second time.
+    assert report.count("iPhone 13") == 2
     # 2 models × 2 colors, minus the one combination the color matrix forbids.
     assert "<b>واریژن:</b> 3 ترکیب (مدل × رنگ)" in report
     assert "1 ترکیب را حذف کرد" in report
@@ -112,6 +114,7 @@ def test_a_partial_parser_result_cannot_break_the_report(monkeypatch):
 def test_ai_notes_travel_with_the_report_and_with_the_legacy_tuple(monkeypatch):
     factory = _fake_extract(["iPhone 13"], attributes={}, ai_notes=("AI: حدس از روی context",))
     analysis = _call(monkeypatch, factory)
+    # A *guess* is the one AI outcome a verification card must never hide.
     assert "🤖 AI: حدس از روی context" in analysis.report()
     diagnostics: list[str] = []
     models, attributes = asyncio.run(
@@ -119,6 +122,62 @@ def test_ai_notes_travel_with_the_report_and_with_the_legacy_tuple(monkeypatch):
     )
     assert models == ["iPhone 13"] and attributes == {}
     assert diagnostics == ["AI: حدس از روی context"]
+
+
+def test_a_successful_ai_call_is_not_news_on_the_card(monkeypatch):
+    # «پاسخ AI پردازش شد» and «پاسخ AI شامل 14 مدل بود» describe a request that went fine. On the
+    # seller's card they are two lines of noise; in the group log they are the trace of what ran.
+    factory = _fake_extract(
+        ["iPhone 13"],
+        attributes={},
+        ai_notes=("نرمال‌سازی مدل: پاسخ AI شامل 14 مدل بود", "استخراج جزئیات: پاسخ AI پردازش شد",
+                  "نرمال‌سازی مدل: خطای timeout؛ پارسر قطعی حفظ شد"),
+        to_dict=lambda: {"models": ["iPhone 13"], "attributes": {}},
+    )
+    analysis = _call(monkeypatch, factory)
+    report = analysis.report()
+    assert "پردازش شد" not in report and "شامل 14 مدل بود" not in report
+    assert "🤖 نرمال‌سازی مدل: خطای timeout" in report           # the failure is still on the card
+    detail = analysis.detail()
+    assert "پردازش شد" in detail and "شامل 14 مدل بود" in detail
+
+
+def test_a_uniform_palette_is_one_fact_not_fourteen(monkeypatch):
+    models = [f"iPhone {n}" for n in range(13, 27)]
+    same = {model: ["قهوه‌ای", "صورتی"] for model in models}
+    factory = _fake_extract(
+        models,
+        attributes={"رنگ": ["قهوه‌ای", "صورتی"]},
+        model_colors=same,
+        to_dict=lambda: {"models": models, "attributes": {"رنگ": ["قهوه‌ای", "صورتی"]},
+                         "model_colors": same},
+    )
+    analysis = _call(monkeypatch, factory, caption="قاب چرم", info="رنگ: قهوه‌ای، صورتی")
+    report = analysis.report()
+    assert "قهوه‌ای/صورتی" not in report                 # not enumerated 14 times …
+    assert "<b>ویژگی‌ها:</b> رنگ: قهوه‌ای، صورتی" in report        # … because the color axis already says it
+    assert "28 ترکیب" in report or "26 ترکیب" in report   # 13 models × 2 colours is still counted
+    # The audit keeps the full mapping, so the fold is never a loss.
+    assert "iPhone 26: قهوه‌ای/صورتی" in analysis.detail()
+
+
+def test_a_long_rejected_line_is_quoted_as_much_as_it_matters():
+    # One long caption line must not turn the one line meant to be *read* into a wall.
+    label = "قاب " + "، ".join(f"iPhone {n} pro max" for n in range(13, 30))
+    report = TextAnalysis(phone_models=("iPhone 13",), unmatched=((label, ("max",)),)).report()
+    quoted = next(line for line in report.splitlines() if line.startswith("🚫"))
+    assert len(quoted) < 260 and "…" in quoted
+
+
+def test_a_palette_that_actually_differs_still_names_the_groups(monkeypatch):
+    colors = {"iPhone 13": ["مشکی"], "iPhone 14": ["مشکی", "سفید"], "A54": ["شفاف"]}
+    factory = _fake_extract(["iPhone 13", "iPhone 14", "A54"], attributes={},
+                            model_colors=colors,
+                            to_dict=lambda: {"models": ["iPhone 13", "iPhone 14", "A54"],
+                                             "attributes": {}, "model_colors": colors})
+    report = _call(monkeypatch, factory).report()
+    assert "رنگ هر مدل:" in report
+    assert "مشکی: iPhone 13" in report and "شفاف: A54" in report
 
 
 def test_report_escapes_the_shop_text():

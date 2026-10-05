@@ -13,7 +13,6 @@ Admins can use it only while the sudo owner has it enabled for them (see the
 from __future__ import annotations
 
 import asyncio
-import html
 import logging
 import secrets
 import re
@@ -159,7 +158,6 @@ async def _send_analysis(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> No
     extraction_started = time.perf_counter()
     analysis = await analyze_text(caption, info)
     extraction_ms = (time.perf_counter() - extraction_started) * 1000
-    diagnostics = list(analysis.ai_notes)
     report = analysis.report()
     if report == context.user_data.get(ANALYSIS_REPORT_KEY):
         return
@@ -171,10 +169,12 @@ async def _send_analysis(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> No
         f"🗜️ [compress:{user_id}] خروجی همان پارسرِ ساخت محصول "
         f"(استخراج {extraction_ms:.0f} ms):\n{report}"
     )
-    if diagnostics:
-        audit_text += "\nیادداشت‌های پارسر/AI: " + " | ".join(
-            html.escape(item) for item in diagnostics[:6]
-        )
+    folded = analysis.detail()
+    if folded:
+        # The card is written to be skimmed in three seconds; the log is written to be audited.
+        # Whatever the report folded away — a uniform palette across dozens of models, an AI call
+        # that succeeded, a note about something this screen cannot act on — lands here instead.
+        audit_text += "\nجزئیات (فشرده‌شده در کارت):\n" + folded
     await _log_to_group(context, audit_text, parse_mode="HTML")
     context.user_data[ANALYSIS_REPORT_KEY] = report
 
