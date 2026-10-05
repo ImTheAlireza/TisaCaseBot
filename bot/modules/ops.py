@@ -36,6 +36,7 @@ from bot.services import flow_state, importer_contract, metrics, outbox, sku, tr
 from bot.services.woo_client import WooClient
 from bot.services.woocommerce import ping_woocommerce
 from bot.services.wordpress_media import test_wordpress_media
+from bot.utils import timeutil
 from bot.utils.text import clip_html
 from bot.utils.ui import answer_and
 
@@ -406,7 +407,7 @@ async def send_metrics_file(context: ContextTypes.DEFAULT_TYPE, chat_id: int) ->
     await context.bot.send_document(
         chat_id=chat_id,
         document=io.BytesIO(metrics.export_csv().encode("utf-8-sig")),
-        filename=f"tisa-metrics-{time.strftime('%Y%m%d-%H%M')}.csv",
+        filename=f"tisa-metrics-{timeutil.strftime('%Y%m%d-%H%M')}.csv",
         caption="📈 شمارنده‌ها از وقتی `data/metrics.sqlite3` ساخته شده می‌آیند، نه فقط دیشب. "
                 "نسبت‌ها از خودِ شمارنده‌ها حساب شده‌اند.",
     )

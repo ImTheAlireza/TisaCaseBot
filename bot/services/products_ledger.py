@@ -26,13 +26,13 @@ small, human-readable, and deleting it costs nothing but history.
 
 from __future__ import annotations
 
-import time
 import uuid
 from typing import Any
 from collections.abc import Iterable
 
 from bot.services.jsonstore import checked_write, lock_for, read_json, write_json
 from bot.config import data_dir
+from bot.utils import timeutil
 
 DATA_DIR = data_dir()
 FILE = DATA_DIR / "recent_products.json"
@@ -122,7 +122,7 @@ def record(
         "error": (error or "")[:400],
         "report": (report or "")[:REPORT_LIMIT],
         "batch_id": batch_id,
-        "ts": time.time(),
+        "ts": timeutil.now(),
     }
     with _lock:
         entries = _load()
@@ -173,7 +173,7 @@ def update(key: str, **fields: Any) -> dict[str, Any] | None:
             if str(entry.get("key")) == str(key):
                 previous = str(entry.get("status") or "")
                 entry.update({k: v for k, v in fields.items() if v is not None or k == "product_id"})
-                entry["done_ts"] = time.time()
+                entry["done_ts"] = timeutil.now()
                 entries[index] = entry
                 checked_write(FILE, {"version": 1, "entries": entries[:MAX_ENTRIES]}, write_json)
                 _count(entry, previous=previous)
@@ -217,7 +217,7 @@ def clear() -> int:
 
 def summary(entry: dict[str, Any]) -> str:
     """One line for the list: what happened, to which product, when."""
-    moment = time.strftime("%Y/%m/%d %H:%M", time.localtime(float(entry.get("ts") or 0)))
+    moment = timeutil.strftime("%Y/%m/%d %H:%M", float(entry.get("ts") or 0))
     status = str(entry.get("status"))
     mark = {
         "created": "✅", "zip": "📦", "failed": "❌", "dry": "🧪", "pending": "⏳",

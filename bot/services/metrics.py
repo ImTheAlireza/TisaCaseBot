@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from bot.config import data_dir
+from bot.utils import timeutil
 
 logger = logging.getLogger(__name__)
 
@@ -325,7 +326,7 @@ def export_csv() -> str:
     lines = ["key,counter,n,total,peak,updated_iso"]
     for key, counter in COUNTERS.items():
         n, total, peak, updated = seen.get(key, (0, 0.0, 0.0, 0.0))
-        when = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(updated)) if updated else ""
+        when = timeutil.strftime("%Y-%m-%dT%H:%M:%S", updated) if updated else ""
         lines.append(f'{key},"{counter.label}",{n},{total:g},{peak:g},{when}')
     for name, (numerator, denominator, label) in RATIOS.items():
         value = rate(numerator, denominator)

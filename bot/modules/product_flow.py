@@ -48,6 +48,7 @@ from bot.config import settings
 from bot.constants import CB
 from bot.services.conversations import FlowConversationHandler
 from bot.keyboards import main_menu_keyboard, main_menu_text, result_card, result_keyboard
+from bot.utils import timeutil
 from bot.modules import outbox_flow, restock_flow
 from bot.services import (
     draft_edits,
@@ -642,7 +643,7 @@ def _already_published_note(entry: dict[str, object]) -> str:
     already made — otherwise the answer is «بزن دوباره تا درست شود» and a second
     product, which is the exact bug this gate exists to prevent.
     """
-    when = time.strftime("%Y/%m/%d %H:%M", time.localtime(float(entry.get("ts") or 0)))
+    when = timeutil.strftime("%Y/%m/%d %H:%M", float(entry.get("ts") or 0))
     title = html.escape(str(entry.get("title") or "—"), quote=False)
     ident = entry.get("product_id")
     url = str(entry.get("edit_url") or "")

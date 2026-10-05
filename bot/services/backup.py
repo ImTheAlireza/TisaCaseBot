@@ -22,13 +22,13 @@ from __future__ import annotations
 import logging
 import os
 import sqlite3
-import time
 import zipfile
 from pathlib import Path
 
 from bot.config import data_dir, settings
 from bot.services import metrics, outbox
 from bot.services.fsutils import fsync_dir, private_dir, private_file
+from bot.utils import timeutil
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +39,7 @@ PREFIX = "backup-"
 
 
 def _stamp(now: float | None = None) -> str:
-    return time.strftime("%Y%m%d", time.localtime(time.time() if now is None else now))
+    return timeutil.strftime("%Y%m%d", now)
 
 
 def directory() -> Path:
@@ -67,7 +67,7 @@ def due(now: float | None = None, *, max_age_hours: float = 20.0) -> bool:
     newest = latest()
     if newest is None:
         return True
-    age_hours = (time.time() - newest.stat().st_mtime) / 3600
+    age_hours = (timeutil.now() - newest.stat().st_mtime) / 3600
     return age_hours >= max_age_hours
 
 
@@ -90,11 +90,19 @@ def _sqlite_copy(source: Path, target: Path) -> bool:
         return False
 
 
-def _queued_files() -> list[Path]:
+def _queued_files() -> list[tuple[Path, str]]:
+    """فایل‌های درون صف؛ arcname نسبی است تا دو فایلِ همنام در زیرپوشه‌های متفاوت
+    روی هم نیفتند (مثل `foo/x.jpg` و `bar/x.jpg`)."""
     root = Path(outbox.FILES_DIR)
     if not root.is_dir():
         return []
-    return [path for path in sorted(root.rglob("*")) if path.is_file()]
+    pairs: list[tuple[Path, str]] = []
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(root).as_posix()
+        pairs.append((path, f"outbox_files/{rel}"))
+    return pairs
 
 
 def create(*, now: float | None = None, force: bool = False) -> Path | None:
@@ -117,8 +125,8 @@ def create(*, now: float | None = None, force: bool = False) -> Path | None:
         with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             for path in _state_files():
                 archive.write(path, arcname=path.name)
-            for path in _queued_files():
-                archive.write(path, arcname=f"outbox_files/{path.name}")
+            for path, arcname in _queued_files():
+                archive.write(path, arcname=arcname)
             for copy, name in databases:
                 archive.write(copy, arcname=name)
         os.replace(temporary, target)

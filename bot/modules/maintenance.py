@@ -6,20 +6,20 @@
 آخری بیش از ۲۰ ساعت عمر داشته باشد.
 
 گزارش فقط وقتی فرستاده می‌شود که `LOG_CHAT_ID` تنظیم باشد؛ ساعتِ آن با
-`TISA_DAILY_REPORT_HOUR` (پیش‌فرض ۹، صفر = خاموش) و ساعتِ پشتیبان ۰۴:۰۰ به وقتِ
-سرور است.
+`TISA_DAILY_REPORT_HOUR` (پیش‌فرض ۹، صفر = خاموش) و ساعتِ پشتیبان ۰۴:۰۰ — **همه
+به وقتِ `TISA_TZ`** (پیش‌فرض `Asia/Tehran`)، نه وقتِ سرور.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import time as clock_time
 
 from telegram.ext import Application, ContextTypes
 
 from bot import __version__
 from bot.config import settings
 from bot.services import backup, metrics, outbox
+from bot.utils import timeutil
 
 logger = logging.getLogger(__name__)
 
@@ -38,18 +38,23 @@ async def backup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 def report_text() -> str:
     """The daily summary: version, service counters, queue depth, last backup."""
-    lines = [f"📊 <b>گزارش روزانه</b> — نسخهٔ {__version__}", ""]
+    import html
+    lines = [f"📊 <b>گزارش روزانه</b> — نسخهٔ {html.escape(__version__)}", ""]
     counters = metrics.status_lines()
-    lines.extend(counters or ["امروز شمارنده‌ای ثبت نشده است."])
+    if counters:
+        lines.extend(html.escape(line) for line in counters)
+    else:
+        lines.append("امروز شمارنده‌ای ثبت نشده است.")
     try:
         queue = outbox.stats()
     except Exception:  # pragma: no cover - a broken queue must not lose the report
         logger.exception("maintenance: could not read queue stats")
         queue = {}
     if queue:
-        lines.append(f"📤 صفِ ارسال: {int(queue.get('pending', 0))} مورد در انتظار")
+        pending = int(queue.get("pending", 0))
+        lines.append(f"📤 صفِ ارسال: {pending} مورد در انتظار")
     newest = backup.latest()
-    lines.append("🗄 آخرین پشتیبان: " + (newest.name if newest else "—"))
+    lines.append("🗄 آخرین پشتیبان: " + (html.escape(newest.name) if newest else "—"))
     return "\n".join(lines)
 
 
@@ -71,11 +76,11 @@ async def start(app: Application) -> int:
         except Exception:  # pragma: no cover - create() already reports its own failures
             logger.exception("maintenance: catch-up backup failed")
     if app.job_queue is not None:
-        app.job_queue.run_daily(backup_job, time=clock_time(hour=BACKUP_HOUR), name="tisa_backup")
+        app.job_queue.run_daily(backup_job, time=timeutil.clock_time_at(hour=BACKUP_HOUR), name="tisa_backup")
         if settings.log_chat_id and settings.daily_report_hour:
             app.job_queue.run_daily(
                 report_job,
-                time=clock_time(hour=settings.daily_report_hour),
+                time=timeutil.clock_time_at(hour=settings.daily_report_hour),
                 name="tisa_daily_report",
             )
     else:  # pragma: no cover - JobQueue is installed in every supported setup

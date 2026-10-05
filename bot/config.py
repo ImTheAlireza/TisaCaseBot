@@ -21,6 +21,9 @@ logger = logging.getLogger(__name__)
 # (supervisor does not always set `directory=`).
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
+#: منطقه زمانیِ پیش‌فرض برای مُهر زمانی‌ها و کارهای روزانه (وقتی TISA_TZ خالی است).
+_DEFAULT_TZ = "Asia/Tehran"
+
 
 def _load_env_file(path: Path) -> None:
     """Read `.env` if python-dotenv is installed — a convenience, never a need.
@@ -174,8 +177,12 @@ class Settings:
     #: One zip per day, rotated; see bot/services/backup.py.
     backup_dir: Path = field(default_factory=lambda: data_dir() / "backups")
     backup_keep: int = 7
-    #: Hour (server-local) of the daily «📊 گزارش روزانه» in the log chat; 0 = off.
+    #: Hour (in TISA_TZ, default Asia/Tehran) of the daily «📊 گزارش روزانه» in
+    #: the log chat; 0 = off.
     daily_report_hour: int = 9
+    #: Time zone for all user-visible timestamps and daily jobs. Default ``Asia/Tehran``.
+    #: Falls back to the default if the name is unknown (a warning goes to logs).
+    timezone: str = _DEFAULT_TZ
     max_file_mb: float = 25.0
     max_rows: int = 200_000
     process_timeout_seconds: float = 120.0
@@ -254,6 +261,13 @@ class Settings:
         if not 0 <= report_hour <= 23:
             note("TISA_DAILY_REPORT_HOUR باید بین ۰ و ۲۳ باشد؛ گزارش خاموش شد.")
             report_hour = 0
+        tz_name = _raw("TISA_TZ", _DEFAULT_TZ) or _DEFAULT_TZ
+        try:
+            from zoneinfo import ZoneInfo
+            ZoneInfo(tz_name)
+        except Exception:  # ImportError یا ZoneInfoNotFoundError
+            note(f"TISA_TZ={tz_name!r} منطقهٔ شناخته‌شده‌ای نیست؛ به {_DEFAULT_TZ} برگشت.")
+            tz_name = _DEFAULT_TZ
 
         price_min, problem = _as_int("PRICE_MIN", 1_000)
         note(problem)
@@ -341,6 +355,7 @@ class Settings:
             backup_dir=backup_dir,
             backup_keep=backup_keep,
             daily_report_hour=report_hour,
+            timezone=tz_name,
             max_file_mb=max_file_mb,
             max_rows=max_rows,
             process_timeout_seconds=max(5.0, process_timeout),
