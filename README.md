@@ -97,6 +97,7 @@ required to start.
 | `TISA_BACKUP_DIR` | no | Where daily rotating zip backups land (state JSONs + both SQLite DBs + the outbox file queue). Default `<TISA_DATA_DIR>/backups`. The directory is created `0700` and each zip is `0600` — these are the shop's data. |
 | `TISA_BACKUP_KEEP` | no | How many daily zips to keep before rotation (default `7`, clamped to `1..365`). |
 | `TISA_DAILY_REPORT_HOUR` | no | Hour (0–23, in `TISA_TZ`) at which a short ops report is sent to `LOG_CHAT_ID` (default `9`; `0` disables the report; backups still run at 04:00). Requires `LOG_CHAT_ID` to be set. |
+| `TISA_SHOP_WATCH_MINUTES` | no | 🛰 How often (minutes) the bot asks the shop four read-only questions and messages *only when the answer changes* — ⛔ when it stops answering, 🟢 when it comes back (and the send queue is drained at once). A nine-hour outage costs two messages, not thirty-six. `0` disables it (default `15`). |
 | `TISA_TZ` | no | IANA time zone for all user-visible timestamps and daily jobs (default `Asia/Tehran`). A misspelled name falls back to the default and is reported in the start log. |
 | `TISA_DRY_RUN` | no | `yes` = rehears every publish: the real payload is built and sent to a fake transport, so **nothing is written on the shop** (default `no`). See [dry-run](#-حالت-آزمایشی-انتشار-dry-run). |
 | `FLOW_TIMEOUT_SECONDS` | no | Idle time before a product flow is closed and its temp files deleted (default `900`). |
@@ -737,6 +738,18 @@ xiaomi (فقط سفید)
 | چطور ببینم چه خبر است؟ | `python main.py --check-config` خط `outbox : <path> (N در صف)` را چاپ می‌کند و اگر دایرکتوری نوشتن نتواند، با exit کد ۱ می‌گوید (صفی که نمی‌نویسد، قولِ شکسته است نه افت کیفیت) |
 
 ### 🏓 Ping
+
+`/watch` همان چهار سؤال را *همین حالا* می‌پرسد و می‌گوید خطا از کدام طبقه است: **هاست** (هیچ
+درخواستی پاسخ نگرفت)، **فایروال** (فقط آدرسِ دارای `consumer_key` گیر می‌کند)، **افزونه**
+(مسیر ثبت نشده/بی‌قرارداد)، یا **کلید** (۴۰/۴۰۳). فقط سودو، و فقط GET — وسطِ قطعی هم زدنش بی‌خطر
+است و در dry-run هم اجرا می‌شود.
+
+خودِ این پرسش دیگر منتظرِ آدم نمی‌ماند: `bot/modules/shop_watch.py` هر `TISA_SHOP_WATCH_MINUTES`
+(پیش‌فرض ۱۵ دقیقه) همان چهار سؤال را می‌پرسد و **فقط وقتی جواب عوض شد** به `LOG_CHAT_ID` و سودو
+می‌گوید — ⛔ موقع افتادن (با علت و اینکه «از تو چیزی غلط نبود»)، یک یادآوری هر شش ساعت، و 🟢 موقع
+برگشتن؛ و در همان پاسِ بازگشت، `🐇 صفِ ارسال` بی‌درنگ تخلیه می‌شود تا محصولی که نیم‌ساعت صبر کرده
+منتظرِ موعدِ بعدیِ backoff نماند. هیچ نوشتنی در این ماژول نیست، و در dry-run یا با کلیدِ
+کامل‌نشده اصلاً سؤال نمی‌پرسد (چون «سبز» در آن حالت دروغ است).
 
 Diagnostics button — measures bot round-trip and includes a WooCommerce REST test. The WooCommerce test reads one product through `wp-json/wc/v3/products` using HTTPS query-string authentication, matching shared-host configurations where Basic Auth is blocked.
 

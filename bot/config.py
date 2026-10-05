@@ -180,6 +180,10 @@ class Settings:
     #: Hour (in TISA_TZ, default Asia/Tehran) of the daily «📊 گزارش روزانه» in
     #: the log chat; 0 = off.
     daily_report_hour: int = 9
+    #: 🛰 How often the bot asks the shop four read-only questions and reports only when the
+    #: answer *changes* (0 = off). See ``bot/modules/shop_watch.py`` — the watchdog is what turns
+    #: «نمی‌دانم سایت است یا ربات» into one sentence in the log chat.
+    shop_watch_minutes: int = 15
     #: Time zone for all user-visible timestamps and daily jobs. Default ``Asia/Tehran``.
     #: Falls back to the default if the name is unknown (a warning goes to logs).
     timezone: str = _DEFAULT_TZ
@@ -261,6 +265,12 @@ class Settings:
         if not 0 <= report_hour <= 23:
             note("TISA_DAILY_REPORT_HOUR باید بین ۰ و ۲۳ باشد؛ گزارش خاموش شد.")
             report_hour = 0
+        watch_minutes, problem = _as_int("TISA_SHOP_WATCH_MINUTES", 15)
+        note(problem)
+        if watch_minutes < 0:
+            note("TISA_SHOP_WATCH_MINUTES منفی است؛ پایشِ خودکار خاموش شد.")
+            watch_minutes = 0
+        watch_minutes = min(6 * 60, watch_minutes)   # یک بار در شش ساعت، بیشتر از این بی‌فایده است
         tz_name = _raw("TISA_TZ", _DEFAULT_TZ) or _DEFAULT_TZ
         try:
             from zoneinfo import ZoneInfo
@@ -355,6 +365,7 @@ class Settings:
             backup_dir=backup_dir,
             backup_keep=backup_keep,
             daily_report_hour=report_hour,
+            shop_watch_minutes=watch_minutes,
             timezone=tz_name,
             max_file_mb=max_file_mb,
             max_rows=max_rows,

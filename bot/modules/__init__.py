@@ -33,6 +33,7 @@ from bot.modules import (
     product_tools,
     restart,
     settings,
+    shop_watch,
     start,
     tracking_converter,
 )
@@ -51,6 +52,7 @@ ALL_MODULES = (
     settings,
     start,
     ping,
+    shop_watch,
     restart,
     fallback,
 )

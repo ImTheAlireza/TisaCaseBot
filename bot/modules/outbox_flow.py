@@ -342,20 +342,6 @@ def queue_status(batch_id: str, *, now: float | None = None) -> str:
     return status_line(entry, now=now) if entry is not None else ""
 
 
-def _human(seconds: float) -> str:
-    """«۲۷ دقیقه» / «۱ ساعت و ۵ دقیقه» — a wait someone can plan around, not a raw number."""
-    total = max(0, int(seconds))
-    hours, rest = divmod(total, 3600)
-    minutes = (rest + 59) // 60
-    if hours and minutes:
-        return f"{hours} ساعت و {minutes} دقیقه"
-    if hours:
-        return f"{hours} ساعت"
-    if minutes:
-        return f"{minutes} دقیقه"
-    return "کمتر از یک دقیقه"
-
-
 def status_line(entry: outbox.QueuedPublish, *, now: float | None = None) -> str:
     """One line of truth about a waiting publish: how far it got and when it moves again.
 
@@ -366,7 +352,11 @@ def status_line(entry: outbox.QueuedPublish, *, now: float | None = None) -> str
     moment = time.time() if now is None else now
     left = max(0, outbox.MAX_ATTEMPTS - int(entry.attempts))
     wait = int(entry.next_at) - int(moment)
-    when = "همین حالا" if wait <= 0 else f"{timeutil.strftime('%H:%M', entry.next_at)} ({_human(wait)} دیگر)"
+    if wait <= 0:
+        when = "همین حالا"
+    else:
+        clock = timeutil.strftime("%H:%M", entry.next_at)
+        when = f"{clock} ({timeutil.human_duration(wait)} دیگر)"
     if entry.status != outbox.STATUS_PENDING:
         return f"رها شده پس از {entry.attempts} تلاش"
     tail = "بدونِ تلاشِ باقی‌مانده" if left <= 0 else f"{left} بار دیگر"

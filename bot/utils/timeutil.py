@@ -65,6 +65,25 @@ def strftime(fmt: str, seconds: float | None = None) -> str:
     return time.strftime(fmt, localtime(seconds if seconds is not None else time.time()))
 
 
+def human_duration(seconds: float) -> str:
+    """«۲۷ دقیقه» / «۱ ساعت و ۵ دقیقه» — یک فاصلهٔ قابل‌برنامه‌ریزی، نه عددِ خام ثانیه.
+
+    هر دو طرفِ این عدد در چت خوانده می‌شود («چقدر صبر کنم؟»، «چقدر پایین بود؟»)، پس
+    «۱۸۳۴ ثانیه» هیچ‌کس را جلو نمی‌اندازد. دقیقه‌ها به بالا گرد می‌شوند تا «۰ دقیقه»
+    معنای «همین حالا» ندهد.
+    """
+    total = max(0, int(seconds))
+    hours, rest = divmod(total, 3600)
+    minutes = (rest + 59) // 60
+    if hours and minutes:
+        return f"{hours} ساعت و {minutes} دقیقه"
+    if hours:
+        return f"{hours} ساعت"
+    if minutes:
+        return f"{minutes} دقیقه"
+    return "کمتر از یک دقیقه"
+
+
 def now_dt() -> datetime:
     """تاریخ-زمانِ الان در منطقهٔ پیکربندی (برای JobQueue)."""
     return datetime.now(tz=_tz())
