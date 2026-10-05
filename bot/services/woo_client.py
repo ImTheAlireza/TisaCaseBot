@@ -169,6 +169,22 @@ def products_base(url: str | None = None, version: str | None = None) -> str:
     return f"{root}/wp-json/{api}/products"
 
 
+def origin_of(url: str) -> str:
+    """``https://shop.example/wp-json/wc/v3`` → ``https://shop.example`` (``""`` if nonsense).
+
+    Built from the parts rather than ``URL.netloc`` (bytes in httpx) and never from the whole
+    URL: what comes back must carry no path and no credentials, whatever the configured base
+    happened to include.
+    """
+    try:
+        parsed = httpx.URL(url)
+        host = parsed.host or ""
+        port = f":{parsed.port}" if parsed.port else ""
+    except Exception:                                       # malformed configuration
+        return ""
+    return f"{parsed.scheme}://{host}{port}" if parsed.scheme and host else ""
+
+
 def media_base(url: str | None = None) -> str:
     """``…/wp-json/wp/v2/media`` — the WordPress upload endpoint."""
     root = (url if url is not None else settings.wordpress_url or "").rstrip("/")

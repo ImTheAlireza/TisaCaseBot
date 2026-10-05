@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import logging
 import time
 
@@ -11,6 +12,7 @@ from telegram.ext import Application, CallbackQueryHandler, ContextTypes
 from bot import rbac
 from bot.constants import CB
 from bot.config import settings
+from bot.services.shop_network import probe_shop_network
 from bot.services.woocommerce import ping_woocommerce
 from bot.services.wordpress_media import test_wordpress_media
 from bot.services.woocommerce_product_test import test_product_with_image
@@ -43,6 +45,7 @@ def _back_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("🌐 تست اتصال ووکامرس", callback_data=CB.WOO_PING)],
             [InlineKeyboardButton("🖼️ تست آپلود تصویر", callback_data=CB.WP_MEDIA_PING)],
             [InlineKeyboardButton("📦 تست ساخت محصول با تصویر", callback_data=CB.WOO_PRODUCT_PING)],
+            [InlineKeyboardButton("🛰 شبکهٔ سایت (بدون ترمینال)", callback_data=CB.SHOP_NETWORK_PING)],
             [InlineKeyboardButton("⬅️ بازگشت به منو", callback_data=CB.MAIN_MENU)],
         ]
     )
@@ -105,6 +108,27 @@ async def cb_woocommerce_ping(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
 
 
+async def cb_shop_network_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Four read-only GETs that name the broken layer — for an admin with no shell access.
+
+    Deliberately *not* skipped in dry-run: nothing here writes, and the outage this reports on is
+    precisely the reason somebody cannot reach the site to test by hand.
+    """
+    query = update.callback_query
+    user = update.effective_user
+    if not user or not rbac.is_sudo(user.id):
+        await query.answer("⛔ دسترسی ندارید.", show_alert=True)
+        return
+    await query.answer("در حال پرسیدن چهار سؤال از سایت…")
+    result = await probe_shop_network()
+    body = "\n".join(html.escape(line) for line in result.report().splitlines())
+    await query.edit_message_text(
+        f"🛰 <b>شبکهٔ سایت (از همین سرور، بدون نوشتن)</b>\n\n{body}\n\n"
+        f"<i>{result.elapsed_ms:.0f} ms · همهٔ درخواست‌ها GET هستند</i>",
+        reply_markup=_back_keyboard(), parse_mode="HTML",
+    )
+
+
 async def cb_media_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Upload and immediately delete a 1x1 test image through WP Media API."""
     query = update.callback_query
@@ -159,3 +183,4 @@ def register(app: Application) -> None:
     app.add_handler(CallbackQueryHandler(cb_woocommerce_ping, pattern=f"^{CB.WOO_PING}$"))
     app.add_handler(CallbackQueryHandler(cb_media_ping, pattern=f"^{CB.WP_MEDIA_PING}$"))
     app.add_handler(CallbackQueryHandler(cb_product_ping, pattern=f"^{CB.WOO_PRODUCT_PING}$"))
+    app.add_handler(CallbackQueryHandler(cb_shop_network_ping, pattern=f"^{CB.SHOP_NETWORK_PING}$"))

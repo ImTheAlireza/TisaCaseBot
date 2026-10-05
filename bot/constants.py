@@ -18,6 +18,8 @@ class CB:
     WOO_PING = "ping:woocommerce"
     WP_MEDIA_PING = "ping:wordpress-media"
     WOO_PRODUCT_PING = "ping:woocommerce-product"
+    # چهار پرسشِ خواندنیِ سایت، برای کسی که ترمینالِ هاست را ندارد (bot/services/shop_network.py)
+    SHOP_NETWORK_PING = "ping:shop-network"
     # 📊 وضعیت / 🩺 عیب‌یابی / 📥 متریک‌ها (bot/modules/ops.py)
     OPS_STATUS = "ops:status"
     OPS_DIAGNOSE = "ops:diagnose"

@@ -1,4 +1,11 @@
-"""Small WooCommerce REST API check used by the diagnostics button."""
+"""Small WooCommerce REST checks used by the diagnostics buttons.
+
+`ping_woocommerce` answers «can we authenticate?». `probe_shop_network` answers the question that
+comes *before* it, the one that showed up as six identical 45-second `ReadTimeout`s in the log
+group on 2026-10-05: «is the shop answering anybody at all?». It is deliberately built for an
+operator with **no shell access** — every fact it would have to `curl` for is one Telegram tap
+away, and it measures the same outbound path the publisher uses.
+"""
 
 from __future__ import annotations
 
@@ -87,3 +94,4 @@ async def ping_woocommerce(
     except Exception:
         elapsed = (time.perf_counter() - started) * 1000
         return WooCommerceResult(False, None, "Could not connect to WooCommerce.", elapsed)
+

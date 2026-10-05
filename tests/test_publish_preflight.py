@@ -53,7 +53,7 @@ except ImportError as exc:                                   # pragma: no cover 
 from bot.modules import product_flow as PF
 from bot.services import outbox, plan as plan_service, woo_fencing
 from bot.services.product_extractor import ProductData
-from bot.services.woo_client import Audit, WooClient, WooCommerceAPIError
+from bot.services.woo_client import Audit, WooClient, WooCommerceAPIError, origin_of
 
 BASE = "https://shop.example/wp-json/wc/v3/products"
 HEALTH = {"contract": 1, "batch_fencing": True, "variation_fencing": True,
@@ -343,11 +343,11 @@ class OriginParsing(unittest.TestCase):
     """The probe must not invent a host, and must not forward one's credentials."""
 
     def test_the_origin_keeps_scheme_host_and_port_only(self) -> None:
-        self.assertEqual("https://shop.example", woo_fencing._origin(BASE))
+        self.assertEqual("https://shop.example", origin_of(BASE))
         self.assertEqual("http://shop.example:8080",
-                         woo_fencing._origin("http://admin:pw@shop.example:8080/wp-json/wc/v3/products"))
-        self.assertEqual("", woo_fencing._origin("not a url"))
-        self.assertEqual("", woo_fencing._origin(""))
+                         origin_of("http://admin:pw@shop.example:8080/wp-json/wc/v3/products"))
+        self.assertEqual("", origin_of("not a url"))
+        self.assertEqual("", origin_of(""))
 
 
 if __name__ == "__main__":  # pragma: no cover

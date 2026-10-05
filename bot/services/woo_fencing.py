@@ -17,7 +17,7 @@ from typing import Any
 import httpx
 
 from bot.services.outbox import TRANSIENT_STATUS_CODES
-from bot.services.woo_client import WooClient, WooCommerceAPIError, error_message
+from bot.services.woo_client import WooClient, WooCommerceAPIError, error_message, origin_of
 from bot.services.woo_contract import positive_id
 
 CONTROL_FIELDS = {"tisa_fence", "tisa_expected_stock", "tisa_expected_fields"}
@@ -48,22 +48,6 @@ _sleep = asyncio.sleep
 def _namespace(base: str) -> str:
     """``…/wp-json/wc/v3/products`` → ``…/wp-json/wc/v3`` — where the fence's own route lives."""
     return base.removesuffix("/products")
-
-
-def _origin(base: str) -> str:
-    """``https://shop/wp-json/wc/v3`` → ``https://shop`` (``""`` when the config is nonsense).
-
-    Built from the parts, not from ``URL.netloc`` (which is bytes in httpx) and not from the
-    whole URL: a probe must not carry anything but scheme/host/port, whatever the configured
-    base happened to include.
-    """
-    try:
-        url = httpx.URL(base)
-        host = url.host or ""
-        port = f":{url.port}" if url.port else ""
-    except Exception:                                       # malformed configuration
-        return ""
-    return f"{url.scheme}://{host}{port}" if url.scheme and host else ""
 
 
 def _detail(response: httpx.Response) -> str:
@@ -118,7 +102,7 @@ async def _awake(client: WooClient, base: str) -> bool:
     rewriting are alive, which is the whole question. This is what separates «the shop is down»
     from «something between us and the shop dislikes URLs containing ``consumer_secret``».
     """
-    origin = _origin(base)
+    origin = origin_of(base)
     if not origin:
         return False
     try:
