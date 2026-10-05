@@ -1146,12 +1146,18 @@ async def _create_draft_unlocked(
     except Exception as exc:
         # Preserve the successful steps and the final HTTP path on transport failures too.
         # Otherwise the user sees an empty ``ReadTimeout:`` despite a useful audit trail.
-        try:
-            exc.diagnostics = audit.lines  # type: ignore[attr-defined]
-        except Exception:
-            # The exception below is logged anyway; this only says the *audit trail* could
-            # not ride along with it.
-            logger.debug("could not attach the audit trail to %s", type(exc).__name__, exc_info=True)
+        # ``RuntimeError`` already accepts arbitrary attributes but built-ins (ValueError,
+        # OSError, …) do not; guard with setattr so a non-standard exception cannot crash
+        # the audit attachment itself.
+        if hasattr(exc, "diagnostics"):
+            exc.diagnostics = audit.lines
+        else:
+            try:
+                object.__setattr__(exc, "diagnostics", audit.lines)
+            except Exception:
+                logger.debug(
+                    "could not attach the audit trail to %s", type(exc).__name__, exc_info=True,
+                )
         logger.exception("create_draft failed unexpectedly")
         raise
 

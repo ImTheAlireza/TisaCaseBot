@@ -1,5 +1,44 @@
 # CHANGELOG
 
+## 0.19.2 — فاز ۱۲: ایرادهای سطح متوسط
+
+Fixed
+: - **پنج `# type: ignore`** واقعی حل شد (چهار مورد) و یک مورد غیرضروری از
+  `learning.py` حذف شد:
+  * `image_compress.py:286` — به‌جای `union-attr` روی `query.message` از
+    `if query.message is not None` استفاده شد.
+  * `product_flow.py:793` — تایپ `fields` به `dict[str, Any]` تغییر کرد تا
+    `record(**fields)` بی‌نیاز از سرکوب باشد.
+  * `product_flow.py:2598` — `_target` حالا `dict[str, Any]` برمی‌گرداند و
+    `send_message(**_target(...))` بدون ignore تایپ می‌شود.
+  * `woocommerce_direct.py:1150` — به‌جای سرکوب attr-defined، با `hasattr` و
+    `object.__setattr__` محافظت می‌شود تا روی استثناهای builtin (ValueError،
+    Timeout) هم خطای الحاقِ فیلد خودش crash نکند.
+- **مسیر `/tmp/supervisor.sock` هاردکد شده بود** (`bot/modules/restart.py`):
+  حالا با `tempfile.gettempdir()` (که به TMPDIR/TMP احترام می‌گذارد) به‌دست
+  می‌آید و مسیرهای سیستم (`/var/run`، `/run`) قبل از آن امتحان می‌شوند.
+  کامنتی هم اضافه شد که چرا `/tmp` آخر است.
+- **مهاجرت ALTER TABLE در outbox** (`bot/services/outbox.py`): identifierها
+  با regex قبل از اجرا اعتبارسنجی می‌شوند و نام ستون کوتیشن می‌گیرد تا
+  اضافه‌کردن migrationهای آتی با رشته‌های بیرونی، تزریق SQL ایجاد نکند.
+- **دو except ساکت** که هیچ لاگی نداشتند صدادار شدند:
+  * `processor._html_rows`: خطای parser در tag soup را `logger.debug` می‌کند.
+  * `worker` (کودک isolate): وقتی لوله به والد از بین رفته `logger.debug`
+    می‌زند و بعد `return`. بقیه exceptها یا کاربر/آپریتور را صدا می‌زدند، یا
+    در audit ثبت می‌شدند، یا exception را به بیرون پاس می‌دادند — ساکت نبودند.
+- **HEALTHCHECK داکر** (Dockerfile + `main.py --build-app`): قبلاً فقط
+  `--check-config` بود که env و state را چک می‌کرد؛ حالا `--build-app` همهٔ
+  هندلرها را هم می‌سازد (بدون تماس تلگرام/ووکامرس) تا یک import شکسته یا
+  register بد در جریان آپدیت به کراش حلقه نرسد. بررسی `--check-config` بخشی
+  از همان اجرا باقی مانده.
+- **lazy imports در `bot/app.py`**: پنج `from X import Y` داخل `_post_init` و
+  `_post_stop` به بالای ماژول منتقل شدند (چرخه‌ای ایجاد نمی‌کردند — مقصد‌ها
+  به app ارجاع نمی‌دهند). خواناتر و سریع‌تر.
+
+Changed
+: - هنوز ۵ `type: ignore` در کل کد باقی نمانده است.
+
+
 ## 0.19.1 — فاز ۱۱: فیکس‌های بحرانی (منطقه‌زمانی، پوشش ماژول‌ها، ایرادهای بک‌آپ)
 
 Fixed

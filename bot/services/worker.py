@@ -287,6 +287,8 @@ def _serve(connection: Any, config: Any) -> None:
         try:
             connection.send(outcome)
         except Exception:
+            # Parent is already gone (timeout/kill); nothing we can do but exit.
+            logger.debug("worker: parent closed the pipe before we could send; exiting.")
             return
         finally:
             # Drop the job's references (a 4000×3000 image stays alive otherwise) and

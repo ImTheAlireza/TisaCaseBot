@@ -156,13 +156,22 @@ def _initialize(conn: sqlite3.Connection) -> None:
         logger.warning("outbox: WAL is not available here; using the default journal")
     conn.executescript(_SCHEMA)
     columns = {row[1] for row in conn.execute("PRAGMA table_info(outbox)")}
-    for name, declaration in {
+    # هر ستونِ migration اینجا تعریف می‌شود؛ identifierها فقط از الف/عدد/آندرلاین
+    # تشکیل شده‌اند تا حتی اگر کسی migration ای با ورودیِ بیرونی به این حلقه اضافه
+    # کرد، تزریق SQL ممکن نباشد (sqlite برای identifier پارامتر ندارد).
+    _migrations: dict[str, str] = {
         "generation": "TEXT NOT NULL DEFAULT ''",
         "claim_token": "TEXT NOT NULL DEFAULT ''",
         "lease_until": "REAL NOT NULL DEFAULT 0",
-    }.items():
-        if name not in columns:
-            conn.execute(f"ALTER TABLE outbox ADD COLUMN {name} {declaration}")
+    }
+    _ident = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+    for name, declaration in _migrations.items():
+        if name in columns:
+            continue
+        if not _ident.match(name) or not _ident.match(declaration.split()[0]):
+            logger.error("outbox: refusing to apply migration for %r", name)
+            continue
+        conn.execute(f'ALTER TABLE outbox ADD COLUMN "{name}" {declaration}')
 
 
 def _connect() -> sqlite3.Connection:

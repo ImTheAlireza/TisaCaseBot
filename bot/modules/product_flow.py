@@ -762,7 +762,7 @@ def _record_result(
     request (plan 4.3) instead of appending a second card for the same attempt —
     one attempt, one card, whatever the outcome.
     """
-    fields: dict[str, object] = {
+    fields: dict[str, Any] = {
         "status": status,
         "product_id": product_id,
         "edit_url": edit_url,
@@ -790,7 +790,7 @@ def _record_result(
         finished = products_ledger.update(key, **fields)
         if finished is not None:
             return finished
-    return products_ledger.record(user_id=user_id, batch_id=batch_id, key=key, **fields)  # type: ignore[arg-type]
+    return products_ledger.record(user_id=user_id, batch_id=batch_id, key=key, **fields)
 
 
 @guard_feature(_feature_key, on_denial=lambda uid: _cleanup(uid), checker=lambda uid, key: feature_allowed(uid, key))
@@ -2448,10 +2448,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return REVIEW
 
 
-def _target(session: ProductSession | None, fallback: int) -> dict[str, object]:
+def _target(session: ProductSession | None, fallback: int) -> dict[str, Any]:
     """Proactive messages go to the chat (and thread) that started the flow."""
     chat = session.chat_id if session is not None and session.chat_id else fallback
-    kwargs: dict[str, object] = {"chat_id": chat}
+    kwargs: dict[str, Any] = {"chat_id": chat}
     if session is not None and session.thread_id:
         kwargs["message_thread_id"] = session.thread_id
     return kwargs
@@ -2595,7 +2595,7 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             text=_already_published_note(prior),
             reply_markup=_bound(session, InlineKeyboardMarkup([[InlineKeyboardButton(
                 "🔁 با این حال دوباره بساز", callback_data="product:force")]])),
-            **_target(session, user.id),  # type: ignore[arg-type]
+            **_target(session, user.id),
         )
         return REVIEW
     session.force_publish = False

@@ -10,12 +10,12 @@ from telegram.request import HTTPXRequest
 
 from bot import rbac
 from bot.config import settings
-from bot.services import flow_guard
-from bot.services.update_processor import PerUserUpdateProcessor, lock_for_user
-from bot.modules import register_all
+from bot.modules import image_compress, maintenance, product_flow, register_all
 from bot.modules.outbox_flow import start as start_outbox
 from bot.modules.product_flow import notify_interrupted_flows
 from bot.modules.restart import notify_restart_complete
+from bot.services import flow_guard, metrics, worker
+from bot.services.update_processor import PerUserUpdateProcessor, lock_for_user
 from bot.utils.logging import set_current_user
 
 logger = logging.getLogger(__name__)
@@ -99,14 +99,10 @@ async def _post_init(app: Application) -> None:
     # itself — including the ones left over from before this restart.
     await start_outbox(app)
     # Daily zip backup + daily ops report (catch-up at startup if a backup is due).
-    from bot.modules import maintenance
     await maintenance.start(app)
 
 
 async def _post_stop(app: Application) -> None:
-    from bot.modules import image_compress, product_flow
-    from bot.services import metrics, worker
-
     await product_flow.shutdown()
     await image_compress.shutdown()
     await worker.shutdown()

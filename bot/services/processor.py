@@ -447,7 +447,8 @@ def _html_rows(text: str) -> list[list[str]] | None:
     try:
         parser.feed(text)
         parser.close()
-    except Exception:  # pragma: no cover — a malformed tag soup, not a file we can use
+    except Exception as exc:  # pragma: no cover — a malformed tag soup, not a file we can use
+        logger.debug("html table parser choked on tag soup: %s", exc)
         return None
     if not parser.tables:
         return None

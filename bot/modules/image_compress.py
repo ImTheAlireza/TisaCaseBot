@@ -282,8 +282,8 @@ async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data[COMPRESS_RETRIES_KEY] = 0
     # «one thing at a time»: any other open flow of this user is closed first.
     closed = flow_guard.close_others("compress", user.id)
-    if closed:
-        await query.message.reply_text(  # type: ignore[union-attr]
+    if closed and query.message is not None:
+        await query.message.reply_text(
             "↩️ جریان «" + "»، «".join(closed) + "» قبلی‌ات بسته شد."
         )
     await query.edit_message_text(

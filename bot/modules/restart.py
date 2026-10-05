@@ -43,12 +43,19 @@ _COMMON_CONFS = (
     str(Path.home() / "etc" / "supervisord.conf"),
     str(Path.home() / ".supervisord.conf"),
 )
-_COMMON_SOCKETS = (
-    "/var/run/supervisor.sock",
-    "/run/supervisor.sock",
-    "/var/run/supervisord.sock",
-    "/tmp/supervisor.sock",
-)
+#: مکان‌های رایج سوکت سوپروایزر. به /tmp آخر نگاه می‌کنیم چون در هاست‌های با
+#: PrivateTmp یا TMPDIR متفاوت، سوکت همنامِ قابل‌پیش‌بینی در /tmp می‌تواند متعلق
+#: به حساب دیگری باشد (و آن وقت supervisorctl فقط خطای اتصال می‌دهد و امنیتی
+#: شکسته نمی‌شود، اما پیدا کردنش کند می‌شود). مسیر سیستم اول می‌آید.
+def _common_sockets() -> tuple[str, ...]:
+    import tempfile
+    tmp = tempfile.gettempdir()  # به TMPDIR/TMP احترام می‌گذارد
+    return (
+        "/var/run/supervisor.sock",
+        "/run/supervisor.sock",
+        "/var/run/supervisord.sock",
+        str(Path(tmp) / "supervisor.sock"),
+    )
 
 
 def _runtime_supervisor_config() -> tuple[str, str, str, str]:
@@ -88,7 +95,7 @@ def _candidate_commands() -> list[list[str]]:
     for conf in _COMMON_CONFS:
         if Path(conf).is_file():
             candidates.append([bin_, "-c", conf, *tail])
-    for sock in _COMMON_SOCKETS:
+    for sock in _common_sockets():
         if Path(sock).exists():
             candidates.append([bin_, "-s", f"unix://{sock}", *tail])
     return candidates
