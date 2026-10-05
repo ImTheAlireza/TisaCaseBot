@@ -1894,6 +1894,64 @@ async def _extract_once(session: ProductSession, *, learn: bool = True) -> Produ
     return session.data
 
 
+async def analyze_text(caption: str, info: str, *, learn: bool = False) -> Any:
+    """The product parser's *whole* answer for a block of text — nothing recorded, no session kept.
+
+    This is the same :func:`_extract` the «📦 ساخت محصول» card is built from, so the two can never
+    drift; what it adds is the parts that card shows somewhere else — the colors per model, the
+    variation count, and the words the parser *refused*. A person asking «درست تشخیص داد؟» needs
+    the misses: an empty result and a rejected one look the same in a two-line summary.
+    """
+    from bot.services.product_text_summary import TextAnalysis
+
+    session = ProductSession(model_text=caption or "", info_text=info or "")
+    data = await _extract(session, learn=learn)
+    source = "\n".join(part for part in (caption, info) if part and part.strip())
+    models = [str(model) for model in (session.models or [])]
+    phones = [model for model in models if not canonical_airpods_model(model)]
+    accessories = [model for model in models if canonical_airpods_model(model)]
+
+    def _field(name: str, default: Any) -> Any:
+        # A caller may hand us a partial stand-in (the tests do); a missing attribute is an empty
+        # one, never a crash inside a utility that only reports.
+        value = getattr(data, name, default) if data is not None else default
+        return value if value is not None else default
+
+    plan = None
+    to_dict = getattr(data, "to_dict", None)
+    if callable(to_dict):
+        try:
+            plan = plan_from_dict(to_dict())
+        except Exception as exc:                                # a plan is a bonus, not a gate
+            logger.debug("analysis plan could not be built: %s", exc)
+    suggestions = tuple(
+        (str(item.get("word") or ""), str(item.get("target") or ""))
+        for item in _field("suggestions", [])
+        if isinstance(item, dict) and item.get("word") and item.get("target")
+    )
+    return TextAnalysis(
+        phone_models=tuple(phones),
+        accessories=tuple(accessories),
+        attributes=dict(_field("attributes", {})),
+        model_colors=dict(_field("model_colors", {})),
+        color_summary=str(getattr(session, "color_summary", "") or ""),
+        variation_count=int(getattr(plan, "count", 0) or 0),
+        naive_count=int(getattr(plan, "naive_count", 0) or 0),
+        is_variable=bool(getattr(plan, "is_variable", False)),
+        axis_names=tuple(str(name) for name, _values in getattr(plan, "axes", ()) or ()),
+        dropped=tuple(getattr(plan, "dropped", ()) or ()),
+        unmatched=tuple(
+            (str(label), tuple(str(word) for word in words))
+            for label, words in (unmatched_model_words(source) if source else [])
+        ),
+        suggestions=suggestions,
+        warnings=tuple(str(item) for item in _field("warnings", [])),
+        notes=tuple(str(item) for item in _field("notes", [])),
+        ai_notes=tuple(str(item) for item in getattr(session, "ai_diagnostics", ()) or ()),
+        has_text=bool(source),
+    )
+
+
 async def extract_product_metadata(
     model_text: str,
     info_text: str,
@@ -1901,11 +1959,10 @@ async def extract_product_metadata(
     diagnostics: list[str] | None = None,
 ) -> tuple[list[str], dict[str, list[str]]]:
     """Use the product parser without recording a product; optionally return its warnings."""
-    session = ProductSession(model_text=model_text or "", info_text=info_text or "")
-    data = await _extract(session, learn=False)
+    analysis = await analyze_text(model_text, info_text)
     if diagnostics is not None:
-        diagnostics.extend(session.ai_diagnostics)
-    return session.models, data.attributes if data is not None else {}
+        diagnostics.extend(analysis.ai_notes)
+    return [*analysis.phone_models, *analysis.accessories], analysis.attributes
 
 
 def _apply_color_matrix(session: ProductSession, source_text: str) -> None:

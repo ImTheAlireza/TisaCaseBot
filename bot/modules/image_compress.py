@@ -40,7 +40,6 @@ from bot.constants import CB
 from bot.services.conversations import FlowConversationHandler
 from bot.keyboards import main_menu_keyboard, main_menu_text
 from bot.services.image_compressor import compress_image
-from bot.services.product_text_summary import format_product_summary
 from bot.utils.ui import answer_and_edit
 
 logger = logging.getLogger(__name__)
@@ -82,7 +81,8 @@ def close_for(user_id: int) -> bool:
 INSTRUCTION = (
     "🗜️ <b>فشرده‌سازی عکس‌ها</b>\n\n"
     "پیام‌های عکس‌دار را فوروارد کن؛ عکس فشرده می‌شود و مدل‌ها و ویژگی‌ها از کپشن/متن همراه استخراج می‌شوند.\n"
-    "مدل‌ها به شکل <code>model | model | ...</code> نمایش داده می‌شوند.\n\n"
+    "خروجی همان پارسرِ «📦 ساخت محصول» است — با رنگِ هر مدل، تعداد واریژن، و کلمه‌هایی که "
+    "<i>مدل نشد</i>؛ تا «پیدا نشد» با «خوانده شد و رد شد» یکی به نظر نرسد.\n\n"
     "برای پایان: /cancel"
 )
 
@@ -151,16 +151,16 @@ async def _send_analysis(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> No
         return
     context.user_data[ANALYSIS_SOURCE_KEY] = report_source
     # Reuse the product-creation flow verbatim: its parser/AI normalization,
-    # learned vocabulary, color matrix, and accessory handling all stay in sync.
-    from bot.modules.product_flow import extract_product_metadata
+    # learned vocabulary, color matrix, and accessory handling all stay in sync — and the
+    # *whole* answer is shown, including what the parser refused, so a wrong detection is
+    # distinguishable from an empty one.
+    from bot.modules.product_flow import analyze_text
 
-    diagnostics: list[str] = []
     extraction_started = time.perf_counter()
-    models, attributes = await extract_product_metadata(
-        caption, info, diagnostics=diagnostics
-    )
+    analysis = await analyze_text(caption, info)
     extraction_ms = (time.perf_counter() - extraction_started) * 1000
-    report = format_product_summary(models, attributes)
+    diagnostics = list(analysis.ai_notes)
+    report = analysis.report()
     if report == context.user_data.get(ANALYSIS_REPORT_KEY):
         return
     if (context.user_data.get("compress_closed") or context.user_data.get("compress_generation") != generation
