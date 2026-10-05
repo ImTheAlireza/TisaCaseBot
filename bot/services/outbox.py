@@ -519,6 +519,28 @@ def pending(*, now: float | None = None) -> int:
         return 0
 
 
+def is_queued(batch_id: str) -> bool:
+    """Is this exact batch still waiting for the shop?
+
+    The product flow's idle timer asks it before it calls a quiet seller an «abandoned» build:
+    a queued publish retries for up to two hours on its own, and saying «جریان بسته شد» over it
+    both spikes a metric that is not true and frightens someone whose product is about to appear.
+    An unreadable database answers ``False`` — the conservative direction, since the row is then
+    reported as finished rather than promised forever.
+    """
+    if not batch_id:
+        return False
+    try:
+        with _db() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM outbox WHERE batch_id = ? AND status = ? LIMIT 1",
+                (batch_id, STATUS_PENDING),
+            ).fetchone()
+    except (sqlite3.Error, OSError):
+        return False
+    return row is not None
+
+
 def stats(*, now: float | None = None) -> dict[str, Any]:
     """What «چند توی صف مونده؟» should answer, and what ``--check-config`` prints."""
     moment = time.time() if now is None else now

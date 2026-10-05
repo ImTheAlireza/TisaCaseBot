@@ -219,6 +219,10 @@ def describe_exception(exc: BaseException) -> str:
         detail = "ارتباط پیش از پاسخ قطع شد"
     elif isinstance(exc, httpx.TransportError):
         detail = "خطای شبکه"
+    elif isinstance(exc, TimeoutError):
+        # ``asyncio.timeout`` raises a bare TimeoutError with an empty message — and it is not
+        # an httpx error, so without this branch the card read «TimeoutError: » and nothing else.
+        detail = "مهلت کلِ درخواست تمام شد (پاسخ فروشگاه در زمان مقرر نرسید)"
     else:
         detail = redact(str(exc).strip()) or "جزئیات خطا در دسترس نیست"
     return f"{type(exc).__name__}: {detail}"
@@ -331,23 +335,32 @@ class WooClient:
         *,
         params: Mapping[str, Any] | None = None,
         basic: bool = False,
+        public: bool = False,
         headers: Mapping[str, str] | None = None,
         **kwargs: Any,
     ) -> httpx.Response:
         """Send ``method url``, authenticated, with the shared retry policy.
 
-        ``kwargs`` go straight to httpx (``json=``, ``content=``, ``files=``, ``data=``):
-        this class is a policy wrapper, not a second request builder, and that is the whole
-        reason a rehearsal can reuse the production path.
+        ``kwargs`` go straight to httpx (``json=``, ``content=``, ``files=``, ``data=``, and
+        ``timeout=`` to shorten one phase): this class is a policy wrapper, not a second
+        request builder, and that is the whole reason a rehearsal can reuse the production
+        path.
+
+        ``public=True`` sends the request with **no credentials at all** — the liveness probe
+        in :mod:`bot.services.woo_fencing` needs it. Two reasons: a URL without
+        ``consumer_secret`` in the query string cannot leak it into the shop's access log, and
+        a probe that answers while the authenticated request hangs is itself the diagnosis
+        («the host is dropping requests that carry our keys», not «the site is down»).
         """
         merged: dict[str, Any] = dict(kwargs)
         query = dict(params or {})
-        if basic:
-            credentials = app_password()
-            if credentials is not None:
-                merged["auth"] = credentials
-        else:
-            query = {**auth_params(self._key, self._secret), **query}
+        if not public:
+            if basic:
+                credentials = app_password()
+                if credentials is not None:
+                    merged["auth"] = credentials
+            else:
+                query = {**auth_params(self._key, self._secret), **query}
         if query:
             merged["params"] = query
         merged["headers"] = {"User-Agent": USER_AGENT, **dict(headers or {})}
@@ -355,6 +368,14 @@ class WooClient:
         method = method.upper()
         self._request_number += 1
         request_id = self._request_number
+        # A caller may shorten one phase (the safety preflight does). The outer guard and the
+        # audit line must speak the same number as the socket, not the client-wide default —
+        # a trace that says «مهلت هر فاز=45s» for a request abandoned at 8s sends
+        # whoever is debugging this to the wrong timeout.
+        try:
+            phase = float(merged.get("timeout", self.timeout_seconds))
+        except (TypeError, ValueError):
+            phase = float(self.timeout_seconds)
         try:
             path = httpx.URL(str(url)).path
         except Exception:  # malformed configuration: never echo a URL or query string
@@ -372,9 +393,9 @@ class WooClient:
                     started = time.perf_counter()
                     self.audit.log(
                         f"[http:start] #{request_id} {method} {path} "
-                        f"(تلاش {attempt + 1}/{self.attempts}؛ مهلت هر فاز={self.timeout_seconds:g}s)"
+                        f"(تلاش {attempt + 1}/{self.attempts}؛ مهلت هر فاز={phase:g}s)"
                     )
-                    async with asyncio.timeout(max(1.0, self.timeout_seconds * 2)):
+                    async with asyncio.timeout(max(1.0, phase * 2)):
                         response = await self._client.request(method, str(url), **merged)
             except httpx.TransportError as exc:
                 elapsed_ms = (time.perf_counter() - started) * 1000

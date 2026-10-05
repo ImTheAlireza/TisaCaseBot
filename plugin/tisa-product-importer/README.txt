@@ -20,3 +20,12 @@ in stock for it), the color attribute still lists EVERY color, but only the
 listed model/color pairs become variations. Models missing from that map stay
 unrestricted, and a model whose colors match none of the real color options is
 left unrestricted too, so no sellable variation is ever dropped.
+
+Safety contract (0.8.x): GET /wp-json/wc/v3/tisa-health answers {"contract":1,...}
+and the bot refuses to write until it does. The answer includes "version" (what is
+really running here) and "stock_cas" (is postmeta InnoDB?). Since 0.8.1 that engine
+lookup is cached for five minutes and runs with lock_wait_timeout=2, because an
+information_schema read takes a metadata lock: a backup or an OPTIMIZE TABLE job used
+to be able to park the bot's preflight — and therefore the whole publish — without a
+single row being touched. If publishing stops with «اتصال به فروشگاه برقرار نشد» or
+«به هیچ درخواستی پاسخ نداد», the plugin is not the problem: the host is.

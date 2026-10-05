@@ -192,6 +192,11 @@ class ProductSession:
     # Set while a product is being published. Publishing takes several seconds
     # (media upload + SKU scan), and a second tap used to create a second draft.
     submitting: bool = False
+    #: The batch the outbox is still retrying for this session, if any. The idle timer reads it:
+    #: «the seller went quiet while the queue kept knocking on the shop» is not an abandoned
+    #: product, and telling them the flow was closed and its files deleted while a publish is
+    #: still pending is simply a lie.
+    queued_batch: str = ""
     # Text fingerprint of the last extraction, to avoid a pointless AI rerun.
     last_extract_hash: str = ""
     # During media intake, the captions are for models; expensive product-detail
@@ -323,6 +328,33 @@ async def _edit_message_if_changed(target: Any, *args: Any, **kwargs: Any) -> bo
             logger.debug("Telegram edit skipped: message content and markup are unchanged")
             return False
         raise
+
+
+async def _toast(query: Any, text: str = "", **kwargs: Any) -> None:
+    """Answer a button tap — and shrug when Telegram refuses to take it.
+
+    The toast is decoration; the publish that follows it is not. An unreachable Telegram made
+    this single call raise, which skipped every line after it: the shop was never contacted, the
+    failure was never queued, and ``session.submitting`` stayed set forever, so each later tap
+    was answered with «همین حالا یک ساخت در جریان است» until somebody restarted the bot.
+    """
+    try:
+        await query.answer(text, **kwargs)
+    except Exception as exc:
+        logger.warning("could not answer the tap (%s): %s", type(exc).__name__, exc)
+
+
+async def _note_on_card(query: Any, text: str) -> None:
+    """Put the outcome on the seller's own card, if Telegram will still take it.
+
+    Only ever called once the publish has *finished failing*: the ledger entry and the retry
+    queue are written by then, so a lost edit is a cosmetic loss and must not escape into PTB's
+    global handler (that is how a handled error used to be reported as «خطای مدیریت‌نشدهٔ بات»).
+    """
+    try:
+        await _edit_message_if_changed(query, text)
+    except Exception as exc:
+        logger.warning("could not update the card after a failure (%s): %s", type(exc).__name__, exc)
 
 
 async def _send_chat_action(
@@ -2515,7 +2547,7 @@ async def _queue_for_retry(
     if settings.woo_dry_run or session.mode != "new" or not outbox.is_transient(exc):
         return False
     try:
-        return await asyncio.to_thread(outbox_flow.enqueue_after_failure,
+        queued = await asyncio.to_thread(outbox_flow.enqueue_after_failure,
             user_id=user_id, chat_id=session.chat_id or user_id, thread_id=session.thread_id,
             mode=session.mode, data=data, files=session.files, batch_id=batch,
             ledger_key=ledger_key or "", error=error, retry_after=getattr(exc, "retry_after", 0.0),
@@ -2523,6 +2555,11 @@ async def _queue_for_retry(
     except Exception as inner:                                   # the publish already failed; be plain
         logger.warning("outbox: نتوانست صف را بنویسد: %s", inner)
         return False
+    if queued:
+        # Remembered on the session for one reason: the idle timer must not call a product that
+        # is still queued a «رهاشده». `outbox.is_queued` is the truth, this field is the pointer.
+        session.queued_batch = batch
+    return queued
 
 
 def _queued_note(queued: bool) -> str:
@@ -2606,9 +2643,7 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     # This is a callback, so Telegram can show a transient toast. Keep the
     # preview card intact while the publish runs; ``session.submitting`` blocks
     # a second tap without replacing the user's card with a status message.
-    await query.answer(
-        "در حال ساخت پیش‌نویس مستقیم…" if session.mode == "new" else "در حال ساخت فایل ZIP…"
-    )
+    await _toast(query, "در حال ساخت پیش‌نویس مستقیم…" if session.mode == "new" else "در حال ساخت فایل ZIP…")
     await _telegram_log(context, f"[product:{user.id}] تأیید نهایی دریافت شد؛ داده نهایی:\n{json.dumps(data.to_dict(), ensure_ascii=False, indent=2)}")
     intent_key: str | None = None
     publish_returned = False
@@ -2752,6 +2787,10 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         except WooCommerceAPIError as exc:
             if publish_returned:
                 return await keep_success_if_reply_failed(exc)
+            # Cleared first, before anything else in this handler can fail: the publish is over
+            # whichever way it ended, and a second failure on the way to saying so must never
+            # leave the session locked («یک ساخت در جریان است») for the rest of its life.
+            session.submitting = False
             audit_lines = exc.diagnostics or []
             await _telegram_log(
                 context,
@@ -2772,12 +2811,12 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 await product_journal.send_publish_trace(
                     context.bot, audit_lines, dry_run=settings.woo_dry_run
                 )
-            await _edit_message_if_changed(query, message)
-            session.submitting = False
+            await _note_on_card(query, message)
             return REVIEW
         except Exception as exc:
             if publish_returned:
                 return await keep_success_if_reply_failed(exc)
+            session.submitting = False                            # see the note above
             details = traceback.format_exc()
             audit_lines = list(getattr(exc, "diagnostics", []) or [])
             reason = describe_exception(exc)
@@ -2799,15 +2838,14 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 await product_journal.send_publish_trace(
                     context.bot, audit_lines, dry_run=settings.woo_dry_run
                 )
-            await _edit_message_if_changed(
+            await _note_on_card(
                 query, f"❌ ساخت مستقیم محصول ناموفق بود:\n{reason}" + _queued_note(queued)
             )
-            session.submitting = False
             return REVIEW
     # Every mode but «new» (REST draft above) and «update» (dispatched at the top) is unknown:
     # the bot no longer builds ZIP files, so there is nothing honest to do with it.
     session.submitting = False
-    await query.answer("این حالت پشتیبانی نمی‌شود؛ از منو دوباره شروع کن.", show_alert=True)
+    await _toast(query, "این حالت پشتیبانی نمی‌شود؛ از منو دوباره شروع کن.", show_alert=True)
     return REVIEW
 
 
@@ -3084,10 +3122,33 @@ async def cb_back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def on_timeout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """An idle flow is over: drop the state and its files, and say so."""
+    """An idle flow is over: drop the state and its files, and say so.
+
+    One case is not an abandonment: a publish the shop refused and
+    :mod:`bot.services.outbox` is still retrying. The queue keeps its own copy of the images, so
+    the workspace may go — but calling a product that is about to appear on its own a «رهاشده»,
+    counting a ``flow_abandoned`` that never happened, and telling the seller the flow was closed
+    would be a false alarm with a metric behind it. This branch says «🕐 هنوز در صف» instead.
+    """
     user = update.effective_user
     restock_open = bool(user and restock_flow.sessions.get(user.id))
     open_session = sessions.get(user.id) if user else None
+    batch = str(getattr(open_session, "queued_batch", "") or "")
+    if open_session is not None and batch and await asyncio.to_thread(outbox.is_queued, batch):
+        if open_session.data is not None:
+            # Flushed BEFORE the cleanup: the card wants the session's own title, variation count
+            # and image count, and `_cleanup` is what throws them away.
+            await _flush_journal(context, status="queued", data=open_session.data,
+                                 session=open_session, batch=batch)
+        if user:
+            _cleanup(user.id)                       # the queue spooled its own image copies
+        message = update.effective_message
+        if message:
+            await message.reply_text(
+                "🕐 این محصول هنوز در صفِ تلاشِ دوباره است؛ ربات خودش سایت را امتحان می‌کند و "
+                "نتیجه را همین‌جا می‌فرستد. بی‌فعالیتِ چت، صف را لغو نمی‌کند."
+            )
+        return
     # Which flow gave up is both a number and a sentence — the metric wants a key, the
     # user has to be told «اپدیت محصول» — so one branch decides both and they cannot drift.
     if open_session is not None and open_session.mode == "update":

@@ -4,6 +4,10 @@ if (!defined('ABSPATH')) exit;
 
 final class Tisa_REST_Fencing {
     const CONTRACT = 1;
+    // Where «is postmeta InnoDB?» is remembered. The engine of a live site does not change
+    // under its own feet, so five minutes is both cheap and long enough to cover a publish.
+    const ENGINE_CACHE = 'tisa_postmeta_engine';
+    const ENGINE_TTL = 300;
     private static $locks = [];
     private static $transaction = false;
 
@@ -27,17 +31,44 @@ final class Tisa_REST_Fencing {
 
     public static function transactional() {
         global $wpdb;
+        // Which engine backs postmeta decides whether a stock compare-and-set can be atomic.
+        // Reading it out of information_schema is the one thing in this file that can hang a
+        // request *without touching a single row*: MySQL takes a shared metadata lock for that
+        // lookup, so a mysqldump / OPTIMIZE TABLE / backup job parks it — and with it the bot's
+        // preflight, which runs before every publish. Two defences, both cheap: an answer is
+        // cached (the engine does not change under a running site), and the read itself gets a
+        // lock-wait ceiling, so a busy database answers «not now» in about a second instead of
+        // sitting on the socket until the client gives up.
+        $cached = get_transient(self::ENGINE_CACHE);
+        if ($cached === 'yes') return true;
+        if ($cached === 'no') return false;
+        $wpdb->query('SET SESSION lock_wait_timeout = 2');
+        $wpdb->query('SET SESSION innodb_lock_wait_timeout = 2');
         $engine = $wpdb->get_var($wpdb->prepare(
             'SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s',
             $wpdb->postmeta
         ));
-        return strtoupper((string)$engine) === 'INNODB';
+        $failed = $engine === null && $wpdb->last_error !== '';
+        $wpdb->query('SET SESSION lock_wait_timeout = DEFAULT');
+        $wpdb->query('SET SESSION innodb_lock_wait_timeout = DEFAULT');
+        if ($failed) {
+            // A lock timeout is not evidence of MyISAM. Cache nothing: the next request asks
+            // again, instead of being told for the next five minutes that this site has no
+            // InnoDB.
+            return false;
+        }
+        $innodb = strtoupper((string)$engine) === 'INNODB';
+        set_transient(self::ENGINE_CACHE, $innodb ? 'yes' : 'no', self::ENGINE_TTL);
+        return $innodb;
     }
 
     public static function health() {
         return rest_ensure_response([
             'contract' => self::CONTRACT, 'batch_fencing' => true, 'variation_fencing' => true,
             'parent_cas' => true, 'stock_cas' => self::transactional(), 'max_variations' => 1000,
+            // Which build is really running. The bot puts this in its 412 sentence, because
+            // «update the plugin» without a version number is a guess at somebody's server.
+            'version' => defined('TISA_IMPORTER_VERSION') ? TISA_IMPORTER_VERSION : '',
             'isolated_test' => defined('TISA_CONTRACT_ENV') && TISA_CONTRACT_ENV,
         ]);
     }
