@@ -27,11 +27,13 @@ from bot.modules import (
     image_compress,
     learning_panel,
     ops,
+    outbox_flow,
     ping,
     product_flow,
     product_tools,
     restart,
     settings,
+    shop_watch,
     start,
     tracking_converter,
 )
@@ -41,6 +43,7 @@ from bot.modules import (
 ALL_MODULES = (
     tracking_converter,
     product_flow,
+    outbox_flow,
     product_tools,
     image_compress,
     admins,
@@ -49,6 +52,7 @@ ALL_MODULES = (
     settings,
     start,
     ping,
+    shop_watch,
     restart,
     fallback,
 )

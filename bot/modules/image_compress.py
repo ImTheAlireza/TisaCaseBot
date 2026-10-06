@@ -13,7 +13,6 @@ Admins can use it only while the sudo owner has it enabled for them (see the
 from __future__ import annotations
 
 import asyncio
-import html
 import logging
 import secrets
 import re
@@ -40,7 +39,6 @@ from bot.constants import CB
 from bot.services.conversations import FlowConversationHandler
 from bot.keyboards import main_menu_keyboard, main_menu_text
 from bot.services.image_compressor import compress_image
-from bot.services.product_text_summary import format_product_summary
 from bot.utils.ui import answer_and_edit
 
 logger = logging.getLogger(__name__)
@@ -82,7 +80,8 @@ def close_for(user_id: int) -> bool:
 INSTRUCTION = (
     "🗜️ <b>فشرده‌سازی عکس‌ها</b>\n\n"
     "پیام‌های عکس‌دار را فوروارد کن؛ عکس فشرده می‌شود و مدل‌ها و ویژگی‌ها از کپشن/متن همراه استخراج می‌شوند.\n"
-    "مدل‌ها به شکل <code>model | model | ...</code> نمایش داده می‌شوند.\n\n"
+    "کارت همان پارسرِ «📦 ساخت محصول» است، ولی فقط <i>مقادیر</i> را می‌گوید: مدل‌ها و ویژگی‌ها، "
+    "و هر جا چیزی را نخوانده باشد. جزئیاتِ واریژن در لاگِ گروه ثبت می‌شود.\n\n"
     "برای پایان: /cancel"
 )
 
@@ -150,17 +149,16 @@ async def _send_analysis(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> No
     if report_source == context.user_data.get(ANALYSIS_SOURCE_KEY):
         return
     context.user_data[ANALYSIS_SOURCE_KEY] = report_source
-    # Reuse the product-creation flow verbatim: its parser/AI normalization,
-    # learned vocabulary, color matrix, and accessory handling all stay in sync.
-    from bot.modules.product_flow import extract_product_metadata
+    # Reuse the product-creation flow verbatim: its parser/AI normalization, learned vocabulary,
+    # color matrix and accessory handling all stay in sync. The card then states the *values* and
+    # what the parser refused — enough to answer «درست خواند؟» at a glance — while the variation
+    # plan and the rest go to the log below, because this screen writes nothing to the shop.
+    from bot.modules.product_flow import analyze_text
 
-    diagnostics: list[str] = []
     extraction_started = time.perf_counter()
-    models, attributes = await extract_product_metadata(
-        caption, info, diagnostics=diagnostics
-    )
+    analysis = await analyze_text(caption, info)
     extraction_ms = (time.perf_counter() - extraction_started) * 1000
-    report = format_product_summary(models, attributes)
+    report = analysis.report()
     if report == context.user_data.get(ANALYSIS_REPORT_KEY):
         return
     if (context.user_data.get("compress_closed") or context.user_data.get("compress_generation") != generation
@@ -171,10 +169,12 @@ async def _send_analysis(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> No
         f"🗜️ [compress:{user_id}] خروجی همان پارسرِ ساخت محصول "
         f"(استخراج {extraction_ms:.0f} ms):\n{report}"
     )
-    if diagnostics:
-        audit_text += "\nیادداشت‌های پارسر/AI: " + " | ".join(
-            html.escape(item) for item in diagnostics[:6]
-        )
+    folded = analysis.detail()
+    if folded:
+        # The card is written to be skimmed in three seconds; the log is written to be audited.
+        # Whatever the card leaves out — the variation count, the palette of every model, the AI
+        # chatter, a note about a field this screen cannot act on — lands here instead.
+        audit_text += "\nجزئیات (فشرده‌شده در کارت):\n" + folded
     await _log_to_group(context, audit_text, parse_mode="HTML")
     context.user_data[ANALYSIS_REPORT_KEY] = report
 

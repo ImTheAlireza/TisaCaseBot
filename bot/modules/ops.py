@@ -33,6 +33,7 @@ from bot.buttons import feature_allowed
 from bot.config import data_dir, settings
 from bot.constants import CB
 from bot.services import flow_state, importer_contract, metrics, outbox, sku, tracking_ledger
+from bot.services.shop_network import probe_shop_network
 from bot.services.woo_client import WooClient
 from bot.services.woocommerce import ping_woocommerce
 from bot.services.wordpress_media import test_wordpress_media
@@ -256,6 +257,22 @@ async def _check_woocommerce() -> Check:
                  "کلید و سِر (خواندن‌ونوشتن) و permalink سایت را بررسی کن.")
 
 
+async def _check_shop_network() -> Check:
+    """The preflight's own four questions — the line to read when «هیچ‌چیز منتشر نمی‌شود».
+
+    It is here rather than only behind «🌐 تست اتصال ووکامرس» because the two answers differ:
+    authenticating fine while `tisa-health` hangs is a host problem, and a card that only knows
+    «WooCommerce OK» would send the operator looking in the wrong place.
+    """
+    if not (settings.woocommerce_url and settings.woocommerce_key and settings.woocommerce_secret):
+        return Check("شبکهٔ سایت", "warn", "با کلیدهای ناقص سنجیده نمی‌شود",
+                     "WOOCOMMERCE_URL / _KEY / _SECRET در .env.")
+    result = await probe_shop_network()
+    if result.ok:
+        return Check("شبکهٔ سایت", "ok", f"{result.verdict} · {result.elapsed_ms:.0f} ms")
+    return Check("شبکهٔ سایت", "bad", f"{result.verdict} ↳ {result.summary}", result.fix)
+
+
 async def _check_wordpress() -> Check:
     if settings.woo_dry_run:
         return Check("رسانهٔ وردپرس", "warn", "🧪 در dry-run آپلود/حذف زنده انجام نمی‌شود؛ تست رسانه اجرا نشد.")
@@ -307,6 +324,7 @@ async def run_checks(bot) -> list[Check]:
         _check_token(bot),
         _check_log_chat(bot),
         _check_woocommerce(),
+        _check_shop_network(),
         _check_wordpress(),
         _check_sku_plugin(),
         return_exceptions=True,

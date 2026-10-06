@@ -192,6 +192,11 @@ class ProductSession:
     # Set while a product is being published. Publishing takes several seconds
     # (media upload + SKU scan), and a second tap used to create a second draft.
     submitting: bool = False
+    #: The batch the outbox is still retrying for this session, if any. The idle timer reads it:
+    #: «the seller went quiet while the queue kept knocking on the shop» is not an abandoned
+    #: product, and telling them the flow was closed and its files deleted while a publish is
+    #: still pending is simply a lie.
+    queued_batch: str = ""
     # Text fingerprint of the last extraction, to avoid a pointless AI rerun.
     last_extract_hash: str = ""
     # During media intake, the captions are for models; expensive product-detail
@@ -323,6 +328,34 @@ async def _edit_message_if_changed(target: Any, *args: Any, **kwargs: Any) -> bo
             logger.debug("Telegram edit skipped: message content and markup are unchanged")
             return False
         raise
+
+
+async def _toast(query: Any, text: str = "", **kwargs: Any) -> None:
+    """Answer a button tap — and shrug when Telegram refuses to take it.
+
+    The toast is decoration; the publish that follows it is not. An unreachable Telegram made
+    this single call raise, which skipped every line after it: the shop was never contacted, the
+    failure was never queued, and ``session.submitting`` stayed set forever, so each later tap
+    was answered with «همین حالا یک ساخت در جریان است» until somebody restarted the bot.
+    """
+    try:
+        await query.answer(text, **kwargs)
+    except Exception as exc:
+        logger.warning("could not answer the tap (%s): %s", type(exc).__name__, exc)
+
+
+async def _note_on_card(query: Any, text: str, markup: Any = None) -> None:
+    """Put the outcome on the seller's own card, if Telegram will still take it.
+
+    Only ever called once the publish has *finished failing*: the ledger entry and the retry
+    queue are written by then, so a lost edit is a cosmetic loss and must not escape into PTB's
+    global handler (that is how a handled error used to be reported as «خطای مدیریت‌نشدهٔ بات»).
+    """
+    kwargs: dict[str, Any] = {} if markup is None else {"reply_markup": markup}
+    try:
+        await _edit_message_if_changed(query, text, **kwargs)
+    except Exception as exc:
+        logger.warning("could not update the card after a failure (%s): %s", type(exc).__name__, exc)
 
 
 async def _send_chat_action(
@@ -1861,6 +1894,64 @@ async def _extract_once(session: ProductSession, *, learn: bool = True) -> Produ
     return session.data
 
 
+async def analyze_text(caption: str, info: str, *, learn: bool = False) -> Any:
+    """The product parser's *whole* answer for a block of text — nothing recorded, no session kept.
+
+    This is the same :func:`_extract` the «📦 ساخت محصول» card is built from, so the two can never
+    drift; what it adds is the parts that card shows somewhere else — the colors per model, the
+    variation count, and the words the parser *refused*. A person asking «درست تشخیص داد؟» needs
+    the misses: an empty result and a rejected one look the same in a two-line summary.
+    """
+    from bot.services.product_text_summary import TextAnalysis
+
+    session = ProductSession(model_text=caption or "", info_text=info or "")
+    data = await _extract(session, learn=learn)
+    source = "\n".join(part for part in (caption, info) if part and part.strip())
+    models = [str(model) for model in (session.models or [])]
+    phones = [model for model in models if not canonical_airpods_model(model)]
+    accessories = [model for model in models if canonical_airpods_model(model)]
+
+    def _field(name: str, default: Any) -> Any:
+        # A caller may hand us a partial stand-in (the tests do); a missing attribute is an empty
+        # one, never a crash inside a utility that only reports.
+        value = getattr(data, name, default) if data is not None else default
+        return value if value is not None else default
+
+    plan = None
+    to_dict = getattr(data, "to_dict", None)
+    if callable(to_dict):
+        try:
+            plan = plan_from_dict(to_dict())
+        except Exception as exc:                                # a plan is a bonus, not a gate
+            logger.debug("analysis plan could not be built: %s", exc)
+    suggestions = tuple(
+        (str(item.get("word") or ""), str(item.get("target") or ""))
+        for item in _field("suggestions", [])
+        if isinstance(item, dict) and item.get("word") and item.get("target")
+    )
+    return TextAnalysis(
+        phone_models=tuple(phones),
+        accessories=tuple(accessories),
+        attributes=dict(_field("attributes", {})),
+        model_colors=dict(_field("model_colors", {})),
+        color_summary=str(getattr(session, "color_summary", "") or ""),
+        variation_count=int(getattr(plan, "count", 0) or 0),
+        naive_count=int(getattr(plan, "naive_count", 0) or 0),
+        is_variable=bool(getattr(plan, "is_variable", False)),
+        axis_names=tuple(str(name) for name, _values in getattr(plan, "axes", ()) or ()),
+        dropped=tuple(getattr(plan, "dropped", ()) or ()),
+        unmatched=tuple(
+            (str(label), tuple(str(word) for word in words))
+            for label, words in (unmatched_model_words(source) if source else [])
+        ),
+        suggestions=suggestions,
+        warnings=tuple(str(item) for item in _field("warnings", [])),
+        notes=tuple(str(item) for item in _field("notes", [])),
+        ai_notes=tuple(str(item) for item in getattr(session, "ai_diagnostics", ()) or ()),
+        has_text=bool(source),
+    )
+
+
 async def extract_product_metadata(
     model_text: str,
     info_text: str,
@@ -1868,11 +1959,10 @@ async def extract_product_metadata(
     diagnostics: list[str] | None = None,
 ) -> tuple[list[str], dict[str, list[str]]]:
     """Use the product parser without recording a product; optionally return its warnings."""
-    session = ProductSession(model_text=model_text or "", info_text=info_text or "")
-    data = await _extract(session, learn=False)
+    analysis = await analyze_text(model_text, info_text)
     if diagnostics is not None:
-        diagnostics.extend(session.ai_diagnostics)
-    return session.models, data.attributes if data is not None else {}
+        diagnostics.extend(analysis.ai_notes)
+    return [*analysis.phone_models, *analysis.accessories], analysis.attributes
 
 
 def _apply_color_matrix(session: ProductSession, source_text: str) -> None:
@@ -2515,7 +2605,7 @@ async def _queue_for_retry(
     if settings.woo_dry_run or session.mode != "new" or not outbox.is_transient(exc):
         return False
     try:
-        return await asyncio.to_thread(outbox_flow.enqueue_after_failure,
+        queued = await asyncio.to_thread(outbox_flow.enqueue_after_failure,
             user_id=user_id, chat_id=session.chat_id or user_id, thread_id=session.thread_id,
             mode=session.mode, data=data, files=session.files, batch_id=batch,
             ledger_key=ledger_key or "", error=error, retry_after=getattr(exc, "retry_after", 0.0),
@@ -2523,10 +2613,57 @@ async def _queue_for_retry(
     except Exception as inner:                                   # the publish already failed; be plain
         logger.warning("outbox: نتوانست صف را بنویسد: %s", inner)
         return False
+    if queued:
+        # Remembered on the session for one reason: the idle timer must not call a product that
+        # is still queued a «رهاشده». `outbox.is_queued` is the truth, this field is the pointer.
+        session.queued_batch = batch
+    return queued
 
 
 def _queued_note(queued: bool) -> str:
     return "\n🐇 در صفِ تلاش مجدد است؛ نتیجه را همین‌جا می‌فرستم." if queued else ""
+
+
+def _publish_failure_text(exc: BaseException, reason: str, *, queued: bool, waiting: str = "") -> str:
+    """Say «this did not go through» in the voice of whoever has to act — the shop or the seller.
+
+    One red sentence used to cover both a host that answers nothing and a value WooCommerce
+    refused, and the first is not something a person can fix by retyping the form. A queued,
+    host-silent failure is therefore not shown as an error at all: it is a state with a time on
+    it, and the only thing asked of the seller is to wait — «✅ تأیید و ساخت» still works and
+    only does the same send sooner.
+    """
+    if queued and outbox.is_silent(exc):
+        lines = [
+            "🕐 سایت در این لحظه پاسخ نمی‌دهد — از سمتِ تو هیچ‌چیز غلط نبود.",
+            "🐇 هرچه تأیید کرده بودی در صفِ ارسال است؛ ربات خودش سایت را امتحان می‌کند و "
+            "نتیجه را همین‌جا می‌فرستد.",
+        ]
+        if waiting:
+            lines.append(f"⏱ {waiting}")
+        lines.append(
+            "👤 لازم است کاری نکنی. اگر عجله داری همان «✅ تأیید و ساخت» را دوباره بزن؛ "
+            "«📤 صف من» (یا ‎/queue) هم وضعیتش را نشان می‌دهد."
+        )
+        return "\n\n".join(lines)
+    head = f"❌ ساخت مستقیم محصول ناموفق بود:\n{reason}"
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int) and status:
+        head = f"❌ ساخت مستقیم محصول ناموفق بود (HTTP {status}):\n{reason}"
+    return head + _queued_note(queued)
+
+
+def _queued_keyboard(session: ProductSession, queued: bool) -> InlineKeyboardMarkup | None:
+    """The card's own buttons, plus «📤 صف من» — a failure edit must never eat «تأیید و ساخت».
+
+    Replacing the markup with the two buttons a failure *seems* to need is how a queue turns
+    into «چطور دوباره بزنم؟»: the review keyboard is the retry, so it is kept and only extended.
+    """
+    if not queued:
+        return None
+    rows = list(_keyboard(session).inline_keyboard)
+    rows.append([InlineKeyboardButton("📤 صف من", callback_data=CB.QUEUE_SHOW)])
+    return InlineKeyboardMarkup(rows)
 
 
 
@@ -2606,9 +2743,7 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     # This is a callback, so Telegram can show a transient toast. Keep the
     # preview card intact while the publish runs; ``session.submitting`` blocks
     # a second tap without replacing the user's card with a status message.
-    await query.answer(
-        "در حال ساخت پیش‌نویس مستقیم…" if session.mode == "new" else "در حال ساخت فایل ZIP…"
-    )
+    await _toast(query, "در حال ساخت پیش‌نویس مستقیم…" if session.mode == "new" else "در حال ساخت فایل ZIP…")
     await _telegram_log(context, f"[product:{user.id}] تأیید نهایی دریافت شد؛ داده نهایی:\n{json.dumps(data.to_dict(), ensure_ascii=False, indent=2)}")
     intent_key: str | None = None
     publish_returned = False
@@ -2752,6 +2887,10 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         except WooCommerceAPIError as exc:
             if publish_returned:
                 return await keep_success_if_reply_failed(exc)
+            # Cleared first, before anything else in this handler can fail: the publish is over
+            # whichever way it ended, and a second failure on the way to saying so must never
+            # leave the session locked («یک ساخت در جریان است») for the rest of its life.
+            session.submitting = False
             audit_lines = exc.diagnostics or []
             await _telegram_log(
                 context,
@@ -2763,7 +2902,8 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             reason = f"HTTP {exc.status_code}: {exc}"
             queued = await _queue_for_retry(exc, user_id=user.id, session=session, data=data,
                                       batch=batch, error=reason, ledger_key=intent_key)
-            message = f"❌ ساخت مستقیم محصول ناموفق بود (HTTP {exc.status_code}):\n{exc}" + _queued_note(queued)
+            waiting = await asyncio.to_thread(outbox_flow.queue_status, batch) if queued else ""
+            message = _publish_failure_text(exc, str(exc), queued=queued, waiting=waiting)
             _record_result(user.id, session, data, status="queued" if queued else "failed",
                            key=intent_key, batch_id=batch, error=reason)
             await _flush_journal(context, status="queued" if queued else "failed", data=data,
@@ -2772,12 +2912,12 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 await product_journal.send_publish_trace(
                     context.bot, audit_lines, dry_run=settings.woo_dry_run
                 )
-            await _edit_message_if_changed(query, message)
-            session.submitting = False
+            await _note_on_card(query, message, _queued_keyboard(session, queued))
             return REVIEW
         except Exception as exc:
             if publish_returned:
                 return await keep_success_if_reply_failed(exc)
+            session.submitting = False                            # see the note above
             details = traceback.format_exc()
             audit_lines = list(getattr(exc, "diagnostics", []) or [])
             reason = describe_exception(exc)
@@ -2799,15 +2939,14 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 await product_journal.send_publish_trace(
                     context.bot, audit_lines, dry_run=settings.woo_dry_run
                 )
-            await _edit_message_if_changed(
-                query, f"❌ ساخت مستقیم محصول ناموفق بود:\n{reason}" + _queued_note(queued)
-            )
-            session.submitting = False
+            waiting = await asyncio.to_thread(outbox_flow.queue_status, batch) if queued else ""
+            message = _publish_failure_text(exc, reason, queued=queued, waiting=waiting)
+            await _note_on_card(query, message, _queued_keyboard(session, queued))
             return REVIEW
     # Every mode but «new» (REST draft above) and «update» (dispatched at the top) is unknown:
     # the bot no longer builds ZIP files, so there is nothing honest to do with it.
     session.submitting = False
-    await query.answer("این حالت پشتیبانی نمی‌شود؛ از منو دوباره شروع کن.", show_alert=True)
+    await _toast(query, "این حالت پشتیبانی نمی‌شود؛ از منو دوباره شروع کن.", show_alert=True)
     return REVIEW
 
 
@@ -3084,10 +3223,33 @@ async def cb_back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def on_timeout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """An idle flow is over: drop the state and its files, and say so."""
+    """An idle flow is over: drop the state and its files, and say so.
+
+    One case is not an abandonment: a publish the shop refused and
+    :mod:`bot.services.outbox` is still retrying. The queue keeps its own copy of the images, so
+    the workspace may go — but calling a product that is about to appear on its own a «رهاشده»,
+    counting a ``flow_abandoned`` that never happened, and telling the seller the flow was closed
+    would be a false alarm with a metric behind it. This branch says «🕐 هنوز در صف» instead.
+    """
     user = update.effective_user
     restock_open = bool(user and restock_flow.sessions.get(user.id))
     open_session = sessions.get(user.id) if user else None
+    batch = str(getattr(open_session, "queued_batch", "") or "")
+    if open_session is not None and batch and await asyncio.to_thread(outbox.is_queued, batch):
+        if open_session.data is not None:
+            # Flushed BEFORE the cleanup: the card wants the session's own title, variation count
+            # and image count, and `_cleanup` is what throws them away.
+            await _flush_journal(context, status="queued", data=open_session.data,
+                                 session=open_session, batch=batch)
+        if user:
+            _cleanup(user.id)                       # the queue spooled its own image copies
+        message = update.effective_message
+        if message:
+            await message.reply_text(
+                "🕐 این محصول هنوز در صفِ تلاشِ دوباره است؛ ربات خودش سایت را امتحان می‌کند و "
+                "نتیجه را همین‌جا می‌فرستد. بی‌فعالیتِ چت، صف را لغو نمی‌کند."
+            )
+        return
     # Which flow gave up is both a number and a sentence — the metric wants a key, the
     # user has to be told «اپدیت محصول» — so one branch decides both and they cannot drift.
     if open_session is not None and open_session.mode == "update":

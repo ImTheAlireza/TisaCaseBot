@@ -5,25 +5,33 @@ never imports a module: the service stores and schedules, this module talks to T
 calls the *real* publish path. The queue holds a product, not a callback, so nothing here can
 drift from what a human pressing «تأیید و ساخت» does: same ``create_draft``, same batch id,
 same ledger card, and (in dry-run) no draining at all.
+
+The second half is the seller's own view of that queue (``/queue``, «📤 صف من»): what is waiting,
+how many tries are left, when the next one is — so «صف است» is a state they can look at instead
+of a sentence they have to trust. Read-only apart from two buttons that move *their* rows.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import html
 import logging
 import time
 from typing import Any
+from collections.abc import Sequence
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, ContextTypes
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 from bot import __version__ as _BOT_VERSION
 from bot.config import settings
 from bot.buttons import feature_allowed
+from bot.constants import CB
 from bot.services.validation import validate_draft
+from bot.utils import timeutil
 from bot.keyboards import result_card, result_keyboard
-from bot.services import outbox, product_journal, products_ledger, publish_batch
+from bot.services import callbacks, outbox, product_journal, products_ledger, publish_batch
 from bot.services.woo_client import WooCommerceAPIError, describe_exception
 from bot.services.woocommerce_direct import create_draft
 
@@ -104,7 +112,11 @@ async def _attempt(app: Application, entry: outbox.QueuedPublish) -> None:
     report: list[str] = []
     try:
         if outbox.expired(entry):
-            raise WooCommerceAPIError(410, "مهلت ۲۴ ساعته/تعداد تلاش این بسته تمام شده؛ بدون ارسال به فروشگاه رها شد.")
+            error = WooCommerceAPIError(
+                410, "مهلت ۲۴ ساعته و ۸ تلاشِ این بسته تمام شده؛ بدون ارسال به فروشگاه رها شد."
+            )
+            error.queue_expired = True
+            raise error
         try:
             actor = int(entry.user_id)
         except (TypeError, ValueError):
@@ -136,6 +148,18 @@ async def _attempt(app: Application, entry: outbox.QueuedPublish) -> None:
         reason = f"HTTP {exc.status_code}: {exc}" if isinstance(exc, WooCommerceAPIError) \
             else describe_exception(exc)
         if outbox.is_transient(exc):
+            if outbox.is_silent(exc) and not outbox.expired(
+                entry, now=time.time() + outbox.SILENT_RETRY_SECONDS
+            ):
+                # Nothing answered at all. Waiting the ordinary 1m/3m/9m out of eight tries would
+                # drop the product while the host is still down, so the wait is half an hour and
+                # the attempt counter stays where it was: «هشت تلاش» means eight real ones.
+                await asyncio.to_thread(outbox.defer, entry, reason)
+                logger.info(
+                    "outbox: سایت پاسخ نداد؛ %s تا %s دقیقه دیگر دوباره (تلاشی شمرده نشد)",
+                    entry.batch_id, outbox.SILENT_RETRY_SECONDS // 60,
+                )
+                return
             if entry.attempts + 1 >= outbox.MAX_ATTEMPTS or outbox.expired(entry):
                 await asyncio.to_thread(_finish_card, entry, status="failed", error=reason)
             updated = await asyncio.to_thread(outbox.note_failure, entry, reason)
@@ -143,12 +167,33 @@ async def _attempt(app: Application, entry: outbox.QueuedPublish) -> None:
                 await _notify(
                     app, entry,
                     f"❌ بعد از {updated.attempts} تلاش این محصول در صف ماند و رها شد:\n{reason}\n"
-                    "هرچه در پیش‌نمایش تأیید کرده بودی ذخیره شده؛ دوباره «تأیید و ساخت» را بزن.",
+                    "هرچه در پیش‌نمایش تأیید کرده بودی در «🧾 تاریخچهٔ محصولات» مانده. اگر جریان هنوز "
+                    "باز است همان «✅ تأیید و ساخت» را بزن؛ اگر بسته شده، از «📦 ساخت محصول» با "
+                    "همان عکس‌ها دوباره شروع کن.",
                 )
             else:
                 wait = max(0, int(updated.next_at - time.time()))
                 logger.info("outbox: تلاش %s/%s برای %s پس از %ss", updated.attempts,
                             outbox.MAX_ATTEMPTS, updated.batch_id, wait)
+            return
+        if getattr(exc, "queue_expired", False):
+            # The queue's own deadline, not a verdict about the product. It has to read
+            # differently: «رهایش کردم» is a decision the bot made, and the seller's next move
+            # (open the flow again) is a different move than «fix this error».
+            await asyncio.to_thread(_finish_card, entry, status="failed", error=reason)
+            await asyncio.to_thread(
+                outbox.abandon, entry.batch_id, reason,
+                expected_updated_at=entry.updated_at or None,
+                expected_generation=entry.generation or None,
+                claim_token=entry.claim_token or None,
+            )
+            await _notify(
+                app, entry,
+                "⌛ بیست‌وچهار ساعت از صف این محصول گذشت و سایت هنوز جواب نمی‌داد؛ رهایش کردم تا "
+                "بی‌آخر تلاش نکند — هیچ‌چیز روی فروشگاه نوشته نشد.\n\n"
+                "پیش‌نمایش و علتش در «🧾 تاریخچهٔ محصولات» مانده؛ برای ساختنش جریان «📦 ساخت محصول» "
+                "را دوباره باز کن و عکس‌ها را از نو بفرست (پس از رهاکردن، صف کپیِ خودش را پاک می‌کند).",
+            )
             return
         # A 400 will answer the same way tomorrow: saying why now is kinder than a silent queue.
         await asyncio.to_thread(_finish_card, entry, status="failed", error=reason)
@@ -282,3 +327,160 @@ async def start(app: Application) -> int:
         logger.info("outbox: %s مورد در صف است (آخرین خطا: %s)", pending["pending"],
                     pending.get("last_error") or "—")
     return 0
+
+
+# --- the queue, from the seller's side (/queue, «📤 صف من») -------------------------
+
+
+def queue_status(batch_id: str, *, now: float | None = None) -> str:
+    """One line about a batch, for the card that has just put it in the queue.
+
+    Read back from the row instead of composed from the constants: ``enqueue`` counts the failed
+    attempt as number one, and a promise printed on a card must not be a second arithmetic.
+    """
+    entry = outbox.get(batch_id)
+    return status_line(entry, now=now) if entry is not None else ""
+
+
+def status_line(entry: outbox.QueuedPublish, *, now: float | None = None) -> str:
+    """One line of truth about a waiting publish: how far it got and when it moves again.
+
+    Read from the queue row rather than remembered in the conversation, because the two are
+    allowed to disagree (a restart, a button pressed in another chat) and only one of them is
+    written by the code that actually retries.
+    """
+    moment = time.time() if now is None else now
+    left = max(0, outbox.MAX_ATTEMPTS - int(entry.attempts))
+    wait = int(entry.next_at) - int(moment)
+    if wait <= 0:
+        when = "همین حالا"
+    else:
+        clock = timeutil.strftime("%H:%M", entry.next_at)
+        when = f"{clock} ({timeutil.human_duration(wait)} دیگر)"
+    if entry.status != outbox.STATUS_PENDING:
+        return f"رها شده پس از {entry.attempts} تلاش"
+    tail = "بدونِ تلاشِ باقی‌مانده" if left <= 0 else f"{left} بار دیگر"
+    return f"تلاش {entry.attempts} از {outbox.MAX_ATTEMPTS} · بعدی: {when} · {tail}"
+
+
+def queue_text(entries: Sequence[outbox.QueuedPublish], *, now: float | None = None) -> str:
+    """The card: what is waiting, what the last attempt said, and what the two buttons do.
+
+    The error line is shown because the seller's next question is always «چرا؟» — and the
+    answer is one of the three sentences the preflight writes (host silent / firewall / plugin),
+    each of which has a different person who can fix it.
+    """
+    if not entries:
+        return "📤 صفی نداری — چیزی در انتظار ارسال نیست."
+    lines = [f"📤 <b>صفِ ارسالِ تو</b> — {len(entries)} مورد", ""]
+    for index, entry in enumerate(entries, 1):
+        title = html.escape(str(entry.payload.get("title") or "—").strip())[:80]
+        icon = "🕐" if entry.status == outbox.STATUS_PENDING else "⛔"
+        lines.append(f"{index}) «{title}»\n   {icon} {status_line(entry, now=now)}")
+        reason = " ".join(str(entry.last_error or "").split())[:200]
+        if reason:
+            lines.append(f"   ↳ {html.escape(reason)}")
+    lines += ["", "«⟳» همان تلاش را جلو می‌اندازد. «🗑» یعنی از صف بردار تا خودت دوباره بزنی."]
+    return "\n".join(lines)
+
+
+def queue_markup(entries: Sequence[outbox.QueuedPublish]) -> InlineKeyboardMarkup | None:
+    """⟳/🗑 per waiting row, in the same order as the text. ``None`` for an empty queue.
+
+    A dropped row gets no buttons: there is nothing to retry and nothing to remove, and a
+    button that answers «چیزی نیست» is the kind of thing this bot has been deleting for weeks.
+    """
+    rows = []
+    for entry in entries:
+        if entry.status != outbox.STATUS_PENDING:
+            continue
+        rows.append([
+            InlineKeyboardButton("⟳ همین حالا", callback_data=f"{CB.QUEUE_NOW}:{entry.batch_id}"),
+            InlineKeyboardButton("🗑 از صف بردار", callback_data=f"{CB.QUEUE_DROP}:{entry.batch_id}"),
+        ])
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+async def _answer(query: Any, text: str, *, alert: bool = False) -> None:
+    try:
+        await query.answer(text, show_alert=alert)
+    except Exception as exc:                                # a toast is never worth a stack trace
+        logger.debug("outbox: توست نرفت (%s): %s", type(exc).__name__, exc)
+
+
+async def _show_queue(update: Update, context: ContextTypes.DEFAULT_TYPE, *, edit: bool) -> None:
+    user = update.effective_user
+    if user is None:
+        return
+    entries = await asyncio.to_thread(outbox.rows_for, user.id)
+    text, markup = queue_text(entries), queue_markup(entries)
+    query = update.callback_query
+    target = query if (edit and query is not None) else None
+    try:
+        if target is not None:
+            await target.edit_message_text(text=text, reply_markup=markup, parse_mode="HTML")
+            return
+    except Exception as exc:
+        logger.debug("outbox: کارت صف ویرایش نشد (%s): %s", type(exc).__name__, exc)
+    kwargs: dict[str, Any] = {"chat_id": user.id, "text": text, "parse_mode": "HTML"}
+    if markup is not None:
+        kwargs["reply_markup"] = markup
+    try:
+        await context.bot.send_message(**kwargs)
+    except Exception as exc:
+        logger.warning("outbox: کارت صف به %s نرفت: %s", user.id, exc)
+
+
+async def cmd_queue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/queue`` — what of mine is still waiting for the shop?"""
+    await _show_queue(update, context, edit=False)
+
+
+async def cb_queue_show(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """«📤 صف من» on the failure card. A new message, not an edit: the preview card stays."""
+    await _answer(update.callback_query, "")
+    await _show_queue(update, context, edit=False)
+
+
+async def cb_queue_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """⟳ /  on one's own queued publish — the only two writes this screen can do.
+
+    Ownership is decided by the ``user_id`` the row was stored with, so a batch id copied from
+    somebody else's message cannot push their product or delete it: ``get`` answers «nothing
+    here» and that is exactly what the toast says.
+    """
+    query = update.callback_query
+    data = callbacks.action(query)
+    action, _, batch_id = data.rpartition(":")
+    user = update.effective_user
+    entry = await asyncio.to_thread(outbox.get, batch_id, user_id=user.id if user else None)
+    if entry is None:
+        await _answer(query, "این مورد دیگر در صف نیست (ساخته شده یا برداشته شده).", alert=True)
+        await _show_queue(update, context, edit=True)
+        return
+    if action.endswith(CB.QUEUE_NOW):
+        if entry.claim_token:
+            await _answer(query, "⏳ همین حالا دارد تلاش می‌شود؛ چند لحظه صبر کن.", alert=True)
+            return
+        moved = await asyncio.to_thread(outbox.push_now, batch_id, user_id=user.id)
+        await _answer(query, "👌 تلاش بعدی تا چند ثانیه دیگر." if moved else "⚠️ نشد؛ دوباره امتحان کن.")
+        await _show_queue(update, context, edit=True)
+        return
+    if entry.claim_token:
+        await _answer(query, "⏳ دارد تلاش می‌شود؛ برای برداشتن از صف صبر کن.", alert=True)
+        return
+    await asyncio.to_thread(outbox.abandon, batch_id, "کاربر آن را از صفِ تلاشِ دوباره برداشت.")
+    await asyncio.to_thread(
+        _finish_card, entry, status="failed", error="از صفِ تلاشِ دوباره برداشته شد."
+    )
+    await _answer(query, "🗑 از صف برداشته شد. هرچه در پیش‌نمایش بود دست‌نخورده مانده.")
+    await _show_queue(update, context, edit=True)
+
+
+def register(app: Application) -> None:
+    """Only the queue's own two screens; the drain itself is started from ``bot/app.py``."""
+    app.add_handler(CommandHandler("queue", cmd_queue))
+    app.add_handler(CallbackQueryHandler(cb_queue_show, pattern=f"^{CB.QUEUE_SHOW}$"))
+    app.add_handler(CallbackQueryHandler(
+        cb_queue_action, pattern=r"^queue:(now|drop):[A-Za-z0-9_-]{1,64}$",
+    ))
