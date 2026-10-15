@@ -60,9 +60,10 @@ async def test_wordpress_media(timeout: float = 15.0) -> MediaTestResult:
                     # Password را چک کن» would be the wrong advice, and the fix is the same
                     # whitelist the safety fence asks for.
                     msg = (f"لایهٔ امنیتیِ میزبان درخواستِ ربات را رد کرد (HTTP {response.status_code}) "
-                           "— افزونه، کاربر و رمز مقصر نیستند: درخواست به وردپرس نرسیده. IP سرورِ "
-                           "ربات را وایت‌لیست کن (ضدِرباتِ میزبان / Imunify360 / Cloudflare) و بعد "
-                           "«🩺 عیب‌یابی کامل» ← «شبکهٔ سایت» را ببین.")
+                           "— افزونه، کاربر و رمز مقصر نیستند: درخواست به وردپرس نرسیده. ربات چالشِ "
+                           "جاوااسکریپتی این لایه را خودکار انجام می‌دهد؛ این ۴۱۸ بدون چالش آمده، "
+                           "پس IP سرورِ ربات را وایت‌لیست کن (ضدِرباتِ میزبان / Imunify360 / "
+                           "Cloudflare) و بعد «🩺 عیب‌یابی کامل» ← «شبکهٔ سایت» را ببین.")
                 elif response.status_code == 403:
                     msg = "WordPress یا ModSecurity اجازه آپلود نمی‌دهد."
                 elif response.status_code == 404:

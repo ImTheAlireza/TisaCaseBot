@@ -29,6 +29,12 @@ created a second product. So the rule here is narrow and the same for every call
 The ambiguous write is handled one layer up instead, where it belongs: the content-addressed
 batch id and the resume hunt in :mod:`bot.services.publish_batch` top up the half-made
 product rather than adding a second one.
+
+One more thing belongs here and nowhere else: :data:`CHALLENGE_COOKIE`. The shop's host stands
+behind a gate that answers ``418`` to any client without its cookie and hands that client a
+JavaScript page that sets it (2026‑10‑15 — the whole «سایت پایین است» saga). Only the layer that
+opens the socket can answer it once for every caller, so that is what :meth:`WooClient._handshake`
+does, and :class:`ChallengeJar` keeps the answer across restarts.
 """
 from __future__ import annotations
 
@@ -36,17 +42,19 @@ import asyncio
 import json
 import logging
 import math
+import os
 import re
 import time
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
+from pathlib import Path
 from typing import Any, Protocol
 from collections.abc import Mapping, Sequence
 
 import httpx
 
 from bot import __version__
-from bot.config import settings
+from bot.config import data_dir, settings
 from bot.utils.logging import redact
 
 logger = logging.getLogger(__name__)
@@ -73,10 +81,113 @@ IDEMPOTENT_METHODS = ("GET", "HEAD", "OPTIONS", "PUT", "DELETE")
 #: "teapot" — instead of 403 — to every request the watchdog sent, with the keys and without them
 #: alike, in fifteen-minute cycles that matched the watchdog's own cadence. Nothing downstream may
 #: read it as «the plugin is missing» or «the seller typed something wrong»: the request never
-#: reached PHP, no byte was written, and the only thing that fixes it is a whitelist entry for the
-#: bot's IP on the host side. Hence one name, used by the safety fence, the send queue and the
-#: no-terminal diagnosis, instead of the bare number in three places.
+#: reached PHP and no byte was written.
+#:
+#: What that answer *is* changed once somebody finally looked at its body (see
+#: :data:`CHALLENGE_COOKIE`): a JavaScript handshake, not a refusal. :class:`WooClient` now
+#: completes the handshake itself, so this code only ever reaches the layers above when the gate
+#: refused **without** offering one — the residual, harder block the 🔒 sentence is for.
 BLOCKED_STATUS_CODES = frozenset({418})
+
+#: The cookie the host's anti-bot gate plants with JavaScript, and the page that plants it.
+#:
+#: The 2026‑10‑15 mystery, end to end. Every request that arrived *without* this cookie — the
+#: bot's, ``curl``'s, a third-party checker's — was answered ``418`` with a 663-byte page whose
+#: whole body is «set ``_dgjsc`` to ``<32 hex>:<14-digit stamp>``, then reload». A browser runs
+#: that page, reloads once and never notices: which is why every «پایین بودن» report came from the
+#: bot while the shop served customers the whole time. ``curl`` and ``httpx`` execute no
+#: JavaScript, so they read ``418`` for as long as the cookie (``Max-Age=7200``) is missing.
+CHALLENGE_COOKIE = "_dgjsc"
+#: The value, exactly as the page builds it (`_dgjsc=<hex>:<stamp>`), plus the page's own lifetime.
+CHALLENGE_PATTERN = re.compile(rf"{CHALLENGE_COOKIE}=([a-f0-9]{{32}}:[0-9]{{14}})")
+CHALLENGE_MAX_AGE_PATTERN = re.compile(r"Max-Age=(\d+)")
+#: What the observed page asks for (``Max-Age=7200``); used when a page does not say.
+CHALLENGE_MAX_AGE_DEFAULT = 7200.0
+
+
+def challenge_cookie(response: httpx.Response) -> tuple[str, float] | None:
+    """The gate's handshake, when this response is the page that asks for it.
+
+    Returns ``(value, max_age)``. ``None`` means «this 418 is a refusal, not a question» — the
+    distinction the fence, the queue and the seller's card are all built on.
+    """
+    if response.status_code not in BLOCKED_STATUS_CODES:
+        return None
+    try:
+        body = response.text
+    except Exception:                                       # a body httpx cannot decode
+        return None
+    match = CHALLENGE_PATTERN.search(body or "")
+    if match is None:
+        return None
+    max_age = CHALLENGE_MAX_AGE_PATTERN.search(body or "")
+    return match.group(1), (float(max_age.group(1)) if max_age else CHALLENGE_MAX_AGE_DEFAULT)
+
+
+class ChallengeJar:
+    """Remembers each origin's gate cookie between requests *and* restarts.
+
+    Without it every restart would begin with a 418 (the first request has no cookie) — and a
+    single 418 seen by :mod:`bot.services.woo_fencing` is enough to paint the shop 🔒 «مسدود» for
+    a whole publish. Two hours of handshake are worth a small JSON file next to the outbox.
+
+    The value is bound to the client the gate issued it to, so a stale entry costs one extra round
+    trip (the gate asks again) and never a wrong answer.
+    """
+
+    def __init__(self, path: Path | None = None) -> None:
+        self.path = path if path is not None else data_dir() / "shop-challenge.json"
+        self._entries: dict[str, tuple[str, float]] | None = None
+
+    def _all(self) -> dict[str, tuple[str, float]]:
+        if self._entries is None:
+            self._entries = self._read()
+        return self._entries
+
+    def _read(self) -> dict[str, tuple[str, float]]:
+        """Read whatever previous builds left, dropping anything expired or malformed.
+
+        Never raises: a missing, unreadable or hand-mangled file must not be able to stop a
+        publish. The worst it can cost is one handshake.
+        """
+        try:
+            raw = json.loads(self.path.read_text("utf-8"))
+        except (OSError, ValueError):
+            return {}
+        now = time.time()
+        entries: dict[str, tuple[str, float]] = {}
+        for origin, item in (raw.items() if isinstance(raw, dict) else ()):
+            if not isinstance(item, (list, tuple)) or len(item) != 2:
+                continue
+            value, expires = item
+            if isinstance(value, str) and isinstance(expires, (int, float)) and float(expires) > now:
+                entries[str(origin)] = (value, float(expires))
+        return entries
+
+    def value(self, origin: str) -> str | None:
+        """The cookie to send to ``origin`` right now, or ``None`` if there is none to send."""
+        if not origin:
+            return None
+        entry = self._all().get(origin)
+        if entry is None or entry[1] <= time.time():
+            return None
+        return entry[0]
+
+    def remember(self, origin: str, value: str, max_age: float) -> None:
+        """Keep a freshly solved handshake, and write it down for the next process."""
+        if not origin:
+            return
+        self._all()[origin] = (value, time.time() + max(60.0, float(max_age)))
+        self._write()
+
+    def _write(self) -> None:
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_name(self.path.name + ".tmp")
+            tmp.write_text(json.dumps(self._all(), ensure_ascii=False), "utf-8")
+            os.replace(tmp, self.path)
+        except OSError as exc:  # a read-only data dir must not break publishing
+            logger.warning("ذخیرهٔ کوکیِ چالش ناکام ماند (%s): %s", self.path, exc)
 
 #: How many times a request may be sent at all (1 = never retry).
 DEFAULT_ATTEMPTS = 3
@@ -133,10 +244,12 @@ class WooCommerceAPIError(RuntimeError):
         #: lets :func:`bot.services.outbox.is_silent` tell a dead host from a busy one (both 503).
         self.host_silent: bool = False
         #: «answered, and the answer was *no*» — the preflight met a security layer in front of
-        #: WordPress (:data:`BLOCKED_STATUS_CODES`). The queue waits this out exactly like silence
-        #: (nothing was written, so nothing needs a human tonight), but the sentence and the next
-        #: step are a different pair — «وایتلیست کن» rather than «به هاست نگاه کن» — which is why
-        #: it is a second flag and not a second meaning for the first.
+        #: WordPress (:data:`BLOCKED_STATUS_CODES`) that refused *without* offering its
+        #: challenge page — the solvable shape of that answer never gets this far, because
+        #: :meth:`WooClient._handshake` answers it. The queue waits this out exactly like
+        #: silence (nothing was written, so nothing needs a human tonight), but the sentence and
+        #: the next step are a different pair — «وایتلیست کن» rather than «به هاست نگاه کن» —
+        #: which is why it is a second flag and not a second meaning for the first.
         self.host_blocked: bool = False
         #: The queue's own deadline, said on the error: «مهلت ۲۴ ساعت/تلاش‌ها تمام شد». Only the
         #: queue sets it, so the message can tell that expiry apart from a 410 the shop itself
@@ -322,12 +435,18 @@ class WooClient:
         secret: str | None = None,
         min_request_interval: float = 0.0,
         max_concurrent_requests: int = 20,
+        challenges: ChallengeJar | None = None,
     ) -> None:
         """``key``/``secret`` override ``.env`` — the credential tester verifies a candidate
-        pair before it is saved, so it must not be pinned to the settings in force."""
+        pair before it is saved, so it must not be pinned to the settings in force.
+
+        ``challenges`` is the gate's cookie jar; the suite hands in one of its own so that no test
+        writes into the real ``data/``.
+        """
         self.audit: Sink = audit if audit is not None else _NullSink()
         self._key, self._secret = key, secret
         self.dry_run = dry_run
+        self.challenges = challenges if challenges is not None else ChallengeJar()
         self.timeout_seconds = timeout
         self.attempts = max(1, attempts)
         self._request_number = 0
@@ -404,6 +523,13 @@ class WooClient:
         if query:
             merged["params"] = query
         merged["headers"] = {"User-Agent": USER_AGENT, **dict(headers or {})}
+        # A solved handshake rides along on every request, exactly as a browser replays its
+        # cookies: without it each request after the first would meet the gate's 418 again and
+        # pay a second round trip. It goes through the client's own jar (not a header of ours) so
+        # that it would merge with any other cookie instead of replacing it.
+        held = self.challenges.value(origin_of(str(url)))
+        if held:
+            self._install_cookie(str(url), held)
 
         method = method.upper()
         self._request_number += 1
@@ -466,10 +592,72 @@ class WooClient:
                 )
                 await _sleep(delay)
                 continue
-            return response
+            return await self._handshake(method, str(url), merged, response, request_id, phase, path)
         # Unreachable while ``attempts >= 1``, but ``assert`` vanishes under ``python -O``
         # and the caller would then get ``None`` as if it were a response.
         raise RuntimeError("no request was attempted (attempts must be at least 1)")  # pragma: no cover
+
+    def _install_cookie(self, url: str, value: str) -> None:
+        """Put the gate's cookie in the client's jar, scoped to the URL's host."""
+        try:
+            host = httpx.URL(url).host or ""
+        except Exception:                                   # malformed configuration
+            return
+        if host:
+            self._client.cookies.set(CHALLENGE_COOKIE, value, domain=host, path="/")
+
+    async def _handshake(
+        self,
+        method: str,
+        url: str,
+        merged: dict[str, Any],
+        response: httpx.Response,
+        request_id: int,
+        phase: float,
+        path: str,
+    ) -> httpx.Response:
+        """Answer the gate's JavaScript handshake for it, once, and send the request again.
+
+        The page that arrived is not a refusal — it is the gate saying «set this cookie and come
+        back», which a browser does without anyone noticing and ``httpx`` never does. Doing it here,
+        in the one HTTP layer, means every caller above (the safety fence, the four probes, the
+        media test, the writer) sees the real answer instead of a 418 nobody could explain.
+
+        Sending again is safe **even for a POST**: this answer proves PHP never ran — the gate
+        stands in front of it — so no byte of the request has been applied. That is the same
+        argument the retry policy makes for a connect error, and the reason this repeat does not
+        spend one of ``attempts``: the first request was never delivered.
+
+        A second 418 is returned as it is. Looping would hammer the gate that is already unhappy,
+        and the fence above is the layer that knows how to *report* a real, challenge-less block.
+        """
+        challenge = challenge_cookie(response)
+        if challenge is None:
+            return response
+        value, max_age = challenge
+        self.challenges.remember(origin_of(url), value, max_age)
+        self._install_cookie(url, value)
+        self.audit.log(
+            f"[http:gate] #{request_id} لایهٔ ضدِرباتِ میزبان چالشِ جاوااسکریپتی داد؛ "
+            f"کوکی {CHALLENGE_COOKIE} ست شد (اعتبار {max_age:g}s) و همان درخواست یک‌بار تکرار می‌شود"
+        )
+        again = dict(merged)
+        started = time.perf_counter()
+        try:
+            async with self._request_slots:
+                await self._pace()
+                async with asyncio.timeout(max(1.0, phase * 2)):
+                    second = await self._client.request(method, url, **again)
+        except httpx.TransportError as exc:
+            self.audit.log(
+                f"[http:gate] #{request_id} تکرارِ پس از چالش بی‌پاسخ ماند: {describe_exception(exc)}"
+            )
+            return response
+        self.audit.log(
+            f"[http:done] #{request_id} {method} {path} → HTTP {second.status_code} "
+            f"در {(time.perf_counter() - started) * 1000:.0f} ms (پس از چالش)"
+        )
+        return second
 
     def _retry_network(self, exc: httpx.TransportError) -> bool:
         """May this failed request be sent again?

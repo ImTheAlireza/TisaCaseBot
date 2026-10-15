@@ -177,6 +177,10 @@ async def _blocked(client: WooClient, base: str, response: httpx.Response) -> Wo
     read as «the plugin is missing»: the request never reached PHP, so the deployment is fine and
     re-uploading the zip is a wasted afternoon. It is also the one refusal that is *not* a config
     error of ours — so it is queued (``503``) and waited out, not dropped (``412``).
+
+    Reaching this function at all is now itself a finding: :class:`…woo_client.WooClient` answers
+    the gate's JavaScript challenge on its own (see ``woo_client.CHALLENGE_COOKIE``), so a 418 that
+    still arrives here is the harder, *challenge-less* refusal — not the page a browser shrugs at.
     """
     status = response.status_code
     stranger = await _stranger_status(client, base)
@@ -190,12 +194,13 @@ async def _blocked(client: WooClient, base: str, response: httpx.Response) -> Wo
         return _blocked_host(WooCommerceAPIError(503, (
             f"میزبان درخواست‌های ربات را رد می‌کند (HTTP {status}{detail}): همین کد را به درخواستِ "
             "بدون کلید هم می‌دهد، پس تصمیم‌گیرنده لایهٔ امنیتی جلوی وردپرس است — ضدِرباتِ میزبان، "
-            "Imunify360، ModSecurity — نه ووکامرس و نه افزونهٔ تیسا. درخواست به وردپرس نرسیده و "
-            "هیچ‌چیز نوشته نشده، پس این بسته در صف می‌ماند و بدون سوزاندنِ تلاش‌ها نیم‌ساعت "
-            "یک‌بار امتحان می‌شود. IP سرورِ ربات را در همان لایه وایت‌لیست کن (Imunify360 ← "
-            "White List ← افزودن IP) یا همین جمله را برای میزبان تیکت کن؛ اگر سایت پشت "
-            "Cloudflare است «Bot Fight Mode» را برای ‎/wp-json/*‎ استثنا کن. برای تأیید، همان "
-            "لحظه سایت را با مرورگر باز کن: بالا می‌آید — این «پایین بودنِ سایت» نیست."
+            "Imunify360، ModSecurity — نه ووکامرس و نه افزونهٔ تیسا. این لایه معمولاً با یک "
+            "چالشِ جاوااسکریپتی راه می‌دهد و ربات همان را خودکار انجام می‌دهد؛ پس ۴۱۸ بدون چالش "
+            "یعنی این‌بار چالش هم داده نشده. درخواست به وردپرس نرسیده و هیچ‌چیز نوشته نشده، پس "
+            "این بسته در صف می‌ماند و بدون سوزاندنِ تلاش‌ها نیم‌ساعت یک‌بار امتحان می‌شود. IP "
+            "سرورِ ربات را در همان لایه وایت‌لیست کن (Imunify360 ← White List ← افزودن IP)؛ اگر "
+            "سایت پشت Cloudflare است «Bot Fight Mode» را برای ‎/wp-json/*‎ استثنا کن. برای تأیید، "
+            "همان لحظه سایت را با مرورگر باز کن: بالا می‌آید — این «پایین بودنِ سایت» نیست."
         )))
     client.audit.log(
         f"[fence] مسیر بررسی ایمنی با کلید HTTP {status} گرفت ولی همان مسیر بدون کلید "
@@ -204,9 +209,10 @@ async def _blocked(client: WooClient, base: str, response: httpx.Response) -> Wo
     return _blocked_host(WooCommerceAPIError(503, (
         f"سایت درخواستِ دارای کلید را رد می‌کند (HTTP {status}{detail}) در حالی که همان مسیرِ "
         f"بدون کلید جواب داد (HTTP {stranger}) — پس قاعدهٔ فایروال/ModSecurity روی "
-        "«consumer_key/consumer_secret» است، نه خرابیِ سایت و نه افزونه. هیچ‌چیز نوشته نشده و "
-        "این بسته در صف می‌ماند. از میزبان بخواه قاعدهٔ «consumer» را برای ‎/wp-json/wc/v3/*‎ "
-        "بردارد، یا IP سرورِ ربات را استثنا کند."
+        "«consumer_key/consumer_secret» است، نه خرابیِ سایت و نه افزونه. کوکیِ چالش هم روی هر "
+        "دو درخواست فرستاده می‌شود، پس فرق از خودِ آدرسِ دارای کلید است. هیچ‌چیز نوشته نشده و "
+        "این بسته در صف می‌ماند. در پنلِ همان لایه قاعدهٔ «consumer» را برای ‎/wp-json/wc/v3/*‎ "
+        "بردار، یا IP سرورِ ربات را استثنا کن."
     )))
 
 
@@ -223,7 +229,8 @@ async def require(client: WooClient, base: str) -> None:
       → ``503`` said out loud, because the fix is a host rule, not a WordPress setting;
     * the shop replies with a busy status (``5xx``/``429``/…) → ``503``, queued like any 5xx;
     * the shop replies with a robot-protection status (:data:`BLOCKED_STATUS_CODES`, the 418 a
-      host's bot layer answers with) → ``503`` tagged ``host_blocked``: queued and waited out
+      host's bot layer answers with — *after* :mod:`bot.services.woo_client` has already answered
+      the layer's JavaScript challenge) → ``503`` tagged ``host_blocked``: queued and waited out
       without spending attempts, because the request never reached PHP and no plugin on earth
       fixes it — the whitelist does;
     * the route is absent, refused, or answers without the fields we need → ``412`` — a plugin
