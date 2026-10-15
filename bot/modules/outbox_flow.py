@@ -148,15 +148,19 @@ async def _attempt(app: Application, entry: outbox.QueuedPublish) -> None:
         reason = f"HTTP {exc.status_code}: {exc}" if isinstance(exc, WooCommerceAPIError) \
             else describe_exception(exc)
         if outbox.is_transient(exc):
-            if outbox.is_silent(exc) and not outbox.expired(
+            if (outbox.is_silent(exc) or outbox.is_blocked(exc)) and not outbox.expired(
                 entry, now=time.time() + outbox.SILENT_RETRY_SECONDS
             ):
-                # Nothing answered at all. Waiting the ordinary 1m/3m/9m out of eight tries would
-                # drop the product while the host is still down, so the wait is half an hour and
-                # the attempt counter stays where it was: «هشت تلاش» means eight real ones.
+                # Nothing reached WordPress: either nothing answered at all, or a security layer
+                # in front of it said «no» before PHP ever saw the request (`is_blocked`). Waiting
+                # the ordinary 1m/3m/9m out of eight tries would drop the product while the host is
+                # still down or still blocking, so the wait is half an hour and the attempt counter
+                # stays where it was: «هشت تلاش» means eight real ones.
                 await asyncio.to_thread(outbox.defer, entry, reason)
                 logger.info(
-                    "outbox: سایت پاسخ نداد؛ %s تا %s دقیقه دیگر دوباره (تلاشی شمرده نشد)",
+                    "outbox: %s؛ %s تا %s دقیقه دیگر دوباره (تلاشی شمرده نشد)",
+                    "سایت درخواست را رد کرد (مسدودسازی)" if outbox.is_blocked(exc)
+                    else "سایت پاسخ نداد",
                     entry.batch_id, outbox.SILENT_RETRY_SECONDS // 60,
                 )
                 return

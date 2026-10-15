@@ -17,7 +17,13 @@ from typing import Any
 import httpx
 
 from bot.services.outbox import TRANSIENT_STATUS_CODES
-from bot.services.woo_client import WooClient, WooCommerceAPIError, error_message, origin_of
+from bot.services.woo_client import (
+    BLOCKED_STATUS_CODES,
+    WooClient,
+    WooCommerceAPIError,
+    error_message,
+    origin_of,
+)
 from bot.services.woo_contract import positive_id
 
 CONTROL_FIELDS = {"tisa_fence", "tisa_expected_stock", "tisa_expected_fields"}
@@ -68,6 +74,19 @@ def _silent_host(error: WooCommerceAPIError) -> WooCommerceAPIError:
     so the branch that *knows* it got silence says so here, once, at the source.
     """
     error.host_silent = True
+    return error
+
+
+def _blocked_host(error: WooCommerceAPIError) -> WooCommerceAPIError:
+    """Tag an error that means «the answer came from a security layer, not from WordPress».
+
+    Same reason as :func:`_silent_host`: the queue has to pick between «wait this out and do not
+    spend the seller's attempts» and «this will repeat tomorrow, ask a human»
+    (:func:`bot.services.outbox.is_blocked`), and a bare ``503`` cannot say which. Both tags end in
+    the same 30-minute wait; they differ in the sentence the operator reads — «وایتلیست کن» here,
+    «به مصرفِ هاست نگاه کن» there.
+    """
+    error.host_blocked = True
     return error
 
 
@@ -131,6 +150,66 @@ async def _awake(client: WooClient, base: str) -> bool:
     return True
 
 
+async def _stranger_status(client: WooClient, base: str) -> int | None:
+    """Ask the *same* safety URL with no credentials: «would it have said that to anyone?»
+
+    Two very different problems arrive as one ``418``, and they are two different phone calls to
+    the host: a rule that refuses *us* (the unkeyed request is refused with the same code — the fix
+    is a whitelist entry for the bot's IP) and a rule that fires *because* the URL carries
+    ``consumer_key``/``consumer_secret`` (WordPress answers the unkeyed request, so only the
+    credentialed URL is being eaten). One GET, on a path that has already failed, tells them apart.
+    ``None`` — the unkeyed request got no answer either — is read as the first case, because the
+    whitelist is the fix that covers both.
+    """
+    try:
+        response = await client.get(f"{_namespace(base)}/tisa-health",
+                                    timeout=LIVENESS_TIMEOUT_SECONDS, public=True)
+    except httpx.TransportError:
+        return None
+    return response.status_code
+
+
+async def _blocked(client: WooClient, base: str, response: httpx.Response) -> WooCommerceAPIError:
+    """The 418 sentence, and *which* rule is behind it — measured, not guessed.
+
+    :data:`bot.services.woo_client.BLOCKED_STATUS_CODES` is what a security layer in front of
+    WordPress answers when it decides a client is a robot. It is the one refusal that must never be
+    read as «the plugin is missing»: the request never reached PHP, so the deployment is fine and
+    re-uploading the zip is a wasted afternoon. It is also the one refusal that is *not* a config
+    error of ours — so it is queued (``503``) and waited out, not dropped (``412``).
+    """
+    status = response.status_code
+    stranger = await _stranger_status(client, base)
+    detail = _detail(response)
+    if stranger is None or stranger == status:
+        said = "بی‌پاسخ ماند" if stranger is None else f"HTTP {stranger}"
+        client.audit.log(
+            f"[fence] سایت درخواستِ دارای کلید را با HTTP {status} رد کرد و درخواستِ بدون کلید "
+            f"هم {said} → تصمیم‌گیرنده لایهٔ امنیتیِ میزبان است، نه ووکامرس و نه افزونه"
+        )
+        return _blocked_host(WooCommerceAPIError(503, (
+            f"میزبان درخواست‌های ربات را رد می‌کند (HTTP {status}{detail}): همین کد را به درخواستِ "
+            "بدون کلید هم می‌دهد، پس تصمیم‌گیرنده لایهٔ امنیتی جلوی وردپرس است — ضدِرباتِ میزبان، "
+            "Imunify360، ModSecurity — نه ووکامرس و نه افزونهٔ تیسا. درخواست به وردپرس نرسیده و "
+            "هیچ‌چیز نوشته نشده، پس این بسته در صف می‌ماند و بدون سوزاندنِ تلاش‌ها نیم‌ساعت "
+            "یک‌بار امتحان می‌شود. IP سرورِ ربات را در همان لایه وایت‌لیست کن (Imunify360 ← "
+            "White List ← افزودن IP) یا همین جمله را برای میزبان تیکت کن؛ اگر سایت پشت "
+            "Cloudflare است «Bot Fight Mode» را برای ‎/wp-json/*‎ استثنا کن. برای تأیید، همان "
+            "لحظه سایت را با مرورگر باز کن: بالا می‌آید — این «پایین بودنِ سایت» نیست."
+        )))
+    client.audit.log(
+        f"[fence] مسیر بررسی ایمنی با کلید HTTP {status} گرفت ولی همان مسیر بدون کلید "
+        f"HTTP {stranger} جواب داد → قاعدهٔ فایروال روی consumer_key/consumer_secret است"
+    )
+    return _blocked_host(WooCommerceAPIError(503, (
+        f"سایت درخواستِ دارای کلید را رد می‌کند (HTTP {status}{detail}) در حالی که همان مسیرِ "
+        f"بدون کلید جواب داد (HTTP {stranger}) — پس قاعدهٔ فایروال/ModSecurity روی "
+        "«consumer_key/consumer_secret» است، نه خرابیِ سایت و نه افزونه. هیچ‌چیز نوشته نشده و "
+        "این بسته در صف می‌ماند. از میزبان بخواه قاعدهٔ «consumer» را برای ‎/wp-json/wc/v3/*‎ "
+        "بردارد، یا IP سرورِ ربات را استثنا کند."
+    )))
+
+
 async def require(client: WooClient, base: str) -> None:
     """Refuse to write until the shop's own safety contract has answered.
 
@@ -143,6 +222,10 @@ async def require(client: WooClient, base: str) -> None:
     * the site answers but the plugin route stays silent *only when our keys are in the URL*
       → ``503`` said out loud, because the fix is a host rule, not a WordPress setting;
     * the shop replies with a busy status (``5xx``/``429``/…) → ``503``, queued like any 5xx;
+    * the shop replies with a robot-protection status (:data:`BLOCKED_STATUS_CODES`, the 418 a
+      host's bot layer answers with) → ``503`` tagged ``host_blocked``: queued and waited out
+      without spending attempts, because the request never reached PHP and no plugin on earth
+      fixes it — the whitelist does;
     * the route is absent, refused, or answers without the fields we need → ``412`` — a plugin
       problem that will repeat tomorrow, so it is never queued.
 
@@ -185,6 +268,12 @@ async def require(client: WooClient, base: str) -> None:
             f"کلید WooCommerce برای بررسی ایمنی پذیرفته نشد (HTTP {status}{_detail(response)}). "
             "کلید باید متعلق به کاربری با دسترسی «ویرایش محصول» باشد؛ «🔑 تست کلید» را بزن."
         ))
+    if status in BLOCKED_STATUS_CODES:
+        # A security layer answered, not WordPress (:data:`…woo_client.BLOCKED_STATUS_CODES`).
+        # This is the one non-2xx that must be *queued*: no byte reached PHP, the deployment is
+        # fine — and the 412 below would send the operator to re-upload a plugin that is already
+        # on the site, once per blocked attempt.
+        raise await _blocked(client, base, response)
     if not response.is_success:
         raise WooCommerceAPIError(412, (
             f"مسیر بررسی ایمنی روی سایت جواب نداد (HTTP {status}{_detail(response)}). یعنی "

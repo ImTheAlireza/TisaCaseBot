@@ -286,6 +286,16 @@ class TestToolsUseTheSameClient(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.ok)
         self.assertIn("ModSecurity", result.message)
 
+    async def test_media_tool_names_the_host_layer_when_it_is_refused(self) -> None:
+        """۴۱۸ روی مسیر رسانه یعنی «کاربر و رمز را چک کن» نصیحتِ غلطی است."""
+        self._inject(TransportScript(respond(418)))
+        with patched_settings(settings_with(**SHARED)):
+            result = await probe_media()
+        self.assertFalse(result.ok)
+        self.assertIn("418", result.message)
+        self.assertIn("وایت‌لیست", result.message)
+        self.assertNotIn("Application Password", result.message)
+
     async def test_product_tool_removes_the_media_when_the_product_fails(self) -> None:
         """تست نباید چیز نیمه‌کاره روی سایت بگذارد.\""""
         script = TransportScript(respond(201, {"id": 77}), respond(403, {"message": "no"}), respond(200, {}))

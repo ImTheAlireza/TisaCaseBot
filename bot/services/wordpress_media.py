@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import httpx
 
 from bot.config import settings
-from bot.services.woo_client import WooClient, media_base
+from bot.services.woo_client import BLOCKED_STATUS_CODES, WooClient, media_base
 
 
 # A tiny valid 1x1 PNG; no real product data is sent during the test.
@@ -54,6 +54,15 @@ async def test_wordpress_media(timeout: float = 15.0) -> MediaTestResult:
             if response.status_code not in (200, 201):
                 if response.status_code == 401:
                     msg = "احراز هویت WordPress ناموفق است."
+                elif response.status_code in BLOCKED_STATUS_CODES:
+                    # The one non-WordPress answer here: a security layer in front of the site
+                    # refused a request that carries no WooCommerce keys at all. «Application
+                    # Password را چک کن» would be the wrong advice, and the fix is the same
+                    # whitelist the safety fence asks for.
+                    msg = (f"لایهٔ امنیتیِ میزبان درخواستِ ربات را رد کرد (HTTP {response.status_code}) "
+                           "— افزونه، کاربر و رمز مقصر نیستند: درخواست به وردپرس نرسیده. IP سرورِ "
+                           "ربات را وایت‌لیست کن (ضدِرباتِ میزبان / Imunify360 / Cloudflare) و بعد "
+                           "«🩺 عیب‌یابی کامل» ← «شبکهٔ سایت» را ببین.")
                 elif response.status_code == 403:
                     msg = "WordPress یا ModSecurity اجازه آپلود نمی‌دهد."
                 elif response.status_code == 404:

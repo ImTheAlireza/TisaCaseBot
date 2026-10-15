@@ -97,7 +97,7 @@ required to start.
 | `TISA_BACKUP_DIR` | no | Where daily rotating zip backups land (state JSONs + both SQLite DBs + the outbox file queue). Default `<TISA_DATA_DIR>/backups`. The directory is created `0700` and each zip is `0600` — these are the shop's data. |
 | `TISA_BACKUP_KEEP` | no | How many daily zips to keep before rotation (default `7`, clamped to `1..365`). |
 | `TISA_DAILY_REPORT_HOUR` | no | Hour (0–23, in `TISA_TZ`) at which a short ops report is sent to `LOG_CHAT_ID` (default `9`; `0` disables the report; backups still run at 04:00). Requires `LOG_CHAT_ID` to be set. |
-| `TISA_SHOP_WATCH_MINUTES` | no | 🛰 How often (minutes) the bot asks the shop four read-only questions and messages *only when the answer changes* — ⛔ when it stops answering, 🟢 when it comes back (and the send queue is drained at once). A nine-hour outage costs two messages, not thirty-six. `0` disables it (default `15`). |
+| `TISA_SHOP_WATCH_MINUTES` | no | 🛰 How often (minutes) the bot asks the shop four read-only questions and messages *only when the answer changes* — ⛔ when it stops answering, 🔒 when the host's security layer starts refusing the bot (and then it asks once an hour instead, so the asking cannot keep the block alive), 🟢 when it answers again (and the send queue is drained at once). A nine-hour outage costs two messages, not thirty-six. `0` disables it (default `15`). |
 | `TISA_TZ` | no | IANA time zone for all user-visible timestamps and daily jobs (default `Asia/Tehran`). A misspelled name falls back to the default and is reported in the start log. |
 | `TISA_DRY_RUN` | no | `yes` = rehears every publish: the real payload is built and sent to a fake transport, so **nothing is written on the shop** (default `no`). See [dry-run](#-حالت-آزمایشی-انتشار-dry-run). |
 | `FLOW_TIMEOUT_SECONDS` | no | Idle time before a product flow is closed and its temp files deleted (default `900`). |
@@ -755,7 +755,7 @@ xiaomi (فقط سفید)
 | «هاست خاموش» با «هاست شلوغ» فرق دارد؟ | بله. اگر هیچ پاسخی نیاید (`ReadTimeout`/`ConnectError`، یا `503`ِ علامت‌خوردهٔ پیش‌آزمون `host_silent`) صف **۳۰ دقیقه** صبر می‌کند و آن صبر را **تلاش نمی‌شمارد** — وگرنه هشت تلاشِ وعده‌داده‌شده داخل نیم‌ساعتِ اولِ یک قطعی سوخته می‌شد و محصول درست وقتی رها می‌شد که هاست هنوز پایین بود. سقف ۲۴ ساعت سرِ جایش است، و اگر تعویق از آن رد کند به backoff معمولی برمی‌گردد |
 | آیا ممکن است محصول دومی بسازد؟ | نه: همان `batch_id` و همان `create_draft`؛ اگر آن محصول نیمه‌کاره روی سایت باشد، تکمیلش می‌کند. صف مسیرِ دومِ انتشار نیست |
 | عکس‌ها؟ | هنگام queue کپی می‌شوند به `data/outbox_files/`، چون پوشهٔ موقت سشن همان لحظه پاک می‌شود |
-| کاربر چه می‌بیند؟ | نه ❌ و نه جملهٔ «دوباره بزن» برای خطای هاست: کارتِ پیش‌نمایش با «🕐 سایت در این لحظه پاسخ نمی‌دهد — از سمتِ تو هیچ‌چیز غلط نبود» عوض می‌شود، با خطِ «تلاش ۲ از ۸ · بعدی: ۱۶:۲۰ (۲۷ دقیقه دیگر)» و دکمهٔ «📤 صف من». دکمهٔ «✅ تأیید و ساخت» هم سرِ جایش می‌ماند (همان ارسال، فقط زودتر). بین دو تلاش پیامی نمی‌رود؛ فقط نتیجهٔ نهایی: ✅ «صفِ ارسال انجام شد — محصول ساخته شد» (با لینک ویرایش)، ❌ «بعد از ۸ تلاش رها شد»، یا ⌛ «۲۴ ساعت گذشت و سایت جواب نداد؛ رهایش کردم — هیچ‌چیز نوشته نشد». سه‌تاییِ آخر همه یک چیز را می‌گویند: کارتِ تاریخچه با همان علت بسته می‌شود و عکس‌های صف پاک می‌شوند، پس ادامه دادن یعنی از سرِ «📦 ساخت محصول» (اگر جریان هنوز باز باشد همان «✅ تأیید و ساخت» کافی است). |
+| کاربر چه می‌بیند؟ | نه ❌ و نه جملهٔ «دوباره بزن» برای خطای هاست — و دو حالِ آن دو جملهٔ جدا دارد: «🕐 سایت در این لحظه پاسخ نمی‌دهد» وقتی هیچ پاسخی نیامده، و «🔒 سایت درخواست‌های ربات را رد می‌کند (مسدودسازیِ سمتِ میزبان)» وقتی لایهٔ امنیتیِ میزبان جلوی درخواست را گرفته؛ دومی همان‌جا می‌گوید راه‌حل وایت‌لیست کردن IP سرورِ ربات است و «🩺 عیب‌یابی کامل» ← «شبکهٔ سایت» جملهٔ آماده برای تیکت را می‌دهد. بعد کارتِ پیش‌نمایش با همان جمله عوض می‌شود، با خطِ «تلاش ۲ از ۸ · بعدی: ۱۶:۲۰ (۲۷ دقیقه دیگر)» و دکمهٔ «📤 صف من». دکمهٔ «✅ تأیید و ساخت» هم سرِ جایش می‌ماند (همان ارسال، فقط زودتر). بین دو تلاش پیامی نمی‌رود؛ فقط نتیجهٔ نهایی: ✅ «صفِ ارسال انجام شد — محصول ساخته شد» (با لینک ویرایش)، ❌ «بعد از ۸ تلاش رها شد»، یا ⌛ «۲۴ ساعت گذشت و سایت جواب نداد؛ رهایش کردم — هیچ‌چیز نوشته نشد». سه‌تاییِ آخر همه یک چیز را می‌گویند: کارتِ تاریخچه با همان علت بسته می‌شود و عکس‌های صف پاک می‌شوند، پس ادامه دادن یعنی از سرِ «📦 ساخت محصول» (اگر جریان هنوز باز باشد همان «✅ تأیید و ساخت» کافی است). |
 | خودم کجا ببینم؟ | `/queue` یا همان «📤 صف من»: فهرستِ صفِ **خودت** با دو دکمه — «⟳ همین حالا» (تلاش را جلو می‌اندازد) و «🗑 از صف بردار» (ردیف می‌رود، کارتِ تاریخچه با «برداشته شد» بسته می‌شود). شناسهٔ صفِ دیگران روی این صفحه «چیزی در صف نیست» است، نه عمل روی محصولِ آن‌ها |
 | حالت آزمایشی؟ | صف **خاموش** است: نه چیزی می‌نویسد، نه تخلیه می‌شود — `TISA_DRY_RUN` یعنی هیچ‌چیز روی سایت نرود |
 | کِی بررسی می‌شود؟ | هر ۶۰ ثانیه با JobQueue، و یک بار در لحظهٔ استارت (اقلامِ قبل از restart معطل نمی‌مانند). اگر APScheduler نصب نباشد فقط همان پاسِ استارت هست — ربات بی‌JobQueue هم کار می‌کند |
@@ -765,14 +765,21 @@ xiaomi (فقط سفید)
 
 `/watch` همان چهار سؤال را *همین حالا* می‌پرسد و می‌گوید خطا از کدام طبقه است: **هاست** (هیچ
 درخواستی پاسخ نگرفت)، **فایروال** (فقط آدرسِ دارای `consumer_key` گیر می‌کند)، **افزونه**
-(مسیر ثبت نشده/بی‌قرارداد)، یا **کلید** (۴۰/۴۰۳). فقط سودو، و فقط GET — وسطِ قطعی هم زدنش بی‌خطر
-است و در dry-run هم اجرا می‌شود.
+(مسیر ثبت نشده/بی‌قرارداد)، **کلید** (۴۰/۴۰۳)، یا **مسدودسازی** — و این پنجمی از همه مهم‌تر است
+تشخیص داده شود، چون در آن حالت سایت **بالا** است: `/wp-json/wc/v3/tisa-health` با کلید و بی‌کلید
+همان کد را می‌دهد (در این سایت `418`، که ضدِرباتِ میزبان به‌جای `403` می‌فرستد)، یعنی تصمیم‌گیرنده
+یک لایهٔ امنیتی جلوی وردپرس است، نه ووکامرس. کارت هم همان را می‌گوید — «سایت از دسترس خارج نشده،
+ربات راه داده نمی‌شود» — و راه‌حلش وایت‌لیست کردن IP سرورِ ربات است، نه دست‌زدن به افزونه.
+فقط سودو، و فقط GET — وسطِ قطعی هم زدنش بی‌خطر است و در dry-run هم اجرا می‌شود.
 
 خودِ این پرسش دیگر منتظرِ آدم نمی‌ماند: `bot/modules/shop_watch.py` هر `TISA_SHOP_WATCH_MINUTES`
 (پیش‌فرض ۱۵ دقیقه) همان چهار سؤال را می‌پرسد و **فقط وقتی جواب عوض شد** به `LOG_CHAT_ID` و سودو
-می‌گوید — ⛔ موقع افتادن (با علت و اینکه «از تو چیزی غلط نبود»)، یک یادآوری هر شش ساعت، و 🟢 موقع
-برگشتن؛ و در همان پاسِ بازگشت، `🐇 صفِ ارسال` بی‌درنگ تخلیه می‌شود تا محصولی که نیم‌ساعت صبر کرده
-منتظرِ موعدِ بعدیِ backoff نماند. هیچ نوشتنی در این ماژول نیست، و در dry-run یا با کلیدِ
+می‌گوید — ⛔ موقع افتادن، 🔒 موقع مسدود شدن (با علت و اینکه «از تو چیزی غلط نبود»)، یک یادآوری هر
+شش ساعت، و 🟢 موقع برگشتن؛ و در همان پاسِ بازگشت، `🐇 صفِ ارسال` بی‌درنگ تخلیه می‌شود تا محصولی که
+نیم‌ساعت صبر کرده منتظرِ موعدِ بعدیِ backoff نماند. «افتاد» و «مسدود شد» دو جملهٔ جدا هستند و دو
+چرخهٔ جدا: در حالت مسدود، پرسش بعدی **یک ساعت** بعد است (هر درخواست می‌تواند بلوک را تمدید کند —
+چرخهٔ ۱۵دقیقه‌ایِ ۲۰۲۶‑۱۰‑۱۵ دقیقاً به اندازهٔ پرسش‌های خودِ ربات بود)، ولی هاستِ خاموش گوش
+نمی‌دهد و همان ۱۵ دقیقه می‌ماند. هیچ نوشتنی در این ماژول نیست، و در dry-run یا با کلیدِ
 کامل‌نشده اصلاً سؤال نمی‌پرسد (چون «سبز» در آن حالت دروغ است).
 
 Diagnostics button — measures bot round-trip and includes a WooCommerce REST test. The WooCommerce test reads one product through `wp-json/wc/v3/products` using HTTPS query-string authentication, matching shared-host configurations where Basic Auth is blocked.

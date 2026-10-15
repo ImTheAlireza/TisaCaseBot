@@ -67,6 +67,17 @@ RETRY_IF_SAFE = (502, 503, 504)
 #: Sending these again cannot double a change. ``POST`` is deliberately absent.
 IDEMPOTENT_METHODS = ("GET", "HEAD", "OPTIONS", "PUT", "DELETE")
 
+#: Statuses WordPress never writes on our routes and a security layer in front of it does.
+#:
+#: ``418`` is the one this shop actually met (2026‑10‑15): the host's bot protection answered the
+#: "teapot" — instead of 403 — to every request the watchdog sent, with the keys and without them
+#: alike, in fifteen-minute cycles that matched the watchdog's own cadence. Nothing downstream may
+#: read it as «the plugin is missing» or «the seller typed something wrong»: the request never
+#: reached PHP, no byte was written, and the only thing that fixes it is a whitelist entry for the
+#: bot's IP on the host side. Hence one name, used by the safety fence, the send queue and the
+#: no-terminal diagnosis, instead of the bare number in three places.
+BLOCKED_STATUS_CODES = frozenset({418})
+
 #: How many times a request may be sent at all (1 = never retry).
 DEFAULT_ATTEMPTS = 3
 
@@ -121,6 +132,12 @@ class WooCommerceAPIError(RuntimeError):
         #: «nothing answered» — set by the preflight on its own silence, and the only thing that
         #: lets :func:`bot.services.outbox.is_silent` tell a dead host from a busy one (both 503).
         self.host_silent: bool = False
+        #: «answered, and the answer was *no*» — the preflight met a security layer in front of
+        #: WordPress (:data:`BLOCKED_STATUS_CODES`). The queue waits this out exactly like silence
+        #: (nothing was written, so nothing needs a human tonight), but the sentence and the next
+        #: step are a different pair — «وایتلیست کن» rather than «به هاست نگاه کن» — which is why
+        #: it is a second flag and not a second meaning for the first.
+        self.host_blocked: bool = False
         #: The queue's own deadline, said on the error: «مهلت ۲۴ ساعت/تلاش‌ها تمام شد». Only the
         #: queue sets it, so the message can tell that expiry apart from a 410 the shop itself
         #: answered for some other reason.

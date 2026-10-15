@@ -180,6 +180,42 @@ class Preflight(unittest.TestCase):
         self.assertIn("Internal Server Error", str(error), "علتِ خودِ سایت هم باید خوانده شود")
         self.assertEqual(1, script.sends)
 
+    # — the shop answers «no» from in front of WordPress —
+    def test_a_robot_protection_refusal_is_queued_and_not_blamed_on_the_plugin(self) -> None:
+        """۲۰۲۶‑۱۰‑۱۵: ۴۱۸ روی مسیر بررسی ایمنی.
+
+        پیامِ قدیمی برای همین پاسخ «افزونه نصب نیست؛ زیپ را آپلود کن» و کدِ ۴۱۲ بود — یعنی
+        نصیحتِ دوباره‌نصب برای افزونه‌ای که سر جایش بود، و بسته‌ای که صف نمی‌شد و از دست می‌رفت.
+        """
+        error, audit, script, _delays = self._require(
+            httpx.Response(418, json={}), httpx.Response(418, json={})
+        )
+        assert error is not None
+        self.assertEqual(503, error.status_code, "۵۰۳ حالتِ صف‌شدن است، نه ۴۱۲ «خودت درستش کن»")
+        self.assertTrue(outbox.is_transient(error))
+        self.assertTrue(outbox.is_blocked(error), "صف باید بداند این «رد شدن» است، نه «شلوغی»")
+        self.assertFalse(outbox.is_silent(error), "پاسخ آمده؛ سکوت نمی‌تواند اسمش باشد")
+        self.assertIn("وایت‌لیست", str(error))
+        self.assertIn("مرورگر", str(error), "باید بگوید سایت بالا است؛ وگرنه «قطعی» باور می‌شود")
+        self.assertNotIn("tisa-product-importer.zip", str(error))
+        self.assertIn("لایهٔ امنیتیِ میزبان", audit)
+        # سؤالِ دوم همان مسیر است، بی‌کلید: تنها راهِ گفتنِ «این قاعده به کلید کار ندارد».
+        self.assertEqual(["GET /wp-json/wc/v3/tisa-health"] * 2, script.methods)
+        self.assertNotIn("consumer_key", dict(script.requests[-1].url.params))
+
+    def test_a_teapot_only_on_the_keyed_url_names_the_query_string_rule(self) -> None:
+        """همان ۴۱۸، ولی مسیرِ بی‌کلید جواب داد: قاعده روی consumer_key است، نه روی IP ما."""
+        error, _audit, script, _delays = self._require(
+            httpx.Response(418, json={}), httpx.Response(401, json={})
+        )
+        assert error is not None
+        self.assertEqual(503, error.status_code)
+        self.assertTrue(outbox.is_blocked(error))
+        self.assertIn("consumer_key", str(error))
+        self.assertIn("فایروال", str(error))
+        self.assertEqual(["GET /wp-json/wc/v3/tisa-health"] * 2, script.methods)
+        self.assertNotIn("consumer_key", dict(script.requests[-1].url.params))
+
     def test_refused_credentials_name_the_permission_that_is_missing(self) -> None:
         error, _audit, _script, _delays = self._require(
             httpx.Response(403, json={"code": "woocommerce_rest_cannot_view",

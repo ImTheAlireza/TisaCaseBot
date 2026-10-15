@@ -243,6 +243,22 @@ class TestWhatCountsAsTransient(unittest.TestCase):
         probe.host_silent = True
         self.assertTrue(outbox.is_silent(probe), "خودِ پیش‌آزمون علامت می‌زند؛ کدِ ۵۰۳ تنها کافی نیست")
 
+    def test_a_block_is_neither_silence_nor_busyness(self) -> None:
+        """«رد شدیم» سومین حال است: نیم‌ساعت صبر مثل سکوت، ولی جمله‌اش «وایت‌لیست کن» است.
+
+        علامت را خودِ پیش‌آزمون می‌زند (``host_blocked``) و نه کدِ ۵۰۳ — چون ۵۰۳ هم‌زمان یعنی
+        «شلوغ بود، با backoff معمولی دوباره بزن»؛ و کدِ ۴۱۸ هم به‌تنهایی کافی نیست: تنها جایی که
+        معنا پیدا می‌کند همان دروازهٔ ایمنی است که آن را دیده.
+        """
+        self.assertFalse(outbox.is_blocked(WooCommerceAPIError(503, "busy")))
+        self.assertFalse(outbox.is_blocked(WooCommerceAPIError(418, "teapot")),
+                         "کدِ خام کافی نیست؛ تا پیش‌آزمون آن را ندیده باشد، «مسدود» خوانده نمی‌شود")
+        blocked = WooCommerceAPIError(503, "میزبان درخواست‌های ربات را رد می‌کند (HTTP 418)")
+        blocked.host_blocked = True
+        self.assertTrue(outbox.is_blocked(blocked))
+        self.assertFalse(outbox.is_silent(blocked), "دو ادعای جدا هستند؛ هیچ‌کدام به نفع دیگری خم نمی‌شود")
+        self.assertTrue(outbox.is_transient(blocked), "رد شدنِ لایهٔ امنیتی موقت است، پس صف قبولش می‌کند")
+
 
 @needs_flow
 class TestQueueIsCreatedFromTheFlow(QueueTestCase):
@@ -360,6 +376,17 @@ class TestQueueIsCreatedFromTheFlow(QueueTestCase):
         self.assertIn("HTTP 400", refused)
         self.assertIn("تصویر مجاز نیست", refused)
         self.assertNotIn("🐇", refused, "چیزی در صف نیست، پس قولِ صف هم نمی‌دهیم")
+
+    def test_a_blocked_shop_is_not_reported_as_a_silent_one(self) -> None:
+        """«پاسخ نمی‌دهد» و «رد می‌کند» دو حال‌اند و دو راهِ حل: یکی صبر، یکی وایت‌لیست."""
+        blocked = WooCommerceAPIError(503, "میزبان درخواست‌های ربات را رد می‌کند (HTTP 418)")
+        blocked.host_blocked = True
+        text = PF._publish_failure_text(blocked, str(blocked), queued=True)
+        self.assertTrue(text.startswith("🔒"), text[:40])
+        self.assertIn("وایت‌لیست", text, "راهِ حل باید در همان کارت باشد، نه در لاگ")
+        self.assertIn("هیچ‌چیز غلط نبود", text, "فروشنده فرم را اشتباه نزده بود")
+        self.assertNotIn("❌", text)
+        self.assertNotIn("🕐", text, "«سایت پاسخ نمی‌دهد» جملهٔ دیگری است")
 
     def test_the_failure_card_keeps_the_confirm_button_and_adds_the_queue(self) -> None:
         """ویرایشِ کارتِ خطا نباید «✅ تأیید و ساخت» را ببلعد؛ فقط یک دکمه اضافه می‌شود."""
@@ -479,6 +506,24 @@ class TestDrainingTheQueue(QueueTestCase):
         )
         self.assertEqual([], self.sent, "بین دو تلاش پیامِ تازه‌ای نمی‌فرستیم")
         self.assertEqual(1, outbox.pending())
+
+    async def test_a_blocked_shop_is_waited_out_like_silence(self) -> None:
+        """۲۰۲۶‑۱۰‑۱۵: ۴۱۸ چهار بار در ساعت. بسته باید در صف بماند و تلاش‌ها نسوزد."""
+        blocked = WooCommerceAPIError(503, "میزبان درخواست‌های ربات را رد می‌کند (HTTP 418)")
+        blocked.host_blocked = True
+        self.error = blocked
+        self.enqueue(batch="teapot12teap", delay=0.0)
+        before = outbox.due()[0].attempts
+        await self._drain()
+        row = self.row(in_seconds=outbox.SILENT_RETRY_SECONDS)
+        self.assertEqual(before, row.attempts, "مسدودسازیِ میزبان تلاشِ فروشنده را کم نمی‌کند")
+        self.assertAlmostEqual(
+            outbox.SILENT_RETRY_SECONDS, row.next_at - time.time(), delta=5,
+            msg="نیم‌ساعت صبر، نه یک دقیقه؛ وگرنه تا وایت‌لیست شدن صف تمام می‌شود",
+        )
+        self.assertIn("418", row.last_error, "علتِ خودِ رد شدن روی ردیف می‌ماند")
+        self.assertEqual(1, outbox.pending())
+        self.assertEqual([], self.sent, "بین دو تلاش پیامِ تازه‌ای نمی‌فرستیم")
 
     async def test_silence_near_the_deadline_still_uses_the_ordinary_backoff(self) -> None:
         """نزدیکِ سقفِ ۲۴ ساعت، تعویقِ نیم‌ساعته جایش را به backoff معمولی می‌دهد."""
