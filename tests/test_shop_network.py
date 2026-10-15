@@ -6,7 +6,11 @@ from Telegram alone. What this service promises — and what these tests hold it
 * every question is a ``GET`` (so pressing it during an outage cannot double a product);
 * exactly one of the four carries credentials — the rest must answer *without* them, otherwise a
   firewall that blocks key-bearing URLs and a dead host look identical;
-* «no answer» and «answered 404» produce different sentences with different next steps.
+* «no answer» and «answered 404» produce different sentences with different next steps;
+* and «answered *no*» — the host's bot protection refusing us — is neither of those two and not an
+  outage either: the same refusal with and without the keys means the site is up and the fix is a
+  whitelist entry (``ShopNetwork.blocked``), which is the one sentence the operator must not have
+  to deduce from a 418.
 """
 
 from __future__ import annotations
@@ -102,6 +106,32 @@ class Verdicts(unittest.TestCase):
         self.assertIn("tisa-health", verdict)
         self.assertIn("wp-admin", fix, "راه‌حل باید بدون ترمینال باشد")
 
+    def test_the_same_refusal_with_and_without_keys_is_a_block_not_an_outage(self) -> None:
+        """۲۰۲۶‑۱۰‑۱۵: ۴۱۸ با کلید و ۴۱۸ بی‌کلید، هر پانزده دقیقه.
+
+        پیامِ آن روز «پاسخ‌ها غیرمنتظره است … افزونه را غیرفعال و فعال کن» بود: نصیحت برای
+        وردپرسی که هیچ‌وقت پرسیده نشد، دربارهٔ سایتی که همان لحظه برای مرورگر بالا بود.
+        """
+        ok, verdict, fix = self._say(home=418, rest=418, fence_open=418, fence_keyed=418)
+        self.assertFalse(ok)
+        self.assertIn("مسدودسازی", verdict)
+        self.assertIn("HTTP 418", verdict, "کدِ دیده‌شده بخشی از تشخیص است")
+        self.assertIn("میزبان", verdict, "تصمیم‌گیرنده را نام ببرد: لایهٔ امنیتی، نه ووکامرس")
+        self.assertIn("مرورگر", verdict, "باید بگوید سایت بالا است؛ وگرنه «قطعی» باور می‌شود")
+        self.assertIn("وایت‌لیست", fix, "راه‌حل باید همان چیزی باشد که مشکل را حل می‌کند")
+        self.assertIn("Cloudflare", fix, "اگر CDN جلوی سایت است، همان هم باید گفته شود")
+        self.assertNotIn("tisa-product-importer.zip", fix, "افزونه اینجا مقصر نیست")
+
+    def test_a_keyed_refusal_alone_is_not_a_block(self) -> None:
+        """۴۰۳ با کلید و ۴۰۱ بی‌کلید، کارِ خودِ ووکامرس است — نه مسدودسازی.
+
+        اگر این دو یکی گرفته شوند، اپراتور برای مشکلِ کلیدِ خودش به میزبان زنگ می‌زند.
+        """
+        _ok, verdict, fix = self._say(fence_keyed=403, fence_open=401)
+        self.assertIn("403", verdict)
+        self.assertNotIn("وایت‌لیست", fix)
+        self.assertIn("🔑", fix, "راهِ درست: تست کلید")
+
     def test_refused_credentials_point_at_the_key_tester(self) -> None:
         ok, verdict, _fix = self._say(fence_keyed=403)
         self.assertFalse(ok)
@@ -149,6 +179,29 @@ class Probing(unittest.IsolatedAsyncioTestCase):
         result, _calls = await self._run(home=200, rest=401, fence_open=401, fence_keyed=CONTRACT)
         self.assertTrue(result.ok, result.verdict)
         self.assertIn("0.8.1", result.verdict)
+        self.assertFalse(result.blocked, "سایتِ سالم «مسدود» علامت نمی‌خورد")
+
+    async def test_a_shop_that_refuses_the_robot_is_marked_blocked(self) -> None:
+        """همان چرخهٔ ۴۱۸: کارتِ 🔒 به‌جای ❌ِ قطعی، و بی‌آنکه کسی فکر کند محصول مشکل داشت."""
+        result, calls = await self._run(home=418, rest=418, fence_open=418, fence_keyed=418)
+        self.assertFalse(result.ok)
+        self.assertTrue(result.blocked)
+        self.assertIn("🔒", result.report(), "علامتِ کارت باید مسدودسازی را بگوید")
+        self.assertNotIn("❌", result.report(), "قرمزِ «خطا» به اپراتور می‌گوید جای اشتباهی را بگردد")
+        self.assertEqual(4, len(calls), "چهار پرسشِ GET، هیچ نوشتنی — وسطِ مسدودسازی هم بی‌خطر")
+
+    async def test_a_refusal_that_ignores_the_keys_is_not_a_verdict_about_our_key(self) -> None:
+        """۴۱۸ با کلید و ۴۱۸ بی‌کلید، تشخیصِ «کلیدت خراب است» را رد می‌کند."""
+        result, _calls = await self._run(home=200, rest=401, fence_open=418, fence_keyed=418)
+        self.assertTrue(result.blocked)
+        self.assertNotIn("🔑", result.fix, "کلید مقصر نیست؛ لایهٔ امنیتی است")
+
+    async def test_a_teapot_only_on_the_keyed_url_names_the_query_string_rule(self) -> None:
+        """۴۱۸ فقط روی آدرسِ دارای کلید: قاعدهٔ فایروال روی consumer_key، نه مسدودیِ ربات."""
+        result, _calls = await self._run(home=200, rest=401, fence_open=401, fence_keyed=418)
+        self.assertFalse(result.blocked)
+        self.assertIn("consumer_key", result.verdict)
+        self.assertIn("فایروال", result.verdict)
 
     async def test_summary_is_numbers_not_prose(self) -> None:
         result, _calls = await self._run(fence_keyed=HANG)

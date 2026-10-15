@@ -6,6 +6,7 @@
 * فقط *تغییر* خبر می‌شود (نه هر ۱۵ دقیقه یک «هنوز پایین است»)،
 * بازگشت یعنی **تخلیهٔ صفِ ارسال**، نه فقط یک 🟢،
 * هیچ‌وقت نمی‌پرسد وقتی پرسیدن دروغ است (dry-run، یا کلیدِ کامل‌نشده)،
+* «مسدود» را «پایین» نمی‌نامد و در حالتِ مسدود دیگر هر ۱۵ دقیقه نمی‌کوبد (۲۰۲۶‑۱۰‑۱۵)،
 * و ``/watch`` پاسخِ تازه می‌دهد، آن هم فقط به مدیر.
 
 اجرا: ``python3 -m pytest tests/test_shop_watch.py`` یا ``python3 -m unittest discover -s tests``
@@ -14,6 +15,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import shutil
 import tempfile
@@ -49,10 +51,12 @@ OWNER = 1234567            # همان SUDO_IDS بالا؛ پیامِ سودو ب
 LOG_CHAT = -1001
 
 
-def _network(ok: bool, verdict: str = "فروشگاه به هیچ درخواستی پاسخ نداد") -> ShopNetwork:
+def _network(ok: bool, verdict: str = "فروشگاه به هیچ درخواستی پاسخ نداد", *,
+             blocked: bool = False) -> ShopNetwork:
     probe = ShopProbe(label="صفحهٔ اصلی", path="/", status=None if not ok else 200,
                       ms=10400.0 if not ok else 120.0, detail="ReadTimeout" if not ok else "")
-    return ShopNetwork(ok, verdict, "به میزبان بگویید.", (probe, probe, probe, probe), 10403.0)
+    return ShopNetwork(ok, verdict, "به میزبان بگویید.", (probe, probe, probe, probe), 10403.0,
+                       blocked=blocked)
 
 
 def _answering(result: ShopNetwork):
@@ -104,6 +108,32 @@ class OnlyTransitionsAreNews(unittest.TestCase):
         _state, message = shop_watch.evaluate(state, ok=False, verdict="x", now=6 * 3600.0)
         self.assertIn("6 ساعت", message)
         self.assertEqual(0.0, float(state["since"]), "سنِ قطعی با یادآوری صفر نمی‌شود")
+
+    def test_a_block_is_never_announced_as_an_outage(self) -> None:
+        """۲۰۲۶‑۱۰‑۱۵: نُه پیامِ «⛔ سایت از دسترس خارج شد» دربارهٔ سایتی که بالا بود."""
+        state, message = shop_watch.evaluate(
+            {}, ok=False, verdict="پاسخ‌ها مسدودسازی است (HTTP 418)", now=1000.0, blocked=True
+        )
+        self.assertIn("🔒", message)
+        self.assertIn("مسدود", message + str(state))
+        self.assertNotIn("از دسترس خارج", message, "سایت بالا است؛ این جمله اپراتور را به پنلِ غلط می‌فرستد")
+        self.assertNotIn("پاسخ نمی‌داد", message)
+
+    def test_a_block_ends_with_its_own_sentence(self) -> None:
+        """پایانِ مسدودسازی «سایت برگشت» نیست — سایت هرگز نرفته بود."""
+        blocked = {"ok": False, "since": 0.0, "reminded": 0.0, "blocked": True}
+        state, message = shop_watch.evaluate(blocked, ok=True, verdict="همه جواب داد", now=7200.0)
+        self.assertIn("🟢", message)
+        self.assertIn("مسدودسازی برداشته شد", message)
+        self.assertIn("2 ساعت", message, "چقدر طول کشید، بخشی از خودِ خبر است")
+        self.assertFalse(state["blocked"], "حالتِ تازه دیگر مسدود نیست")
+
+    def test_the_reminder_of_a_block_is_not_the_reminder_of_an_outage(self) -> None:
+        state = {"ok": False, "since": 0.0, "reminded": 0.0, "blocked": True}
+        _state, message = shop_watch.evaluate(state, ok=False, verdict="x", now=6 * 3600.0,
+                                              blocked=True)
+        self.assertIn("هنوز مسدود است", message)
+        self.assertNotIn("هنوز پایین است", message)
 
 
 @needs_watch
@@ -191,6 +221,39 @@ class ThePassItself(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("🟢" in text for text in texts), texts)
         self.assertTrue(any("2 مورد از صفِ ارسال تلاش شد" in text for text in texts), texts)
 
+    async def test_a_block_rests_before_asking_again(self) -> None:
+        """چرخهٔ ۱۵دقیقه‌ایِ ۲۰۲۶‑۱۰‑۱۵ خودساخته بود: هر پاس یک سؤالِ تازه به لایهٔ مسدودکننده.
+
+        پس وقتی جواب «مسدود» است، پرسش بعدی یک ساعت بعد است — نه پانزده دقیقه بعد.
+        """
+        from unittest.mock import AsyncMock
+
+        with self._run(_network(False, "مسدودسازی", blocked=True)):
+            await shop_watch.check(self.context)
+        probe = AsyncMock(return_value=_network(False, "مسدودسازی", blocked=True))
+        with patch.object(shop_watch, "state_path", lambda: self.state), \
+                patch.object(shop_watch, "probe_shop_network", probe):
+            await shop_watch.check(self.context)
+            probe.assert_not_called()
+            # و ساعتِ استراحت از لحظهٔ آخرین پرسشِ واقعی شمرده می‌شود، نه از ری‌استارت:
+            # حالتِ ذخیره‌شدهٔ یک ساعت پیش یعنی همین حالا دوباره بپرس.
+            state = json.loads(self.state.read_text(encoding="utf-8"))
+            state["checked_at"] = time.time() - shop_watch.BLOCKED_RETRY_SECONDS - 1
+            self.state.write_text(json.dumps(state), encoding="utf-8")
+            await shop_watch.check(self.context)
+            self.assertEqual(1, probe.await_count, "بعد از یک ساعت دوباره می‌پرسد")
+
+    async def test_an_outage_does_not_earn_the_same_rest(self) -> None:
+        """هاستِ خاموش گوش نمی‌دهد؛ پرسیدن هزینه‌ای ندارد و زودفهمیدنِ بازگشت می‌ارزد."""
+        from unittest.mock import AsyncMock
+
+        probe = AsyncMock(return_value=_network(False))
+        with patch.object(shop_watch, "state_path", lambda: self.state), \
+                patch.object(shop_watch, "probe_shop_network", probe):
+            await shop_watch.check(self.context)
+            await shop_watch.check(self.context)
+        self.assertEqual(2, probe.await_count, "قطعیِ واقعی استراحت نمی‌گیرد")
+
     async def test_start_schedules_the_sweep_only_when_it_can_ask(self) -> None:
         jobs: list[dict] = []
 
@@ -244,6 +307,16 @@ class TheWatchCommand(unittest.IsolatedAsyncioTestCase):
         self.assertIn("فروشگاه به هیچ درخواستی پاسخ نداد", card)
         self.assertIn("⛔ پایین است", card)
         self.assertIn("1 ساعت", card, "چقدر است که پایین است")
+
+    async def test_the_owner_sees_a_block_as_a_block(self) -> None:
+        """کارتِ ``/watch`` هم باید بگوید «مسدود»، و اینکه دیگر هر ۱۵ دقیقه نمی‌کوبد."""
+        now = time.time()
+        sent = await self._reply(user_id=OWNER, state={
+            "ok": False, "since": now - 3600, "reminded": now, "blocked": True,
+        })
+        card = sent[-1]
+        self.assertIn("🔒 مسدود است", card)
+        self.assertIn("ساعتی یک‌بار", card, "کارت باید بگوید چرا دیر به دیر می‌پرسد")
 
     async def test_a_fresh_install_says_it_has_not_looked_yet(self) -> None:
         card = shop_watch.watch_card(_network(True), {})

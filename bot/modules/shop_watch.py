@@ -10,9 +10,15 @@
   (افتادن، و یک یادآوری هر شش ساعت)، نه سی‌وشش تا.
 * **بازگشت را *اقدام* می‌کند، نه فقط اعلام:** در همان پاس، صفِ ارسال تخلیه می‌شود تا محصولی
   که نیم‌ساعت صبر کرده منتظرِ موعدِ بعدیِ backoff نماند.
+* **«مسدود» را از «پایین» جدا می‌گوید.** اگر سایت جواب بدهد و جوابش «نه» باشد
+  (``ShopNetwork.blocked``)، پیام «🔒 ربات به سایت راه نمی‌یابد» است، نه «⛔ سایت از دسترس
+  خارج شد» — و در این حال دیگر هر ۱۵ دقیقه نمی‌کوبد: هر درخواست می‌تواند بلوک را تمدید کند،
+  پس ساعتی یک‌بار می‌پرسد تا وایت‌لیست شود. ۲۰۲۶‑۱۰‑۱۵ نشان داد چه خبر است: چرخهٔ ۱۵دقیقه‌ایِ
+  «افتاد/برگشت» دقیقاً به همان اندازه بود که خودمان می‌پرسیدیم.
 
 ``/watch`` هم همین کارت را با یک پرسشِ تازه نشان می‌دهد (فقط سودو) — برای لحظه‌ای که آدم
-می‌خواهد *همین حالا* بداند، نه اینکه صبر کند.
+می‌خواهد *همین حالا* بداند، نه اینکه صبر کند. آن یکی استراحت نمی‌کند: کسی که می‌پرسد آدم است،
+نه یک زمان‌بندِ ۱۵دقیقه‌ای.
 """
 
 from __future__ import annotations
@@ -46,6 +52,15 @@ STATE_FILE = "shop_watch.json"
 #: believing the site came back.
 REMINDER_AFTER_SECONDS = 6 * 3600
 
+#: The cadence *while the answer is «مسدود»*. A block is the one failure that our own questions can
+#: make worse: the bot's IP sits on the host's bot-protection list, and every new request is another
+#: incident that can renew or lengthen the block — which is exactly the fifteen-minute on/off cycle
+#: of 2026‑10‑15, where each pass was refused and the next one, fifteen minutes later, got through.
+#: So one knock an hour instead of four, until a whitelist entry makes the question free again.
+#: A host that is *down* gets no such rest: it is not listening, and noticing the return quickly is
+#: worth more than four saved requests.
+BLOCKED_RETRY_SECONDS = 3600
+
 #: A restart must not look like an outage ending: the first pass after boot only records.
 _UNKNOWN = None
 
@@ -64,38 +79,76 @@ def read_state() -> dict[str, Any]:
     return dict(data) if isinstance(data, dict) else {}
 
 
-def evaluate(state: dict[str, Any], *, ok: bool, verdict: str, now: float) -> tuple[dict[str, Any], str]:
+def evaluate(state: dict[str, Any], *, ok: bool, verdict: str, now: float, blocked: bool = False
+             ) -> tuple[dict[str, Any], str]:
     """What to say about one more pass — the whole watchdog in a pure function.
 
     Only *transitions* are worth a chat message, and a test has to be able to prove that a host
     staying down for nine hours is one sentence. ``was is None`` is the boot case: the first pass
     after a restart records the state and keeps quiet about a green site, but still says so when
     the site was already down, because that is exactly the moment the bot is being blamed for.
+
+    ``blocked`` (:attr:`bot.services.shop_network.ShopNetwork.blocked`) is not a shade of the same
+    failure, it is a different one, and it is stored so that the two sentences on either side of it
+    can tell the truth: this is not «سایت از دسترس خارج شد» — the site is up — and the end of it is
+    «مسدودسازی برداشته شد», not «سایت برگشت».
     """
     was = state.get("ok")
+    was_blocked = bool(state.get("blocked"))
     # نه ``or now``: یک حالتِ با ``since=0.0`` (و هر «شروعِ مبهمِ دیگر») falsy است و قطعی
     # بی‌مقدار به نظر می‌رسد؛ صراحتاً ``None`` چک می‌شود.
     since_raw = state.get("since")
     began = now if since_raw is None else float(since_raw)
     if was is _UNKNOWN:
         if ok:
-            return {"ok": True, "since": now, "verdict": verdict, "reminded": 0.0}, ""
-        return ({"ok": False, "since": now, "verdict": verdict, "reminded": now},
-                f"🛰 پایشِ سایت: از اولین بررسی هم سایت پاسخ نمی‌داد.\n{verdict}")
+            return {"ok": True, "since": now, "verdict": verdict, "reminded": 0.0,
+                    "blocked": False}, ""
+        return ({"ok": False, "since": now, "verdict": verdict, "reminded": now, "blocked": blocked},
+                f"{_first(blocked)}\n{verdict}")
     if bool(was) == ok:
         if ok:
             return state, ""
         down = now - began
         reminded_raw = state.get("reminded")
         if now - (0.0 if reminded_raw is None else float(reminded_raw)) >= REMINDER_AFTER_SECONDS:
-            return ({**state, "reminded": now},
-                    f"🛰 سایت هنوز پایین است: {timeutil.human_duration(down)} است.\n{verdict}")
-        return state, ""
+            return ({**state, "reminded": now, "blocked": blocked},
+                    f"🛰 {_still_saying(blocked)}: {timeutil.human_duration(down)} است.\n{verdict}")
+        return {**state, "blocked": blocked}, ""
     if ok:
-        return ({"ok": True, "since": now, "verdict": verdict, "reminded": 0.0},
-                f"🟢 سایت برگشت — {timeutil.human_duration(now - began)} پایین بود.")
-    return ({"ok": False, "since": now, "verdict": verdict, "reminded": now},
-            f"⛔ سایت از دسترس خارج شد.\n{verdict}")
+        return ({"ok": True, "since": now, "verdict": verdict, "reminded": 0.0, "blocked": False},
+                f"🟢 {_goodbye(was_blocked)} — {timeutil.human_duration(now - began)} "
+                f"{'طول کشید' if was_blocked else 'پایین بود'}.")
+    return ({"ok": False, "since": now, "verdict": verdict, "reminded": now, "blocked": blocked},
+            f"{_hello(blocked)}\n{verdict}")
+
+
+#: The pairs of sentences. Written out here rather than inlined in :func:`evaluate` because they are
+#: the product of this module: «⛔ سایت از دسترس خارج شد» and «🔒 مسدودسازی» are two different
+#: mornings for whoever reads them, and a block reported as an outage is how the wrong one starts.
+_HELLO = {False: "⛔ سایت از دسترس خارج شد.",
+          True: "🔒 ربات به سایت راه نمی‌یابد — سایت جواب می‌دهد، مسدودسازی جوابش است."}
+_FIRST = {False: "🛰 پایشِ سایت: از اولین بررسی هم سایت پاسخ نمی‌داد.",
+          True: "🔒 پایشِ سایت: از اولین بررسی هم پاسخ‌ها مسدودسازی است."}
+_STILL = {False: "سایت هنوز پایین است",
+          True: "ربات هنوز مسدود است"}
+_GOODBYE = {False: "سایت برگشت",
+            True: "مسدودسازی برداشته شد"}
+
+
+def _hello(blocked: bool) -> str:
+    return _HELLO[bool(blocked)]
+
+
+def _first(blocked: bool) -> str:
+    return _FIRST[bool(blocked)]
+
+
+def _still_saying(blocked: bool) -> str:
+    return _STILL[bool(blocked)]
+
+
+def _goodbye(blocked: bool) -> str:
+    return _GOODBYE[bool(blocked)]
 
 
 def _usable() -> bool:
@@ -124,8 +177,16 @@ def watch_card(result: ShopNetwork, state: dict[str, Any], *, now: float | None 
     else:
         since = float(state.get("since") or moment)
         age = timeutil.human_duration(max(0.0, moment - since))
-        mark = "🟢 پایین نبود" if was else "⛔ پایین است"
-        lines += ["", f"<i>پایشِ خودکار هر {minutes} دقیقه · وضعیتِ فعلی: {mark} · از {age} پیش</i>"]
+        blocked = bool(state.get("blocked"))
+        if was:
+            mark = "🟢 پایین نبود"
+        elif blocked:
+            mark = "🔒 مسدود است"
+        else:
+            mark = "⛔ پایین است"
+        cadence = (f"ساعتی یک‌بار تا رفعِ مسدودسازی (به‌جای {minutes} دقیقه‌ایِ عادی)"
+                   if blocked and not was else f"هر {minutes} دقیقه")
+        lines += ["", f"<i>پایشِ خودکار {cadence} · وضعیتِ فعلی: {mark} · از {age} پیش</i>"]
     return "\n".join(lines)
 
 
@@ -149,6 +210,26 @@ async def _announce(app: Application, text: str) -> None:
             logger.debug("shop watch: پیام به %s نرفت (%s)", chat_id, exc)
 
 
+def _resting(state: dict[str, Any], now: float) -> float:
+    """Seconds left of a rest that a *block* earns, or ``0`` when the next pass may ask.
+
+    Only a block rests. A host that is down is not listening, so asking costs nothing and noticing
+    the return quickly is worth more than the four saved requests; a host that has *blocked us* is
+    listening to every knock, and each one can renew the block
+    (:data:`BLOCKED_RETRY_SECONDS`). The clock is the last pass that actually asked
+    (``checked_at``), so a bot that was restarted mid-block does not restart the wait from scratch
+    — but it does ask immediately, because a state file with no ``checked_at`` came from a version
+    of the bot that never counted, and one extra question after a deploy is cheaper than an hour of
+    silence about a site that came back.
+    """
+    if state.get("ok") is not False or not state.get("blocked"):
+        return 0.0
+    last = state.get("checked_at")
+    if last is None:
+        return 0.0
+    return max(0.0, BLOCKED_RETRY_SECONDS - (now - float(last)))
+
+
 async def check(context: ContextTypes.DEFAULT_TYPE) -> None:
     """One pass: four GETs, a state write, and a sentence only when the answer changed."""
     app = getattr(context, "application", None)
@@ -156,10 +237,21 @@ async def check(context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if not _usable():
         return
+    state = read_state()
+    now = time.time()
+    rest = _resting(state, now)
+    if rest:
+        logger.info("shop watch: آخرین پاسخ مسدودسازی بود؛ %s دقیقه دیگر دوباره می‌پرسد",
+                    round(rest / 60))
+        return
     result = await probe_shop_network()
     now = time.time()
-    state = read_state()
-    new_state, message = evaluate(state, ok=result.ok, verdict=result.verdict, now=now)
+    new_state, message = evaluate(state, ok=result.ok, verdict=result.verdict, now=now,
+                                  blocked=result.blocked)
+    # «کِی آخرین بار پرسیدیم» تنها چیزی است که حالت را در هر پاس عوض می‌کند — و همان چیزی است که
+    # به یک مسدودسازی استراحت می‌دهد. یک فایلِ JSONِ کوچک هر پاس، بهایی که «مسدود را چهار بار در
+    # ساعت نکوبیم» می‌ارزد.
+    new_state = {**new_state, "checked_at": now}
     if new_state != state:
         try:
             await jsonstore.write_json_async(state_path(), new_state)

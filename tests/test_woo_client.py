@@ -6,7 +6,11 @@
 """
 from __future__ import annotations
 
+import json
+import tempfile
+import time
 import unittest
+from pathlib import Path
 from typing import Any
 
 from _flow_harness import TransportScript, no_sleep, patched_settings, respond, settings_with
@@ -17,7 +21,8 @@ try:
     from bot import __version__
     from bot.services import woo_client
     from bot.services.woo_client import (
-        USER_AGENT, WooClient, WooCommerceAPIError, body_snippet, check, describe_exception,
+        CHALLENGE_COOKIE, USER_AGENT, ChallengeJar, WooClient, WooCommerceAPIError, body_snippet,
+        challenge_cookie, check, describe_exception,
     )
     from bot.services.woocommerce import ping_woocommerce
     # نام‌گذاری مجدد، وگرنه pytest این دو تابعِ async را به‌اشتباه «تست» جمع می‌کند
@@ -286,6 +291,16 @@ class TestToolsUseTheSameClient(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.ok)
         self.assertIn("ModSecurity", result.message)
 
+    async def test_media_tool_names_the_host_layer_when_it_is_refused(self) -> None:
+        """۴۱۸ روی مسیر رسانه یعنی «کاربر و رمز را چک کن» نصیحتِ غلطی است."""
+        self._inject(TransportScript(respond(418)))
+        with patched_settings(settings_with(**SHARED)):
+            result = await probe_media()
+        self.assertFalse(result.ok)
+        self.assertIn("418", result.message)
+        self.assertIn("وایت‌لیست", result.message)
+        self.assertNotIn("Application Password", result.message)
+
     async def test_product_tool_removes_the_media_when_the_product_fails(self) -> None:
         """تست نباید چیز نیمه‌کاره روی سایت بگذارد.\""""
         script = TransportScript(respond(201, {"id": 77}), respond(403, {"message": "no"}), respond(200, {}))
@@ -365,6 +380,170 @@ class TestNoSecondImplementation(unittest.TestCase):
         users = {path.relative_to(root).as_posix() for path in (root / "bot").rglob("*.py")
                  if "httpx.AsyncClient(" in path.read_text(encoding="utf-8")}
         self.assertEqual(allowed, users, "هر client تازه باید بگوید با چه سرویسی حرف می‌کند")
+
+
+#: The page the shop's host really answers with (2026‑10‑15), abbreviated in the middle: the two
+#: lines a client must read are the challenge value and the page's own ``Max-Age``. Anything the
+#: parser accepts must be readable off this text — not off a fixture we invented.
+GATE_PAGE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Redirecting...</title></head>
+<body>
+<noscript>JavaScript is required.</noscript>
+<script>
+(() => {
+    "use strict";
+    const challenge =
+        "_dgjsc=c871a8a72570e8e31f9decb5bd2afde3:20261015130000";
+    const match =
+        /^_dgjsc=([a-f0-9]{32}):([0-9]{14})$/.exec(challenge);
+    if (!match) {
+        document.body.textContent = "Invalid challenge.";
+        return;
+    }
+    const cookieName = "_dgjsc";
+    const cookieValue = `${match[1]}:${match[2]}`;
+    document.cookie =
+        `${cookieName}=${cookieValue}; ` +
+        "Max-Age=7200; Path=/; Secure; SameSite=Lax";
+    window.location.reload();
+})();
+</script>
+</body></html>
+"""
+
+GATE_VALUE = "c871a8a72570e8e31f9decb5bd2afde3:20261015130000"
+
+
+def gate_page(status: int = 418):
+    """`httpx.Response` برای صفحهٔ چالش — همان متنی که میزبان می‌فرستد."""
+    return httpx.Response(status, html=GATE_PAGE)
+
+
+def temp_jar(test: unittest.TestCase) -> tuple[ChallengeJar, Path]:
+    """جارِ چالش با مسیرِ موقت؛ تست نباید داخل `data/` واقعی بنویسد."""
+    directory = tempfile.TemporaryDirectory()
+    test.addCleanup(directory.cleanup)
+    path = Path(directory.name) / "shop-challenge.json"
+    return ChallengeJar(path=path), path
+
+
+@needs_httpx
+class TestChallengeParsing(unittest.TestCase):
+    """خواندنِ صفحهٔ چالش: دقیقاً همان چیزی که میزبان می‌فرستد، نه بیشتر."""
+
+    def test_the_real_page_is_read_value_and_lifetime(self) -> None:
+        pair = challenge_cookie(gate_page())
+        self.assertIsNotNone(pair, "صفحهٔ واقعیِ میزبان باید خوانده شود")
+        value, max_age = pair  # type: ignore[misc]
+        self.assertEqual(GATE_VALUE, value)
+        self.assertEqual(7200.0, max_age, "عمرِ کوکی را خودِ صفحه می‌گوید؛ ما حدس نمی‌زنیم")
+
+    def test_only_a_refusal_status_is_read(self) -> None:
+        self.assertIsNone(challenge_cookie(httpx.Response(200, html=GATE_PAGE)),
+                          "۲۰۰ صفحهٔ چالش نیست")
+        self.assertIsNone(challenge_cookie(httpx.Response(403, html=GATE_PAGE)),
+                          "فقط کدِ مسدودسازیِ همین سایت چالش خوانده می‌شود")
+
+    def test_a_refusal_without_the_page_is_not_a_challenge(self) -> None:
+        self.assertIsNone(challenge_cookie(httpx.Response(418, text="<html>Access denied</html>")))
+        self.assertIsNone(challenge_cookie(httpx.Response(418, json={"code": "rest_forbidden"})))
+
+    def test_the_jar_forgets_what_is_expired_or_unreadable(self) -> None:
+        jar, path = temp_jar(self)
+        path.write_text(json.dumps({"https://shop.example": ["value", time.time() - 1]}), "utf-8")
+        self.assertIsNone(ChallengeJar(path=path).value("https://shop.example"),
+                          "کوکیِ منقضی نباید فرستاده شود")
+        path.write_text("{ not json", "utf-8")
+        self.assertIsNone(ChallengeJar(path=path).value("https://shop.example"),
+                          "فایلِ خراب یعنی «چالشی نداریم»، نه خطا")
+        self.assertIsNone(ChallengeJar(path=path.parent / "nope.json").value("https://shop.example"))
+        self.assertIsNone(jar.value(""), "originِ خالی یعنی هیچ")
+
+    def test_the_jar_writes_what_the_next_process_needs(self) -> None:
+        _jar, path = temp_jar(self)
+        ChallengeJar(path=path).remember("https://shop.example", "abc:123", 7200)
+        stored = json.loads(path.read_text("utf-8"))["https://shop.example"]
+        self.assertEqual("abc:123", stored[0])
+        self.assertGreater(stored[1], time.time() + 7000, "عمرِ ذخیره‌شده باید واقعی باشد")
+        self.assertEqual("abc:123", ChallengeJar(path=path).value("https://shop.example"))
+
+
+@needs_httpx
+class TestChallengeHandshake(unittest.IsolatedAsyncioTestCase):
+    """۲۰۲۶‑۱۰‑۱۵: پاسخِ ۴۱۸ یک چالشِ جاوااسکریپتی بود، نه «بلاک شدنِ همیشگی».
+
+    مرورگر همان صفحه را اجرا می‌کند، کوکی را ست می‌کند، یک‌بار رفرش می‌کند و هیچ‌وقت نمی‌فهمد؛
+    `curl` و `httpx` این کار را نمی‌کنند و همیشه ۴۱۸ می‌خوانند. ربات حالا وسطِ راهِ مرورگر
+    می‌ایستد: کوکی را از خودِ صفحه برمی‌دارد و همان درخواست را یک‌بار تکرار می‌کند.
+    """
+
+    async def test_the_gate_page_is_answered_and_the_request_repeated(self) -> None:
+        script = TransportScript(gate_page(), respond(200, {"ok": True}))
+        audit = woo_client.Audit()
+        jar, _ = temp_jar(self)
+        with patched_settings(settings_with(**SHARED)):
+            async with WooClient(audit=audit, transport=script.transport(), challenges=jar) as client:
+                response = await client.get("https://shop.example/wp-json/wc/v3/tisa-health")
+        self.assertEqual(200, response.status_code, "پاسخِ واقعیِ سایت، نه صفحهٔ چالش")
+        self.assertEqual(2, script.sends, "یکی چالش، یکی تکرار — نه بیشتر")
+        self.assertNotIn("cookie", script.requests[0].headers, "درخواستِ اول بی‌کوکی می‌رود")
+        self.assertEqual(f"{CHALLENGE_COOKIE}={GATE_VALUE}", script.requests[1].headers["cookie"])
+        self.assertIn("[http:gate]", audit.text())
+        self.assertIn(CHALLENGE_COOKIE, audit.text())
+
+    async def test_the_cookie_is_reused_so_later_requests_skip_the_gate(self) -> None:
+        script = TransportScript(gate_page(), respond(200, {"id": 1}), respond(200, {"id": 2}))
+        jar, _ = temp_jar(self)
+        with patched_settings(settings_with(**SHARED)):
+            async with WooClient(transport=script.transport(), challenges=jar) as client:
+                await client.get("https://shop.example/wp-json/wc/v3/products")
+                await client.get("https://shop.example/wp-json/wc/v3/products")
+        self.assertEqual(3, script.sends, "درخواستِ دوم دیگر نباید ۴۱۸ بخورد")
+        self.assertEqual(f"{CHALLENGE_COOKIE}={GATE_VALUE}", script.requests[2].headers["cookie"])
+
+    async def test_a_write_is_repeated_too_because_php_never_ran(self) -> None:
+        """تکرارِ نوشتن هم بی‌خطر است: چالش ثابت می‌کند درخواست به PHP نرسیده."""
+        script = TransportScript(gate_page(), respond(201, {"id": 5}))
+        jar, _ = temp_jar(self)
+        with patched_settings(settings_with(**SHARED)):
+            async with WooClient(transport=script.transport(), challenges=jar) as client:
+                response = await client.post("https://shop.example/wp-json/wc/v3/products",
+                                             json={"name": "قاب"})
+        self.assertEqual(201, response.status_code)
+        self.assertEqual(["POST /wp-json/wc/v3/products"] * 2, script.methods)
+
+    async def test_a_418_without_the_page_stays_a_refusal_for_the_fence(self) -> None:
+        script = TransportScript(respond(418, {"code": "rest_forbidden"}))
+        jar, _ = temp_jar(self)
+        with patched_settings(settings_with(**SHARED)):
+            async with WooClient(transport=script.transport(), challenges=jar) as client:
+                response = await client.get("https://shop.example/wp-json/wc/v3/tisa-health")
+        self.assertEqual(418, response.status_code)
+        self.assertEqual(1, script.sends, "بدون چالش چیزی برای تکرار نیست")
+        self.assertIsNone(jar.value("https://shop.example"))
+
+    async def test_the_handshake_survives_a_restart(self) -> None:
+        """ری‌استارت نباید با یک ۴۱۸ شروع شود — وگرنه پایش، سایت را 🔒 مسدود می‌بیند."""
+        _jar, path = temp_jar(self)
+        first = TransportScript(gate_page(), respond(200, {}))
+        with patched_settings(settings_with(**SHARED)):
+            async with WooClient(transport=first.transport(), challenges=ChallengeJar(path=path)) as client:
+                await client.get("https://shop.example/wp-json/")
+            second = TransportScript(respond(200, {}))
+            async with WooClient(transport=second.transport(), challenges=ChallengeJar(path=path)) as client:
+                await client.get("https://shop.example/wp-json/")
+        self.assertEqual(1, second.sends, "کوکی از دیسک آمد؛ پروسهٔ تازه چالش نمی‌گیرد")
+        self.assertEqual(f"{CHALLENGE_COOKIE}={GATE_VALUE}", second.requests[0].headers["cookie"])
+
+    async def test_a_second_challenge_is_returned_not_looped(self) -> None:
+        """دو ۴۱۸ پشت‌سرهم ⇒ صف و 🔒، نه حلقه روی گیتی که ناراضی است."""
+        script = TransportScript(gate_page(), gate_page(), respond(200, {}))
+        jar, _ = temp_jar(self)
+        with patched_settings(settings_with(**SHARED)):
+            async with WooClient(transport=script.transport(), challenges=jar) as client:
+                response = await client.get("https://shop.example/wp-json/")
+        self.assertEqual(418, response.status_code)
+        self.assertEqual(2, script.sends, "دقیقاً یک تکرار، حتی اگر پاسخ باز هم چالش باشد")
 
 
 if __name__ == "__main__":  # pragma: no cover

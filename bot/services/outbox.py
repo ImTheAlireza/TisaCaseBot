@@ -74,6 +74,19 @@ def is_transient(exc: BaseException) -> bool:
     return isinstance(exc, (TimeoutError, ConnectionError, OSError, httpx.TransportError))
 
 
+def is_blocked(exc: BaseException) -> bool:
+    """Did the shop answer «no» from *in front of* WordPress — without letting us in at all?
+
+    The signature of a host's bot protection (:data:`bot.services.woo_client.BLOCKED_STATUS_CODES`),
+    and it lands in the same bucket as silence for the queue — the request never reached PHP, so
+    nothing was written and no human needs to be woken tonight, only a whitelist entry made — but
+    in a different bucket for the *sentences*: «به مصرفِ هاست نگاه کن» would send the operator to
+    the wrong panel. Tagged at the source by :func:`bot.services.woo_fencing._blocked_host`, because
+    the status code alone (``503``, queued like any busy host) cannot carry that difference.
+    """
+    return bool(getattr(exc, "host_blocked", False))
+
+
 def is_silent(exc: BaseException) -> bool:
     """Did the shop fail to *answer*, rather than answer «busy»?
 

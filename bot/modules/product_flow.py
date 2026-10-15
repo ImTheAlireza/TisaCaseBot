@@ -2628,17 +2628,32 @@ def _publish_failure_text(exc: BaseException, reason: str, *, queued: bool, wait
     """Say «this did not go through» in the voice of whoever has to act — the shop or the seller.
 
     One red sentence used to cover both a host that answers nothing and a value WooCommerce
-    refused, and the first is not something a person can fix by retyping the form. A queued,
-    host-silent failure is therefore not shown as an error at all: it is a state with a time on
-    it, and the only thing asked of the seller is to wait — «✅ تأیید و ساخت» still works and
-    only does the same send sooner.
+    refused, and the first is not something a person can fix by retyping the form. A queued failure
+    that never reached WordPress is therefore not shown as an error at all: it is a state with a
+    time on it, and the only thing asked of the seller is to wait — «✅ تأیید و ساخت» still works
+    and only does the same send sooner.
+
+    There are two such states and they are not the same sentence. A silent host is «پاسخ نمی‌دهد»;
+    a bot-protection block (`is_blocked`) is «پاسخ می‌دهد و رد می‌کند» — and the second one has a
+    *fix*, on the host side, that the seller can hand to whoever runs the panel. Printing the first
+    sentence for the second case is how a whitelist request turns into three days of «دوباره بزن».
     """
-    if queued and outbox.is_silent(exc):
-        lines = [
-            "🕐 سایت در این لحظه پاسخ نمی‌دهد — از سمتِ تو هیچ‌چیز غلط نبود.",
-            "🐇 هرچه تأیید کرده بودی در صفِ ارسال است؛ ربات خودش سایت را امتحان می‌کند و "
-            "نتیجه را همین‌جا می‌فرستد.",
-        ]
+    if queued and (outbox.is_silent(exc) or outbox.is_blocked(exc)):
+        if outbox.is_blocked(exc):
+            lines = [
+                "🔒 سایت درخواست‌های ربات را رد می‌کند (مسدودسازیِ سمتِ میزبان) — "
+                "از سمتِ تو هیچ‌چیز غلط نبود و هیچ‌چیز هم روی فروشگاه نوشته نشد.",
+                "🛡 این لایهٔ امنیتیِ جلوی وردپرس است (ضدِرباتِ میزبان، Imunify360، ModSecurity)، "
+                "نه افزونه و نه کلید: ربات چالشِ جاوااسکریپتیِ همین لایه را خودکار انجام می‌دهد و "
+                "معمولاً از آن رد می‌شود — پس ۴۱۸ بدون چالش یعنی باید IP سرورِ ربات در همان لایه "
+                "وایت‌لیست شود. «🩺 عیب‌یابی کامل» ← «شبکهٔ سایت» همین را می‌گوید.",
+            ]
+        else:
+            lines = [
+                "🕐 سایت در این لحظه پاسخ نمی‌دهد — از سمتِ تو هیچ‌چیز غلط نبود.",
+                "🐇 هرچه تأیید کرده بودی در صفِ ارسال است؛ ربات خودش سایت را امتحان می‌کند و "
+                "نتیجه را همین‌جا می‌فرستد.",
+            ]
         if waiting:
             lines.append(f"⏱ {waiting}")
         lines.append(
