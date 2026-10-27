@@ -190,6 +190,20 @@ class FlowWiring(unittest.TestCase):
         self.assertTrue(feature_allowed(SUDO, "auto_crop"))
         self.assertFalse(feature_allowed(999999, "auto_crop"), "کاربرِ بی‌نقش نباید دسترسی داشته باشد")
 
+    def test_the_intro_only_says_what_to_send(self) -> None:
+        """پیامِ ورود «چه بفرست» است، نه توضیحِ کاری که قرار است بشود.
+
+        سه قاعدهٔ برش در کد و در README هستند؛ کسی که دنبالِ برشِ عکس است، آن‌ها را
+        نمی‌خواند. هر خطی که این‌جا اضافه شود، هر بار خوانده می‌شود.
+        """
+        intro = auto_crop.INSTRUCTION
+        self.assertIn("عکس بفرست", intro)
+        self.assertIn("/cancel", intro)
+        for extra in ("•", "کیفیت", "فشرده", "📎", "اندازه"):
+            self.assertNotIn(extra, intro, f"«{extra}» توضیحِ اضافه است")
+        lines = [line for line in intro.splitlines() if line.strip()]
+        self.assertLessEqual(len(lines), 3, f"پیامِ ورود بلند شده: {lines}")
+
     def test_it_is_a_registered_flow_and_a_live_handler(self) -> None:
         from bot.services import flow_guard
 

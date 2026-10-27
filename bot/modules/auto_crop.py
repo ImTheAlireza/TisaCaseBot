@@ -60,13 +60,12 @@ _active_data: dict[int, dict] = {}
 #: half-written. They are removed by their own `finally` as usual.
 active_roots: dict[int, set[Path]] = {}
 
+#: «چه بفرست» و بس: هر خطِ توضیحی که کاربر مجبور نباشد بخواند، خوانده نمی‌شود.
+#: آن‌چه واقعاً به کار می‌آید کنارِ خودِ نتیجه گفته می‌شود (کپشنِ ابعاد، جملهٔ
+#: «دست نزدم»)، و اینکه چرا فایل بهتر از عکس است در README آمده.
 INSTRUCTION = (
     "✂️ <b>اتو کراپ ۱:۱</b>\n\n"
-    "عکس بفرست؛ مربعِ وسطش را می‌برّم و برمی‌گردانم:\n"
-    "• از هر طرف به یک اندازه کم می‌شود\n"
-    "• کیفیت دست نمی‌خورد — هیچ پیکسلی دوباره فشرده یا کوچک نمی‌شود\n"
-    "• عکسی که همین حالا ۱:۱ است، همان‌طور برمی‌گردد\n\n"
-    "📎 برای اینکه تلگرام خودش عکس را فشرده نکند، با «فایل» بفرستش.\n\n"
+    "عکس بفرست؛ برش می‌دهم و برمی‌گردانم.\n\n"
     "برای پایان: /cancel"
 )
 
@@ -267,9 +266,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     message = update.effective_message
     if not message or not (message.text or "").strip():
         return WAITING
-    await message.reply_text(
-        "📷 این دکمه فقط عکس را مربع می‌کند. یک عکس (یا فایلِ عکس) بفرست، یا /cancel."
-    )
+    await message.reply_text("📷 عکس بفرست (یا /cancel).")
     return WAITING
 
 
