@@ -8,8 +8,8 @@
 **هیچ‌چیز اینجا نباید منتشرکردن را بشکند.**نوشتنِ یک متریک اگر شکست، فقط یک لاگ
 می‌شود (یک‌بار در هر پروسه، نه هر فراخوانی) — نبودِ عدد بهتر از جریانِ نیمه‌کاره است.
 
-هر کلید در :data:`COUNTERS` تعریف می‌شود؛ صفحهٔ «📊 وضعیت» و `/export_metrics` هر دو
-همان یک لیست را می‌خوانند، پس عددی که هیچ‌جا نوشته نمی‌شود هم در صفحه نمی‌آید.
+هر کلید در :data:`COUNTERS` تعریف می‌شود؛ گزارش روزانهٔ چتِ لاگ همان یک لیست را
+می‌خواند، پس عددی که هیچ‌جا نوشته نمی‌شود هم در گزارش نمی‌آید.
 """
 
 from __future__ import annotations
@@ -24,7 +24,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from bot.config import data_dir
-from bot.utils import timeutil
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +94,9 @@ COUNTERS: dict[str, Counter] = {
         Counter("compress_download_ms", "دریافت عکس", kind="ms"),
         Counter("compress_cpu_ms", "فشرده‌سازی عکس", kind="ms"),
         Counter("compress_upload_ms", "ارسال عکس", kind="ms"),
+        Counter("crop_images", "عکسِ اتو کراپ‌شده"),
+        Counter("crop_download_ms", "دریافت عکسِ اتو کراپ", kind="ms"),
+        Counter("crop_cpu_ms", "برشِ عکس", kind="ms"),
     )
 }
 
@@ -310,7 +312,7 @@ def _line(counter: Counter, row: tuple[int, float, float, float]) -> str:
 
 
 def status_lines() -> list[str]:
-    """What «📊 وضعیت» shows: only counters that have actually fired."""
+    """What the daily report shows: only counters that have actually fired."""
     seen = snapshot()
     lines = [_line(counter, seen[key]) for key, counter in COUNTERS.items() if key in seen]
     for _key, (numerator, denominator, label) in RATIOS.items():
@@ -320,25 +322,11 @@ def status_lines() -> list[str]:
     return lines
 
 
-def export_csv() -> str:
-    """/export_metrics: the raw numbers, header first — Excel-safe, no Persian prose."""
-    seen = snapshot()
-    lines = ["key,counter,n,total,peak,updated_iso"]
-    for key, counter in COUNTERS.items():
-        n, total, peak, updated = seen.get(key, (0, 0.0, 0.0, 0.0))
-        when = timeutil.strftime("%Y-%m-%dT%H:%M:%S", updated) if updated else ""
-        lines.append(f'{key},"{counter.label}",{n},{total:g},{peak:g},{when}')
-    for name, (numerator, denominator, label) in RATIOS.items():
-        value = rate(numerator, denominator)
-        lines.append(f'{name},"{label}",,,"{"" if value is None else f"{value:.4f}"}",')
-    return "\n".join(lines) + "\n"
-
-
 def probe() -> tuple[int, str]:
     """(rows on disk, problem) for ``--check-config``.
 
     A metrics database that cannot be written costs only the numbers — no flow stops —
-    but the operator should learn that at boot, not when a screen stays empty.
+    but the operator should learn that at boot, not when the daily report stays empty.
     """
     if not DB_PATH.exists():
         return 0, ""
@@ -360,7 +348,6 @@ __all__ = [
     "RATIOS",
     "close",
     "elapsed",
-    "export_csv",
     "incr",
     "incr_shop",
     "note_abandoned",

@@ -273,7 +273,7 @@ async def require(client: WooClient, base: str) -> None:
     if status in (401, 403):
         raise WooCommerceAPIError(403, (
             f"کلید WooCommerce برای بررسی ایمنی پذیرفته نشد (HTTP {status}{_detail(response)}). "
-            "کلید باید متعلق به کاربری با دسترسی «ویرایش محصول» باشد؛ «🔑 تست کلید» را بزن."
+            "کلید باید متعلق به کاربری با دسترسی «ویرایش محصول» باشد؛ «🏓 Ping» ← «🌐 تست اتصال ووکامرس» را بزن."
         ))
     if status in BLOCKED_STATUS_CODES:
         # A security layer answered, not WordPress (:data:`…woo_client.BLOCKED_STATUS_CODES`).

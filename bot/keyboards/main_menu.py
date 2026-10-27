@@ -55,13 +55,13 @@ def main_menu_keyboard(user_id: int | None = None) -> InlineKeyboardMarkup:
 
     # Grouped layout: related actions grouped side-by-side or in logical pairs.
     # 1. Products & Store: new + restock, then recent products
-    # 2. Tools & Processing: tracking + compress, then parser test
-    # 3. System & Status (sudo): ops status + ping, then learning
+    # 2. Tools & Processing: tracking + compress, then auto-crop
+    # 3. System & Help (sudo): ping + learning
     # 4. Management & Settings (sudo): admins + settings, then restart
     menu_groups: list[list[tuple[str, ...]]] = [
         [("product_new", "product_restock"), ("recent_products",)],
-        [("tracking", "compress"), ("parser_test",)],
-        [("ops_status", "ping"), ("learning",)],
+        [("tracking", "compress"), ("auto_crop",)],
+        [("ping", "learning")],
         [("admins", "settings"), ("restart",)],
     ]
 

@@ -799,7 +799,10 @@ class TestFlowGuard(FlowStateTestCase):
     def test_every_flow_is_registered(self):
         # «شارژ محصول موجود» shares the builder's conversation but is its own flow to close:
         # an approved diff must not outlive the start of a new product.
-        self.assertEqual(flow_guard.registered(), ["admin_add", "compress", "parser_test", "product", "restock", "tracking"])
+        self.assertEqual(
+            flow_guard.registered(),
+            ["admin_add", "auto_crop", "compress", "product", "restock", "tracking"],
+        )
 
     def test_product_closer_reports_and_cleans(self):
         session = PF.ProductSession(mode="new")

@@ -44,7 +44,7 @@ def _completion(content: str) -> dict:
 
 
 def _count(snapshot: dict, key: str) -> int:
-    """چند بار شده؟ (از snapshotِ گرفته‌شده — همان چیزی که «📊 وضعیت» می‌خواند)."""
+    """چند بار شده؟ (از snapshotِ گرفته‌شده — همان چیزی که گزارش روزانه می‌خواند)."""
     return int(snapshot.get(key, (0, 0.0, 0.0, 0.0))[0])
 
 

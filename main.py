@@ -68,8 +68,15 @@ def check_config() -> int:
     ledger_count, ledger_problem = tracking_ledger.probe()
     print(f"ledger  : {tracking_ledger.FILE} ({ledger_count} فایل)"
           + (f"  ← ⚠️ {ledger_problem}" if ledger_problem else ""))
+    # شمارنده‌ها فقط عدد‌اند و خرابی‌شان هیچ جریانی را نمی‌بندد — پس مثلِ صف، اجرا را
+    # رد نمی‌کند؛ ولی اگر همین‌جا گفته نشود، تنها نشانه‌اش یک گزارش روزانهٔ خالی است.
+    from bot.services import metrics
+
+    metric_rows, metric_problem = metrics.probe()
+    print(f"metrics : {metrics.path()} ({metric_rows} شمارنده)"
+          + (f"  ← ⚠️ {metric_problem}" if metric_problem else ""))
     # افزونهٔ ZIP تنها چیزی است که خرابی‌اش «بی‌صدا» است: محصول ساخته می‌شود، فقط
-    # تخفیف و موجودی‌اش نمی‌رسد. پس همین‌جا هم گفته می‌شود، نه فقط در عیب‌یابی.
+    # تخفیف و موجودی‌اش نمی‌رسد. پس همین‌جا هم گفته می‌شود، نه فقط در لاگ.
     from bot.services import importer_contract
 
     importer_state, importer_detail, _ = importer_contract.describe()

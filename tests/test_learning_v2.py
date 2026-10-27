@@ -10,8 +10,8 @@ Four layers, each tested where its decision is made:
   asked to approve anything;
 * :mod:`bot.modules.learning_panel` — the screens and the buttons that answer them
   (a promise without a button is a bug);
-* :mod:`bot.modules.product_tools` + :func:`bot.modules.product_flow.analyze` — the
-  parser test that shows what the rules did to the text, not just what they read.
+* :func:`bot.modules.product_flow.analyze` — the read-only probe that proves a rule
+  fires on a real text without creating anything.
 
 Run with ``python -m pytest tests/test_learning_v2.py`` or
 ``python3 -m unittest discover -s tests``; like the other flow tests, the panel
@@ -34,11 +34,10 @@ from bot.services import learning, learning_corpus, learning_impact
 try:
     from bot.constants import CB
     from bot.modules import learning_panel
-    from bot.modules import product_tools
 
     HAS_FLOW = True
 except Exception:                          # pragma: no cover - PTB missing
-    CB = learning_panel = product_tools = None   # type: ignore[assignment]
+    CB = learning_panel = None   # type: ignore[assignment]
     HAS_FLOW = False
 
 try:  # the flow and the parser tests need httpx as well (product_extractor)
@@ -677,41 +676,12 @@ class TestLearningPanel(IsolatedMemory):
 
 
 # ---------------------------------------------------------------------------
-# The parser test: show what the rules did
+# The read-only probe: nothing is created, nothing is remembered
 # ---------------------------------------------------------------------------
 
 @needs_parser
-class TestParserTestSandbox(IsolatedMemory):
-    def test_rules_block_names_the_difference(self):
-        self.learn(term_rule("سبز", "سفید"))
-        with_rules = Snapshot(title="قاب سفید", attributes={}, price=0, models=[],
-                              variation_count=0,
-                              evidence={})
-        without = Snapshot(title="قاب سبز", attributes={}, price=0, models=[],
-                           variation_count=0, evidence={})
-        with_rules.evidence = {}
-        text = "\n".join(product_tools._rules_block(with_rules, without))
-        self.assertIn("فرقِ «با قواعد» و «بدون قواعد»", text)
-        self.assertIn("عنوان: «قاب سبز» ← «قاب سفید»", text)
-
-    def test_no_difference_is_reported_as_no_difference(self):
-        self.learn(term_rule("سبز", "سفید"))
-        same = Snapshot(title="قاب مشکی", attributes={}, price=0, models=[],
-                        variation_count=0, evidence={})
-        text = "\n".join(product_tools._rules_block(same, same))
-        self.assertIn("هیچ فرقی نکرد", text)
-        self.assertIn("1 قاعدهٔ فعال در نظر گرفته شد", text)
-
-    def test_the_sandbox_can_run_without_the_memory(self):
-        import asyncio
-
-        self.learn(term_rule("سبز", "سفید"))
-        with_rules = asyncio.run(product_flow.analyze("قاب سبز"))
-        without = asyncio.run(product_flow.analyze("قاب سبز", apply_rules=False))
-        self.assertIn("سفید", with_rules.title)
-        self.assertNotIn("سفید", without.title)
-
-    def test_the_sandbox_does_not_pollute_the_corpus(self):
+class TestReadOnlyAnalyze(IsolatedMemory):
+    def test_the_probe_does_not_pollute_the_corpus(self):
         import asyncio
 
         asyncio.run(product_flow.analyze("قیمت 698000 تومان"))

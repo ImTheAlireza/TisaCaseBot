@@ -10,7 +10,7 @@ from telegram.request import HTTPXRequest
 
 from bot import rbac
 from bot.config import settings
-from bot.modules import image_compress, maintenance, product_flow, register_all, shop_watch
+from bot.modules import auto_crop, image_compress, maintenance, product_flow, register_all, shop_watch
 from bot.modules.outbox_flow import start as start_outbox
 from bot.modules.product_flow import notify_interrupted_flows
 from bot.modules.restart import notify_restart_complete
@@ -24,10 +24,6 @@ BOT_COMMANDS = [
     BotCommand("start", "Open the main menu"),
     BotCommand("menu", "Open the main menu"),
     BotCommand("cancel", "لغو عملیات جاری"),
-    # Only the owner can actually use it (the handler says so); Telegram does not have
-    # per-role command lists, and an underscore is required — «/export-metrics» is not a
-    # valid bot command name, however the upgrade plan spelled it.
-    BotCommand("export_metrics", "خروجی CSV شمارنده‌های عملیاتی (فقط سودو)"),
     BotCommand("queue", "📤 صفِ ارسالِ من — چه چیزی در انتظارِ سایت است"),
     BotCommand("watch", "🛰 پایشِ سایت — خطا از هاست است، افزونه، کلید، یا ربات (فقط سودو)"),
 ]
@@ -110,6 +106,7 @@ async def _post_init(app: Application) -> None:
 async def _post_stop(app: Application) -> None:
     await product_flow.shutdown()
     await image_compress.shutdown()
+    await auto_crop.shutdown()
     await worker.shutdown()
     metrics.close()
 

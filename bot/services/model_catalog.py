@@ -28,8 +28,7 @@ from bot.services import jsonstore
 from bot.services.phone_parser import fold_variant_words
 
 #: کنارِ بقیهٔ state، یعنی زیر `TISA_DATA_DIR` — نه هاردکد در پوشهٔ کد؛ یک فایلِ
-#: بیرون از آن دایرکتوری با اولین `git clean -fdx` یا دیپلویِ بعدی گم می‌شود
-#: («📊 وضعیت» دقیقاً برای گفتنِ همین است).
+#: بیرون از آن دایرکتوری با اولین `git clean -fdx` یا دیپلویِ بعدی گم می‌شود.
 DATA_FILE = data_dir() / "model_catalog.json"
 
 #: The brands the bot knows out of the box, with the spellings sellers use.
