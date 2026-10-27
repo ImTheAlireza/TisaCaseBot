@@ -2,7 +2,7 @@
 
 هر تست در این فایل یک بی‌نظمیِ واقعی را می‌بندد که در فازهای ۰ تا ۸ آزار داد:
 
-* نسخه در دو جا (و دو جا یکی نباشد) → «📊 وضعیت» روی سایت عددِ دیگری می‌گوید؛
+* نسخه در دو جا (و دو جا یکی نباشد) → `--version` روی سرور عددِ دیگری می‌گوید؛
 * `tisa-product-importer.zip` ترک‌شده بدون سورس → معلوم نیست کدام PHP در آن است؛
 * promise در README بدون کد (و برعکس) → کاربر چیزی را دنبال می‌کند که وجود ندارد؛
 * `docker-compose.yml` با نامِ متغیری که هیچ‌جا خوانده نمی‌شود → کانتینر بالا می‌آید
@@ -130,7 +130,7 @@ class TestPluginIsBuiltFromSource(unittest.TestCase):
 
         php = (PLUGIN_DIR / "tisa-product-importer.php").read_text(encoding="utf-8")
         declared = re.search(r"^ \* Version: ([0-9.]+)", php, re.M)
-        self.assertIsNotNone(declared, "افزونه `Version:` اعلام‌شده ندارد؛ «🩺 عیب‌یابی» نمی‌تواند قضاوت کند")
+        self.assertIsNotNone(declared, "افزونه `Version:` اعلام‌شده ندارد؛ `--check-config` نمی‌تواند قضاوت کند")
         self.assertEqual(importer_contract.read_version(PLUGIN_ZIP), tuple(
             int(part) for part in declared.group(1).split(".")
         ), "نسخۀ فایلِ سورس با زیپی که مالک آپلود می‌کند فرق دارد")

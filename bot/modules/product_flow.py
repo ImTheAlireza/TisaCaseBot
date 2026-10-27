@@ -154,8 +154,8 @@ class ProductSession:
     #: the preview card moves to the bottom of the chat.
     guide_message_id: int | None = None
     #: Called by :func:`_extract` at each phase boundary so the card can show what
-    #: is known so far. ``None`` when nobody is watching (the parser test calls
-    #: ``_extract`` directly).
+    #: is known so far. ``None`` when nobody is watching (a read-only probe calls
+    #: ``_extract`` directly — see :func:`analyze`).
     on_stage: Any = None
     #: Drafts as they were before each user action, oldest first. «↩️ برگرداندن
     #: به حالت قبل» pops one and repaints the card from it — no AI call, no site
@@ -1409,18 +1409,13 @@ def _learn_from_diff(
     return notes
 
 
-async def analyze(text: str, *, apply_rules: bool = True) -> ProductData:
+async def analyze(text: str) -> ProductData:
     """Read one text through the flow's own pipeline; create nothing.
 
-    Used by «🔍 تست پارسر» (:mod:`bot.modules.product_tools`). It builds a
-    throwaway session and calls :func:`_extract` on purpose: a sandbox with
-    its own simplified parser would answer a different question than «چرا
-    ربات این متن را این‌طور خواند؟» — and a wrong answer there is worse
-    than none.
-
-    ``apply_rules=False`` runs the identical pipeline with the owner's learned
-    rules switched off, which is how the test can show what a rule changed
-    instead of leaving the owner to imagine it.
+    It builds a throwaway session and calls :func:`_extract` on purpose: a
+    caller with its own simplified parser would answer a different question
+    than «ربات این متن را چگونه می‌خواند؟» — and a wrong answer there is worse
+    than none. Nothing is recorded and no corpus entry is written.
     """
     probe = ProductSession(mode="new")
     # A pasted sample is the *information* message, not a media caption: that
@@ -1428,10 +1423,7 @@ async def analyze(text: str, *, apply_rules: bool = True) -> ProductData:
     # caption would test a different (and more forgiving) precedence rule.
     probe.info_text = (text or "").strip()
     probe.data = ProductData()
-    if apply_rules:
-        return await _extract(probe, learn=False)
-    with learning.suspended():
-        return await _extract(probe, learn=False)
+    return await _extract(probe, learn=False)
 
 
 def _canonical_category_paths(categories: Sequence[str]) -> list[str]:
@@ -2646,7 +2638,7 @@ def _publish_failure_text(exc: BaseException, reason: str, *, queued: bool, wait
                 "🛡 این لایهٔ امنیتیِ جلوی وردپرس است (ضدِرباتِ میزبان، Imunify360، ModSecurity)، "
                 "نه افزونه و نه کلید: ربات چالشِ جاوااسکریپتیِ همین لایه را خودکار انجام می‌دهد و "
                 "معمولاً از آن رد می‌شود — پس ۴۱۸ بدون چالش یعنی باید IP سرورِ ربات در همان لایه "
-                "وایت‌لیست شود. «🩺 عیب‌یابی کامل» ← «شبکهٔ سایت» همین را می‌گوید.",
+                "وایت‌لیست شود. «🏓 Ping» ← «🛰 شبکهٔ سایت» همین را می‌گوید.",
             ]
         else:
             lines = [

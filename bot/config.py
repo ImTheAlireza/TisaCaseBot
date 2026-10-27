@@ -3,7 +3,7 @@
 Every value is parsed *defensively*: a typo in ``.env`` must never crash the bot
 at import time (it would leave supervisor crash-looping with an unreadable
 traceback). Bad values fall back to the documented default and the problem is
-logged, so ``LOG_LEVEL=DEBUG`` or the ``📊 وضعیت`` screen can surface it.
+logged, so ``LOG_LEVEL=DEBUG`` is enough to surface it.
 """
 
 from __future__ import annotations
@@ -208,8 +208,8 @@ class Settings:
 
         این‌جا تعریف شده چون فقط از فیلدهای همین کلاس می‌خواند؛ صفحه‌ها نباید هر
         کدام نسخه‌شان را بنویسند و ماژول‌ها هم (قانونِ خانه) یکدیگر را import
-        نمی‌کنند. پس «📊 وضعیت» همان عددی را می‌گوید که مبدل فایل قبل از دانلود
-        به کاربر وعده داده است.
+        نمی‌کنند. پس همان عددی را می‌گوید که مبدل فایل قبل از دانلود به کاربر
+        وعده داده است.
         """
         return (
             f"فایل تا {self.max_file_mb:g} MB، تا {self.max_rows:,} ردیف، "

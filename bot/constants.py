@@ -24,11 +24,6 @@ class CB:
     QUEUE_SHOW = "queue:show"
     QUEUE_NOW = "queue:now"
     QUEUE_DROP = "queue:drop"
-    # 📊 وضعیت / 🩺 عیب‌یابی / 📥 متریک‌ها (bot/modules/ops.py)
-    OPS_STATUS = "ops:status"
-    OPS_DIAGNOSE = "ops:diagnose"
-    OPS_METRICS = "ops:metrics"
-
     # Restart via supervisor
     RESTART_ASK = "restart:ask"
     RESTART_CONFIRM = "restart:confirm"
@@ -72,11 +67,9 @@ class CB:
     LEARNING_CLEAR_YES = "learning:clear:yes"
     LEARNING_CLEAR_NO = "learning:clear:no"
 
-    # Product history + parser sandbox — see bot/modules/product_tools.py
+    # Product history — see bot/modules/product_tools.py
     PRODUCTS_RECENT = "products:recent"
     PRODUCTS_OPEN = "products:open"          # data = f"{...}:{ledger_key}"
-    PARSER_TEST = "tools:parser"
-    PARSER_TEST_CANCEL = "tools:parser:cancel"
 
     # Product flow — the result card's own buttons
     PRODUCT_NEXT_PREFIX = "product:next"     # data = f"{...}:{new|update}"

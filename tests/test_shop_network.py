@@ -130,7 +130,7 @@ class Verdicts(unittest.TestCase):
         _ok, verdict, fix = self._say(fence_keyed=403, fence_open=401)
         self.assertIn("403", verdict)
         self.assertNotIn("وایت‌لیست", fix)
-        self.assertIn("🔑", fix, "راهِ درست: تست کلید")
+        self.assertIn("🏓 Ping", fix, "راهِ درست: تست اتصال ووکامرس")
 
     def test_refused_credentials_point_at_the_key_tester(self) -> None:
         ok, verdict, _fix = self._say(fence_keyed=403)

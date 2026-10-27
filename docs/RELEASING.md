@@ -13,8 +13,8 @@
 وقتی `1.0.0` زده شد (یعنی قرارداد `product.json` و مسیر انتشار ثابت شد)، SemVer
 کلاسیک جاری می‌شود: MAJOR برای شکست، MINOR برای قابلیت، PATCH برای رفع اشکال.
 
-**نسخه فقط یک‌جا نوشته می‌شود: `bot/__init__.py`.** `main.py --version`، «📊 وضعیت» و
-«🩺 عیب‌یابی» همان را می‌خوانند؛ `tests/test_release.py` می‌گیرد اگر `CHANGELOG.md`
+**نسخه فقط یک‌جا نوشته می‌شود: `bot/__init__.py`.** `main.py --version` و
+`/start` همان را می‌خوانند؛ `tests/test_release.py` می‌گیرد اگر `CHANGELOG.md`
 سرِ دیگری حرف بزند.
 
 ## چک‌لیست انتشار
@@ -45,8 +45,9 @@
    git add tisa-product-importer.zip
    ```
 
-   `Version:` را در رأس همان فایل PHP بالا ببر — وگرنه «🩺 عیب‌یابی» روی سایت می‌گوید
-   افزونه کهنه است (آستانهٔ فیلدهای قیمت در `importer_contract.MIN_VERSION_FOR_PRICE_FIELDS`).
+   `Version:` را در رأس همان فایل PHP بالا ببر — وگرنه `python main.py --check-config`
+   می‌گوید افزونه کهنه است (آستانهٔ فیلدهای قیمت در
+   `importer_contract.MIN_VERSION_FOR_PRICE_FIELDS`).
 
 ۴. نسخه و `CHANGELOG.md`:
 
@@ -100,4 +101,4 @@
 ریلیزِ `0.x` را **اصلاح** نکن، بعدی را بزن (`0.16.1`) و در CHANGELOG بنویس چه چیزی
 برگشت — `git revert` روی `main` امن‌تر از force-push به تگ است. اگر فقط زیپ افزونه
 خراب بود، ریلیزِ تازه لازم نیست: فایل ضمیمه را با `gh release upload --clobber` عوض کن
-و در «🩺 عیب‌یابی» سایت نسخهٔ تازه را ببین.
+و در وردپرس نسخهٔ تازه را ببین.

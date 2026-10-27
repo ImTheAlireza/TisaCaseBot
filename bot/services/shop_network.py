@@ -93,7 +93,7 @@ class ShopNetwork:
 
     @property
     def summary(self) -> str:
-        """One line for «🩺 عیب‌یابی»: what was measured, no prose."""
+        """One line for «🛰 شبکهٔ سایت»: what was measured, no prose."""
         return " · ".join(
             f"{probe.path}={'بی‌پاسخ' if probe.status is None else probe.status}" for probe in self.probes
         )
@@ -197,7 +197,7 @@ def _read_verdict(home: ShopProbe, open_rest: ShopProbe, open_fence: ShopProbe,
         ), (
             "به میزبان بگو برای «/wp-json/wc/v3/*» قاعده‌ای که consumer_key‏/consumer_secret را در "
             "کوئری استرینگ بلاک می‌کند کنار بگذارد (یا IP سرورِ ربات را استثنا کند). تا آن، "
-            "«🌐 تست اتصال ووکامرس» هم همین را می‌بیند و انتشار در صف می‌ماند."
+            "«🏓 Ping» ← «🌐 تست اتصال ووکامرس» هم همین را می‌بیند و انتشار در صف می‌ماند."
         )
     if keyed.status is None:
         return False, (
@@ -213,7 +213,7 @@ def _read_verdict(home: ShopProbe, open_rest: ShopProbe, open_fence: ShopProbe,
             f"پیش‌آزمون با کلیدها رد شد (HTTP {keyed.status}) در حالی که سایت جواب می‌دهد، "
             "پس ایرادِ ارتباط نیست."
         ), (
-            "کلید/سِر را با «🔑 تست کلید» بسنج؛ کلید باید به کاربری با نقش «مدیریت فروشگاه» یا "
+            "کلید/سِر را با «🏓 Ping» ← «🌐 تست اتصال ووکامرس» بسنج؛ کلید باید به کاربری با نقش «مدیریت فروشگاه» یا "
             "دست‌کم «ویرایش محصول» وصل باشد."
         )
     if keyed.status == 404 or open_fence.status == 404:
@@ -223,7 +223,7 @@ def _read_verdict(home: ShopProbe, open_rest: ShopProbe, open_fence: ShopProbe,
             "منتشر نمی‌کند."
         ), (
             "از همان wp-admin، بدون ترمینال: افزونه‌ها ← افزودن جدید ← بارگذاری، و "
-            "tisa-product-importer.zip را آپلود و فعال کن؛ بعد «🩺 عیب‌یابی کامل»."
+            "tisa-product-importer.zip را آپلود و فعال کن؛ بعد «🏓 Ping» ← «🛰 شبکهٔ سایت»."
         )
     if keyed.status == 200 and "قرارداد کامل" in keyed.detail:
         return True, f"مسیر ایمنی جواب داد و قرارداد کامل است ({keyed.detail}).", ""
@@ -231,7 +231,7 @@ def _read_verdict(home: ShopProbe, open_rest: ShopProbe, open_fence: ShopProbe,
         f"پاسخ‌ها غیرمنتظره است: پیش‌آزمون با کلید HTTP {keyed.status}، بدون کلید "
         f"HTTP {open_fence.status}."
     ), (
-        "«🩺 عیب‌یابی کامل» را دوباره بزن؛ اگر باز همین بود، افزونه را یک بار غیرفعال و فعال کن "
+        "«🏓 Ping» ← «🛰 شبکهٔ سایت» را دوباره بزن؛ اگر باز همین بود، افزونه را یک بار غیرفعال و فعال کن "
         "(و در تنظیمات←پیوندهای یکتا یک «ذخیرهٔ مجدد» هم معجزه می‌کند)."
     )
 

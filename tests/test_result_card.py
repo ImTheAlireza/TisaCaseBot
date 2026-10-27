@@ -1,10 +1,9 @@
-"""Phase 3b: the loop closes with a card, a history, and a parser sandbox.
+"""Phase 3b: the loop closes with a card and a history.
 
-A publish used to end in one line of «✅ ساخته شد», and «چرا این متن این‌طور
-خوانده شد؟» had no answer short of reading the code. Both are UI surfaces over a
-small JSON ledger here, so the tests are mostly about what a human can actually
-get back out of it: the right numbers, the link, the stored report, and no
-product created by a screen that promised not to create one.
+A publish used to end in one line of «✅ ساخته شد». The card and the history are
+UI surfaces over a small JSON ledger here, so the tests are mostly about what a
+human can actually get back out of it: the right numbers, the link, and the
+stored report.
 
 Run with ``python3 -m unittest discover -s tests``; the Telegram-dependent
 classes skip themselves when python-telegram-bot is not installed.
@@ -17,7 +16,6 @@ import json
 import os
 import shutil
 import tempfile
-import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -250,72 +248,6 @@ class TestProductTools(LedgerTestCase):
         update, sent = self._query("products:open:999999")
         asyncio.run(PT.cb_open(update, SimpleNamespace()))
         self.assertIn("پیدا نشد", sent[0][1])
-
-    def test_parser_test_arms_and_disarms(self):
-        data = {}
-        context = SimpleNamespace(user_data=data)
-        update, sent = self._query("tools:parser")
-        asyncio.run(PT.cb_parser_test(update, context))
-        self.assertGreater(data[PT._PENDING_KEY], time.time())
-        self.assertIn("هیچ محصولی ساخته نمی‌شود", sent[0][1])
-
-        update, sent = self._query("tools:parser:cancel")
-        asyncio.run(PT.cb_parser_test_cancel(update, context))
-        self.assertNotIn(PT._PENDING_KEY, data)
-
-    def test_parser_text_runs_the_flow_pipeline_once(self):
-        from bot.modules import product_flow as PF
-        calls = []
-
-        async def fake_analyze(text):
-            calls.append(text)
-            from bot.services.product_extractor import ProductData
-            return ProductData(title="قاب", price=698000, models=["iPhone 13 Pro Max"])
-
-        original = PF.analyze
-        PF.analyze = fake_analyze
-        self.addCleanup(setattr, PF, "analyze", original)
-
-        replies = []
-
-        async def reply_text(text, **kwargs):
-            replies.append(text)
-
-        update = SimpleNamespace(
-            effective_message=SimpleNamespace(text="قیمت 698000", reply_text=reply_text),
-            # هر آپدیت واقعیِ تلگرام کاربر دارد؛ دروازهٔ دسترسی روی همان حساب (ادمین ۷) اجرا می‌شود.
-            effective_user=SimpleNamespace(id=7, username="t", first_name="t"),
-        )
-        context = SimpleNamespace(user_data={PT._PENDING_KEY: time.time() + 30})
-        asyncio.run(PT.on_parser_text(update, context))
-        self.assertEqual(calls, ["قیمت 698000"])
-        self.assertIn("iPhone 13 Pro Max", replies[0])
-        self.assertIn("698,000", replies[0])
-        self.assertNotIn(PT._PENDING_KEY, context.user_data, "one sample per tap")
-
-    def test_expired_flag_leaves_the_message_alone(self):
-        called = []
-
-        async def fake_analyze(text):
-            called.append(text)
-
-        from bot.modules import product_flow as PF
-        original = PF.analyze
-        PF.analyze = fake_analyze
-        self.addCleanup(setattr, PF, "analyze", original)
-
-        update = SimpleNamespace(effective_message=SimpleNamespace(text="قیمت 698000"),
-                                 effective_user=SimpleNamespace(id=7, username="t", first_name="t"))
-        context = SimpleNamespace(user_data={PT._PENDING_KEY: time.time() - 1})
-        asyncio.run(PT.on_parser_text(update, context))
-        self.assertEqual(called, [])
-
-    def test_report_is_clipped_to_telegram_limits(self):
-        from bot.services.product_extractor import ProductData
-        data = ProductData(title="ق" * 5000, notes=["نکته"] * 200)
-        text, mode = PT._data_report(data)
-        self.assertLessEqual(len(text), PT._MAX_REPORT + 40)
-        self.assertIsNone(mode, "a clipped HTML message could break on a half-written tag")
 
     def test_long_history_report_degrades_to_plain_text(self):
         products_ledger.record(user_id=7, title="قاب", product_id=1, report="<b>" + "ب" * 9000 + "</b>")
