@@ -48,6 +48,8 @@ class CB:
 
     # Image compression-only utility (فشرده‌سازی عکس‌ها)
     COMPRESS = "compress:start"
+    # Auto-crop to a 1:1 square (اتو کراپ) — bot/modules/auto_crop.py
+    CROP = "crop:start"
 
     # Sudo runtime preferences (تنظیمات نمایش دکمه‌ها برای ادمین‌ها)
     SETTINGS = "settings"

@@ -25,6 +25,7 @@ class Button:
 BUTTONS: tuple[Button, ...] = (
     Button("tracking", "📦 تبدیل فایل کد رهگیری", CB.TRACKING_CONVERT, True),
     Button("compress", "🗜️ فشرده‌سازی عکس‌ها", CB.COMPRESS, True),
+    Button("auto_crop", "✂️ اتو کراپ ۱:۱", CB.CROP, True),
     Button("product_new", "🆕 محصول جدید", CB.PHONE_NEW, True),
     Button("product_restock", "🔄 اپدیت محصول موجود", CB.PHONE_RESTOCK, True),
     Button("recent_products", "🧾 آخرین محصولات", CB.PRODUCTS_RECENT, True),

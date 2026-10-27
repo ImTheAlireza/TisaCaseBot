@@ -23,6 +23,7 @@ from telegram.ext import Application
 
 from bot.modules import (
     admins,
+    auto_crop,
     fallback,
     image_compress,
     learning_panel,
@@ -41,6 +42,7 @@ from bot.modules import (
 # fallbacks win while a flow is active), fallback always last.
 ALL_MODULES = (
     tracking_converter,
+    auto_crop,
     product_flow,
     outbox_flow,
     product_tools,

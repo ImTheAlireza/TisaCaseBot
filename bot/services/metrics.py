@@ -94,6 +94,9 @@ COUNTERS: dict[str, Counter] = {
         Counter("compress_download_ms", "دریافت عکس", kind="ms"),
         Counter("compress_cpu_ms", "فشرده‌سازی عکس", kind="ms"),
         Counter("compress_upload_ms", "ارسال عکس", kind="ms"),
+        Counter("crop_images", "عکسِ اتو کراپ‌شده"),
+        Counter("crop_download_ms", "دریافت عکسِ اتو کراپ", kind="ms"),
+        Counter("crop_cpu_ms", "برشِ عکس", kind="ms"),
     )
 }
 

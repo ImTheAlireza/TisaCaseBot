@@ -10,7 +10,7 @@ from telegram.request import HTTPXRequest
 
 from bot import rbac
 from bot.config import settings
-from bot.modules import image_compress, maintenance, product_flow, register_all, shop_watch
+from bot.modules import auto_crop, image_compress, maintenance, product_flow, register_all, shop_watch
 from bot.modules.outbox_flow import start as start_outbox
 from bot.modules.product_flow import notify_interrupted_flows
 from bot.modules.restart import notify_restart_complete
@@ -106,6 +106,7 @@ async def _post_init(app: Application) -> None:
 async def _post_stop(app: Application) -> None:
     await product_flow.shutdown()
     await image_compress.shutdown()
+    await auto_crop.shutdown()
     await worker.shutdown()
     metrics.close()
 

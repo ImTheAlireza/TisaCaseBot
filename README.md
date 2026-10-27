@@ -32,7 +32,7 @@ Every user is exactly one of three roles:
 | Role    | Who sets it                  | Stored in               | What they can do                                             |
 |---------|------------------------------|-------------------------|--------------------------------------------------------------|
 | 👑 sudo | You, via `SUDO_IDS` in `.env`| `.env` (not runtime-editable) | Everything: converter, phone-post processor, Ping, 🔄 restart, «👥 مدیریت ادمینها», «⚙️ تنظیمات» and «🧠 یادگیری‌ها» |
-| 🛡️ admin| You, at runtime from the menu | `data/roles.json`       | Only the buttons the owner marked *admin-eligible* and left visible in «⚙️ تنظیمات» (today: converter, image compression, product new/restock). Everything else is hidden, and its callback is rejected server-side |
+| 🛡️ admin| You, at runtime from the menu | `data/roles.json`       | Only the buttons the owner marked *admin-eligible* and left visible in «⚙️ تنظیمات» (today: converter, image compression, auto-crop, product new/restock and the product history). Everything else is hidden, and its callback is rejected server-side |
 | 👤 user | —                            | —                       | Denied everywhere (no access to any feature)                 |
 
 The main menu is **role-aware**: an admin only ever sees the tracking-file
@@ -391,6 +391,34 @@ xiaomi (فقط سفید)
 **مسیر پیام‌ها:** کارت پایدار و نتیجهٔ نهایی به همان چت و همان رشتهٔ گفتگو
 (thread) برمی‌گردند که جریان از آنجا شروع شده — نه لزوماً به آیدی کاربر.
 پیشرفت‌های میانی در چت پیام نمی‌شوند؛ گزارش فنی همچنان در گروه لاگ می‌ماند.
+
+#### ✂️ اتو کراپ ۱:۱
+
+دکمه‌ای برای «این عکس باید مربع باشد» — و برای هیچ چیز دیگر. عکس را می‌فرستی،
+مربعِ **وسطش** را می‌بُرد و همان را برمی‌گرداند:
+
+```
+📐 1200×800 → 800×800
+```
+
+سه قاعده که همین را از «تغییر اندازه» جدا می‌کند (`bot/services/image_cropper.py`):
+
+* **بدون تغییر کیفیت.** هیچ پیکسلی دوباره با کیفیتِ دیگری فشرده نمی‌شود: JPEG با
+  **همان جدول‌های کوانتیزه و همان subsampling خودش** نوشته می‌شود
+  (`quality="keep"` / `subsampling="keep"`)، PNG بی‌اتلاف و WEBP با
+  `lossless=True`. عددی در `.env` نیست که کسی اشتباهی عوضش کند.
+* **بدون کوچک‌کردن.** عکسِ ۴۰۰۰×۳۰۰۰ می‌شود ۳۰۰۰×۳۰۰۰، نه ۱۰۸۰×۱۰۸۰.
+* **از هر طرف به یک اندازه.** برش از مرکز است، پس هر دو طرف به تعداد یکسان
+  پیکسل از دست می‌دهند (در ابعادِ فرد، یک پیکسل اختلاف — جبر، نه انتخاب).
+
+خروجی **به‌صورت فایل (Document)** برمی‌گردد، نه «عکس»: تلگرام هر عکسی را که
+به‌عنوان photo بفرستی خودش دوباره فشرده می‌کند و آن‌وقت کل این وعده بی‌معنی
+می‌شد. پس اگر خودت هم عکس را با «📎 فایل» بفرستی، تصویر دو بار فشرده نمی‌شود.
+عکسی که همین حالا ۱:۱ است **دوباره فرستاده نمی‌شود** — فقط گفته می‌شود
+«دست نزدم». فایلِ ناخوانا یا انیمیشن هم با یک جملهٔ روشن رد می‌شود، نه با سکوت.
+
+این ابزار هیچ‌چیز روی فروشگاه نمی‌نویسد و ادمین‌ها هم تا وقتی مالک دکمه را در
+«⚙️ تنظیمات» روشن نگه داشته باشد می‌توانند استفاده کنند.
 
 #### 🧠 یادگیری از اصلاحات (حالت خودیادگیر)
 
@@ -931,6 +959,8 @@ bot/
 │   ├── update_plan.py       # 🔄 draft ⟷ shop product → the diff (pure: no network, no Telegram)
 │   ├── update_apply.py      # 🔄 writes that diff: pictures → product → variations → deletes, verified
 │   ├── metrics.py           # 📈 شمارنده‌های عملیاتی روی data/metrics.sqlite3
+│   ├── image_cropper.py     # ✂️ برشِ مربعِ وسط، با همان جدول‌های کیفیتِ خودِ فایل
+│   ├── media_download.py    # یک مسیرِ دانلودِ فایلِ تلگرام (سقفِ حجم، تلاشِ دوباره، فایلِ نصفه)
 │   ├── product_journal.py   # یک کارتِ جمع‌وجور به‌ازای هر محصول (+ trace با VERBOSE_LOG)
 │   └── importer_contract.py # سازگاری افزونهٔ ZIP با فیلدهایی که ربات می‌فرستد
 ├── modules/                 # features — each exposes register(app)
@@ -942,6 +972,8 @@ bot/
 │   ├── admins.py            # 👥 مدیریت ادمینها (sudo) — add/remove admins
 │   ├── learning_panel.py    # 🧠 یادگیری‌ها (sudo) — list, confirm, disable, re-scope rules
 │   ├── settings.py          # ⚙️ تنظیمات (sudo) — button visibility for admins
+│   ├── auto_crop.py         # ✂️ اتو کراپ ۱:۱ (اتو کراپ عکس‌های ارسالی)
+│   ├── image_compress.py    # 🗜️ فشرده‌سازی عکس‌ها (conversation flow)
 │   ├── ping.py              # 🏓 Ping button (sudo)
 │   ├── restart.py           # 🔄 restart via supervisor (sudo) + startup confirmation
 │   └── fallback.py          # unknown buttons/text/files + global error handler

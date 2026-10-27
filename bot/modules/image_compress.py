@@ -39,6 +39,7 @@ from bot.constants import CB
 from bot.services.conversations import FlowConversationHandler
 from bot.keyboards import main_menu_keyboard, main_menu_text
 from bot.services.image_compressor import compress_image
+from bot.services.media_download import download_to
 from bot.utils.ui import answer_and_edit
 
 logger = logging.getLogger(__name__)
@@ -232,38 +233,26 @@ def _media(message) -> tuple[str, str] | None:
 async def _download(
     context: ContextTypes.DEFAULT_TYPE, file_id: str, target: Path, attempts: int = 3
 ) -> int:
-    """Download safely, retrying only idempotent Telegram read operations."""
-    for attempt in range(1, attempts + 1):
-        try:
-            tg_file = await context.bot.get_file(file_id)
-            if tg_file.file_size and tg_file.file_size > settings.max_download_mb * 1024 * 1024:
-                raise ValueError(f"فایل بزرگ‌تر از سقف مجاز ({settings.max_download_mb:g} MB) است.")
-            await tg_file.download_to_drive(custom_path=target)
-            actual_size = target.stat().st_size if target.exists() else 0
-            maximum = int(settings.max_download_mb * 1024 * 1024)
-            if actual_size > maximum:
-                target.unlink(missing_ok=True)
-                raise ValueError(f"فایل بزرگ‌تر از سقف مجاز ({settings.max_download_mb:g} MB) است.")
-            return actual_size or tg_file.file_size or 0
-        except (NetworkError, TimeoutError) as exc:
-            # A failed download may have left a partial file behind. Never let a
-            # retry treat that partial response as a complete image.
-            target.unlink(missing_ok=True)
-            user_data = getattr(context, "user_data", None)
-            if isinstance(user_data, dict):
-                user_data[COMPRESS_RETRIES_KEY] = int(user_data.get(COMPRESS_RETRIES_KEY, 0)) + 1
-            if attempt >= attempts:
-                raise
-            delay = 0.5 * (2 ** (attempt - 1))
-            logger.warning(
-                "Telegram image download failed (%s/%s); retrying in %.1fs: %s",
-                attempt,
-                attempts,
-                delay,
-                exc,
-            )
-            await asyncio.sleep(delay)
-    raise RuntimeError("Telegram image download failed without an exception")
+    """Download safely, retrying only idempotent Telegram read operations.
+
+    The retry loop itself lives in :mod:`bot.services.media_download`, shared with
+    «✂️ اتو کراپ»: two copies of a size guard and a partial-file rule is exactly the
+    kind of drift that ends with one flow cropping half an image.
+    """
+
+    def count_retry(_attempt: int, _exc: BaseException) -> None:
+        user_data = getattr(context, "user_data", None)
+        if isinstance(user_data, dict):
+            user_data[COMPRESS_RETRIES_KEY] = int(user_data.get(COMPRESS_RETRIES_KEY, 0)) + 1
+
+    return await download_to(
+        context.bot,
+        file_id,
+        target,
+        max_mb=settings.max_download_mb,
+        attempts=attempts,
+        on_retry=count_retry,
+    )
 
 
 async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
