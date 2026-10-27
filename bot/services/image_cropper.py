@@ -125,7 +125,7 @@ def crop_square(src: Path, dest_dir: Path) -> CropResult:
     """
     suffix = src.suffix.lower().lstrip(".")
     if suffix not in SUPPORTED:
-        raise UnsupportedImage(f"فرمت «{suffix or 'نامشخص'}» پشتیبانی نمی‌شود.")
+        raise UnsupportedImage(f"فرمت {suffix or 'این فایل'} رو نمی‌شناسم.")
 
     try:
         with warnings.catch_warnings():
@@ -133,15 +133,15 @@ def crop_square(src: Path, dest_dir: Path) -> CropResult:
             opened = Image.open(src)
             opened.load()
     except (Image.DecompressionBombWarning, Image.DecompressionBombError) as exc:
-        raise UnsupportedImage("تصویر بیش از حد بزرگ است.") from exc
+        raise UnsupportedImage("عکس خیلی بزرگه.") from exc
     except (OSError, ValueError) as exc:  # unreadable/truncated file
-        raise UnsupportedImage("فایل به‌عنوان تصویر باز نشد.") from exc
+        raise UnsupportedImage("این فایل عکس نبود.") from exc
 
     with opened:
         if opened.width * opened.height > MAX_IMAGE_PIXELS:
-            raise UnsupportedImage("تصویر بیش از حد بزرگ است.")
+            raise UnsupportedImage("عکس خیلی بزرگه.")
         if getattr(opened, "is_animated", False) and getattr(opened, "n_frames", 1) > 1:
-            raise UnsupportedImage("تصویر متحرک (GIF/انیمیشن) پشتیبانی نمی‌شود.")
+            raise UnsupportedImage("عکس متحرکه؛ برشش نمی‌دم.")
         image_format = (opened.format or "JPEG").upper()
         # Orientation is a tag, not pixels: a phone photo «۱۲۰۰×۸۰۰» is often really
         # 800×1200. Transposing first means the square is centred on what the user sees.
@@ -160,7 +160,7 @@ def crop_square(src: Path, dest_dir: Path) -> CropResult:
         try:
             _save_unchanged_quality(cropped, opened, dest, image_format)
         except (OSError, ValueError) as exc:
-            raise UnsupportedImage(f"نوشتن تصویر ممکن نشد: {type(exc).__name__}") from exc
+            raise UnsupportedImage("نتونستم فایل رو بنویسم.") from exc
     return CropResult(dest, width, height, side, True)
 
 

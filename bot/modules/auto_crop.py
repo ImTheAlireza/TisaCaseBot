@@ -60,13 +60,13 @@ _active_data: dict[int, dict] = {}
 #: half-written. They are removed by their own `finally` as usual.
 active_roots: dict[int, set[Path]] = {}
 
-#: «چه بفرست» و بس: هر خطِ توضیحی که کاربر مجبور نباشد بخواند، خوانده نمی‌شود.
-#: آن‌چه واقعاً به کار می‌آید کنارِ خودِ نتیجه گفته می‌شود (کپشنِ ابعاد، جملهٔ
-#: «دست نزدم»)، و اینکه چرا فایل بهتر از عکس است در README آمده.
+#: همان‌طور که یک آدم توی چت می‌گوید، نه آن‌طور که یک راهنما می‌نویسد: یک خط
+#: «چه بفرست»، یک خط «چطور تمومش کنی». هر چیزِ دیگری که به کار می‌آید کنارِ خودِ
+#: نتیجه گفته می‌شود (ابعاد روی فایل، «دست نزدم») — نه این‌جا.
 INSTRUCTION = (
     "✂️ <b>اتو کراپ ۱:۱</b>\n\n"
-    "عکس بفرست؛ برش می‌دهم و برمی‌گردانم.\n\n"
-    "برای پایان: /cancel"
+    "عکس بفرست، مربعش می‌کنم.\n"
+    "هر وقت تموم شد /cancel."
 )
 
 
@@ -139,7 +139,7 @@ async def _crop_and_send(
 
     if not result.changed:
         await message.reply_text(
-            f"✅ «{name}» همین حالا ۱:۱ بود ({result.size_text}) — دست نزدم."
+            f"✅ از قبل مربع بود ({result.size_text}) — دست نزدم."
         )
         return f"{name}: {result.change_text} · بدون تغییر"
 
@@ -149,7 +149,7 @@ async def _crop_and_send(
             chat_id=message.chat_id,
             document=handle,
             filename=Path(result.path).name,
-            caption=f"✂️ {name}\n📐 {result.change_text}",
+            caption=f"✂️ {result.change_text}",
         )
     upload_ms = (time.perf_counter() - sent_started) * 1000
     return (
@@ -168,7 +168,7 @@ async def _handle_media(
         root = workspace.new_dir(TEMP_DIR, user_id)
     except OSError:
         logger.exception("Could not create auto-crop workspace for user %s", user_id)
-        await message.reply_text("❌ فضای موقت پردازش در دسترس نیست؛ کمی بعد دوباره تلاش کن.")
+        await message.reply_text("❌ الان نمی‌تونم پردازش کنم؛ یه بار دیگه بفرست.")
         return
     active_roots.setdefault(user_id, set()).add(root)
     workspace.protect(root)
@@ -176,7 +176,7 @@ async def _handle_media(
     try:
         status = None
         try:
-            status = await message.reply_text("✂️ در حال برش…")
+            status = await message.reply_text("✂️ دارم می‌برم…")
         except Exception:  # pragma: no cover - a failed progress note must not stop the work
             logger.info("Could not send crop progress for user %s", user_id, exc_info=True)
         if user_data.get("crop_closed"):
@@ -185,15 +185,13 @@ async def _handle_media(
         try:
             summary = await _crop_and_send(message, context, file_id, name, root)
         except UnsupportedImage as exc:
-            await message.reply_text(f"❌ «{html.escape(name)}» بریده نشد: {exc}")
+            await message.reply_text(f"❌ نشد: {html.escape(str(exc))}")
             logger.info("auto-crop refused %s for user %s: %s", name, user_id, exc)
             await _drop(status)
             return
         except Exception:
             logger.exception("auto-crop failed for user %s (%s)", user_id, name)
-            await message.reply_text(
-                f"❌ «{html.escape(name)}» بریده نشد؛ جزئیات در لاگ ثبت شد."
-            )
+            await message.reply_text("❌ یه چیزی خراب شد؛ توی لاگ نوشتم.")
             await _drop(status)
             return
         metrics.incr("crop_images")
@@ -254,7 +252,7 @@ async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return WAITING
     media = _media(message)
     if not media:
-        await message.reply_text("❗ در این پیام عکسی پیدا نکردم.")
+        await message.reply_text("❗ عکسی توی این پیام نبود.")
         return WAITING
     await _handle_media(user.id, message, context, media)
     return WAITING
@@ -266,7 +264,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     message = update.effective_message
     if not message or not (message.text or "").strip():
         return WAITING
-    await message.reply_text("📷 عکس بفرست (یا /cancel).")
+    await message.reply_text("📷 عکس بفرست.")
     return WAITING
 
 
